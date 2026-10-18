@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { openStore, hashBody, StoreError, type RelayStore } from '../relay/store.ts';
+import { openStore, hashBody, StoreError, type Participant, type RelayStore } from '../relay/store.ts';
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const here = (...parts: string[]): string =>
@@ -27,7 +27,7 @@ function freshStore(label: string): Fresh {
   return { store, dbPath, done: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
-function expectStoreError(code: 'duplicate' | 'relay_header' | 'not_found', fn: () => void): void {
+function expectStoreError(code: 'duplicate' | 'relay_header' | 'not_found' | 'settled' | 'invalid_targets', fn: () => void): void {
   try {
     fn();
   } catch (err) {
@@ -38,20 +38,25 @@ function expectStoreError(code: 'duplicate' | 'relay_header' | 'not_found', fn: 
   assert.fail(`expected StoreError('${code}')`);
 }
 
-test('insertMessage stores the capture and queues one delivery row per target', () => {
+test('insertMessage stores the capture; delivery rows wait for approval by default', () => {
   const { store, done } = freshStore('insert');
   try {
     const msg = store.insertMessage({ source: 'astra', targets: ['codex', 'user'], body: '  hello world  ', hop: 1 });
     assert.match(msg.id, ULID);
     assert.equal(msg.contentHash, hashBody('hello world')); // hashed after trimming
-    assert.equal(msg.body, '  hello world  ');               // stored verbatim
+    assert.equal(msg.body, '  hello world  ');              // stored verbatim
     assert.equal(msg.hop, 1);
     assert.ok(msg.createdAt.endsWith('Z'));
     const pending = store.pendingDeliveries();
     assert.equal(pending.length, 2);
     assert.deepEqual(new Set(pending.map(p => p.target)), new Set(['codex', 'user']));
-    assert.ok(pending.every(p => p.status === 'queued' && p.attempts === 0));
+    assert.ok(pending.every(p => p.status === 'pending_approval' && p.attempts === 0));
     assert.ok(pending.every(p => p.body === '  hello world  '));
+    // An explicit starting status is honored:
+    store.insertMessage({ source: 'astra', targets: ['codex'], body: 'queued on purpose', hop: 1, initialStatus: 'queued' });
+    const queued = store.pendingDeliveries().filter(p => p.body === 'queued on purpose');
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].status, 'queued');
   } finally { done(); }
 });
 
@@ -106,12 +111,18 @@ test('messages carrying the relay header are never stored as new captures', () =
     assert.ok(!store.isDuplicate('codex', hashBody(headerBody))); // rejected for the header, not as a duplicate
     expectStoreError('relay_header', () =>
       store.insertMessage({ source: 'codex', targets: ['astra'], body: headerBody, hop: 1 }));
+    // Copied text often starts with blank lines or spaces — still caught after trimming:
+    expectStoreError('relay_header', () =>
+      store.insertMessage({ source: 'codex', targets: ['astra'], body: '  \n[Relay · from Codex · hop 1]\nanswer', hop: 1 }));
     assert.equal(store.pendingDeliveries().length, 0); // nothing was stored
     // The header only decides as the first line; mentions later in the text are normal content:
     store.insertMessage({ source: 'user', targets: ['codex'], body: 'see [Relay · from Codex] in the transcript', hop: 0 });
     assert.equal(store.pendingDeliveries().length, 1);
     store.insertMessage({ source: 'astra', targets: ['codex'], body: '[Relaychat] prefix', hop: 0 });
     assert.equal(store.pendingDeliveries().length, 2);
+    // Leading whitespace without a header is ordinary text:
+    store.insertMessage({ source: 'user', targets: ['codex'], body: '   \nindented, but no header', hop: 0 });
+    assert.equal(store.pendingDeliveries().length, 3);
   } finally { done(); }
 });
 
@@ -132,14 +143,74 @@ test('markStatus walks a delivery through its lifecycle; unknown rows are reject
   } finally { done(); }
 });
 
-test('failed and cancelled deliveries leave the pending list', () => {
+test('failed and cancelled deliveries leave the pending list; failed may retry', () => {
   const { store, done } = freshStore('settled');
   try {
     const m1 = store.insertMessage({ source: 'astra', targets: ['codex'], body: 'one', hop: 0 });
     const m2 = store.insertMessage({ source: 'astra', targets: ['user'], body: 'two', hop: 0 });
+    store.markStatus(m1.id, 'codex', 'delivering');
     store.markStatus(m1.id, 'codex', 'failed');
     store.markStatus(m2.id, 'user', 'cancelled');
     assert.equal(store.pendingDeliveries().length, 0);
+    // 'failed' is not final — the engine may requeue and retry:
+    store.markStatus(m1.id, 'codex', 'delivering');
+    const retried = store.pendingDeliveries();
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0].attempts, 2);
+  } finally { done(); }
+});
+
+test('a delivered or cancelled delivery never changes again', () => {
+  const { store, done } = freshStore('terminal');
+  try {
+    const msg = store.insertMessage({ source: 'user', targets: ['codex', 'astra'], body: 'one message', hop: 0 });
+    store.markStatus(msg.id, 'codex', 'delivering');
+    store.markStatus(msg.id, 'codex', 'delivered');
+    store.markStatus(msg.id, 'astra', 'cancelled');
+    expectStoreError('settled', () => store.markStatus(msg.id, 'codex', 'queued'));
+    expectStoreError('settled', () => store.markStatus(msg.id, 'codex', 'delivering'));
+    expectStoreError('settled', () => store.markStatus(msg.id, 'astra', 'failed'));
+    expectStoreError('settled', () => store.markStatus(msg.id, 'astra', 'cancelled'));
+    expectStoreError('not_found', () => store.markStatus(msg.id, 'user', 'queued'));
+  } finally { done(); }
+});
+
+test('an empty targets list is rejected', () => {
+  const { store, done } = freshStore('empty-targets');
+  try {
+    expectStoreError('invalid_targets', () =>
+      store.insertMessage({ source: 'user', targets: [], body: 'goes nowhere', hop: 0 }));
+    assert.equal(store.pendingDeliveries().length, 0);
+  } finally { done(); }
+});
+
+test('createdAt is normalized to UTC on the way in', () => {
+  const { store, done } = freshStore('timestamps');
+  try {
+    const msg = store.insertMessage({
+      source: 'user', targets: ['codex'], body: 'tz check', hop: 0,
+      createdAt: '2026-10-18T10:00:00-04:00',
+    });
+    assert.equal(msg.createdAt, '2026-10-18T14:00:00.000Z');
+    // Invalid timestamps are rejected and store nothing:
+    assert.throws(() =>
+      store.insertMessage({ source: 'user', targets: ['codex'], body: 'bad date', hop: 0, createdAt: 'not a date' }));
+    assert.equal(store.pendingDeliveries().length, 1);
+  } finally { done(); }
+});
+
+test('a failure while writing deliveries rolls the message back', () => {
+  const { store, done } = freshStore('atomic');
+  try {
+    const bogus = 'bogus' as unknown as Participant;
+    assert.throws(() =>
+      store.insertMessage({ source: 'astra', targets: [bogus], body: 'atomic insert', hop: 0 }));
+    // The message must not survive a failed delivery insert:
+    assert.equal(store.isDuplicate('astra', hashBody('atomic insert')), false);
+    assert.equal(store.pendingDeliveries().length, 0);
+    // The same body inserts cleanly once the bad target is gone:
+    store.insertMessage({ source: 'astra', targets: ['codex'], body: 'atomic insert', hop: 0 });
+    assert.equal(store.pendingDeliveries().length, 1);
   } finally { done(); }
 });
 

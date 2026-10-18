@@ -29,7 +29,7 @@ export interface RelayMessage {
   createdAt: string;     // ISO 8601
 }
 
-export type StoreErrorCode = 'duplicate' | 'relay_header' | 'not_found';
+export type StoreErrorCode = 'duplicate' | 'relay_header' | 'not_found' | 'settled' | 'invalid_targets';
 
 export class StoreError extends Error {
   readonly code: StoreErrorCode;
@@ -61,8 +61,9 @@ export function hashBody(body: string): string {
   return createHash('sha256').update(body.trim(), 'utf8').digest('hex');
 }
 
-/** SPEC relay header. A first line matching this means the relay itself
- *  injected the text: it is never stored as a new capture. */
+/** SPEC relay header. Tested against the trimmed body, so leading blank
+ *  lines or spaces cannot sneak copied text past the filter: a first line
+ *  matching this means the relay itself injected the text. */
 const RELAY_HEADER = /^\[Relay ·/;
 
 /** Same source + content_hash counts as a duplicate inside this window (SPEC: duplicate rule). */
@@ -77,8 +78,12 @@ export interface InsertInput {
   hop: number;
   /** Set when the engine already assigned one; otherwise a ULID is generated. */
   id?: string;
-  /** ISO 8601, defaults to now. The duplicate window follows this timestamp. */
+  /** ISO 8601, defaults to now. Normalized to UTC on the way in;
+   *  the duplicate window follows this timestamp. */
   createdAt?: string;
+  /** Starting status for each delivery row. Defaults to 'pending_approval':
+   *  nothing is ever sent unless something deliberately asks for it. */
+  initialStatus?: Status;
 }
 
 export interface PendingDelivery {
@@ -133,11 +138,14 @@ const SCHEMA = `
 `;
 
 export interface RelayStore {
-  /** Store one captured message plus one queued delivery row per target.
-   *  Throws StoreError('relay_header') if the body's first line is a relay header,
-   *  StoreError('duplicate') per the SPEC duplicate rule. */
+  /** Store one captured message and its delivery rows in one transaction.
+   *  Delivery rows start as 'pending_approval' unless initialStatus says otherwise.
+   *  Throws StoreError('relay_header') if the trimmed body starts with the relay header,
+   *  StoreError('duplicate') per the SPEC duplicate rule,
+   *  StoreError('invalid_targets') when targets is empty. */
   insertMessage(input: InsertInput): RelayMessage;
-  /** Update one delivery row. Attempts increment each time status becomes 'delivering'. */
+  /** Update one delivery row. Attempts increment each time status becomes 'delivering'.
+   *  Delivered and cancelled are final — any further change is rejected. */
   markStatus(messageId: string, target: Participant, status: Status): void;
   /** Every delivery not yet settled: queued, pending_approval or delivering. */
   pendingDeliveries(): PendingDelivery[];
@@ -167,7 +175,11 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
   };
 
   const insertMessage = (input: InsertInput): RelayMessage => {
-    if (RELAY_HEADER.test(input.body)) {
+    if (input.targets.length === 0) {
+      throw new StoreError('invalid_targets', 'a message needs at least one target');
+    }
+    // Copied text often starts with blank lines or spaces: check the trimmed body.
+    if (RELAY_HEADER.test(input.body.trim())) {
       throw new StoreError('relay_header',
         'message carries the relay header; it is never stored as a new capture');
     }
@@ -176,6 +188,8 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
       throw new StoreError('duplicate',
         'same source and content_hash within 10 minutes, or a source_ref already stored');
     }
+    // The duplicate window compares ISO strings, so normalize any input to UTC.
+    const createdAt = input.createdAt !== undefined ? new Date(input.createdAt).toISOString() : now();
     const message: RelayMessage = {
       id: input.id ?? ulid(),
       source: input.source,
@@ -184,27 +198,47 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
       contentHash,
       sourceRef: input.sourceRef,
       hop: input.hop,
-      createdAt: input.createdAt ?? now(),
+      createdAt,
     };
-    db.prepare(
-      'INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(message.id, message.source, message.body, message.contentHash,
-          message.sourceRef ?? null, message.hop, message.createdAt);
     const stamp = now();
+    const insertRow =
+      db.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
     const addDelivery =
       db.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at) VALUES (?, ?, ?, 0, ?)');
-    for (const target of new Set(input.targets)) addDelivery.run(message.id, target, 'queued', stamp);
+    // One transaction for the message and its delivery rows: a crash or a
+    // failed insert can never leave a message saved with nowhere to go.
+    db.exec('BEGIN');
+    try {
+      insertRow.run(message.id, message.source, message.body, message.contentHash,
+                   message.sourceRef ?? null, message.hop, message.createdAt);
+      for (const target of new Set(input.targets)) {
+        addDelivery.run(message.id, target, input.initialStatus ?? 'pending_approval', stamp);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* the transaction was already closed */ }
+      throw err;
+    }
     return message;
   };
 
   const markStatus = (messageId: string, target: Participant, status: Status): void => {
+    // Delivered and cancelled are final: a finished delivery must never go
+    // back to pending, or the message could be sent twice.
     const result = db.prepare(
       `UPDATE deliveries
          SET status = ?, updated_at = ?, attempts = attempts + ?
-       WHERE message_id = ? AND target = ?`
+       WHERE message_id = ? AND target = ?
+         AND status NOT IN ('delivered', 'cancelled')`
     ).run(status, now(), status === 'delivering' ? 1 : 0, messageId, target);
     if (result.changes === 0) {
-      throw new StoreError('not_found', `no delivery of ${messageId} to ${target}`);
+      const row = db.prepare('SELECT status FROM deliveries WHERE message_id = ? AND target = ?')
+        .get(messageId, target);
+      if (row === undefined) {
+        throw new StoreError('not_found', `no delivery of ${messageId} to ${target}`);
+      }
+      throw new StoreError('settled',
+        `delivery of ${messageId} to ${target} is ${(row as { status: Status }).status}; it can no longer change`);
     }
   };
 
