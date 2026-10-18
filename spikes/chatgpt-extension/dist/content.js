@@ -23,6 +23,7 @@
   var seen = /* @__PURE__ */ new Set();
   var witnessed = /* @__PURE__ */ new Set();
   var stabilityTimer = null;
+  var watchingId = "";
   var watchingText = "";
   var warnedNoTurns = false;
   async function sha256(text) {
@@ -70,32 +71,47 @@
     if (reply === null) return;
     const id = messageId(reply);
     if (id === "" || !witnessed.has(id) || seen.has(id)) return;
+    if (id !== watchingId) {
+      watchingId = id;
+      watchingText = "";
+    }
     const text = reply.innerText;
     if (text === watchingText) return;
     watchingText = text;
     if (stabilityTimer !== null) clearTimeout(stabilityTimer);
-    stabilityTimer = setTimeout(async () => {
-      const expected = watchingText;
-      const current = lastReply();
-      if (current === null || messageId(current) !== id) return;
-      if (current.innerText !== expected) return;
-      if (streamingNow()) return;
-      const currentTurns = turns();
-      const state = currentTurns.length > 0 ? currentTurns[currentTurns.length - 1].getAttribute("data-talvt-turn-state") : null;
-      if (state !== "complete") return;
-      const hash = await sha256(current.innerText);
-      seen.add(id);
+    stabilityTimer = setTimeout(onStableText, 1500);
+  }
+  function onStableText() {
+    const id = watchingId;
+    const expected = watchingText;
+    const current = lastReply();
+    if (current === null || messageId(current) !== id) return;
+    if (current.innerText !== expected) return;
+    if (streamingNow()) return;
+    const currentTurns = turns();
+    const state = currentTurns.length > 0 ? currentTurns[currentTurns.length - 1].getAttribute("data-talvt-turn-state") : null;
+    if (state !== "complete") {
+      stabilityTimer = setTimeout(onStableText, 1500);
+      return;
+    }
+    seen.add(id);
+    watchingId = "";
+    watchingText = "";
+    void (async () => {
+      const hash = await sha256(expected);
       console.log(`[relay-spike] assistant reply completed (message-id: ${id})
 hash: ${hash}
 ---
-${current.innerText}
+${expected}
 ---`);
-    }, 1500);
+    })();
   }
   new MutationObserver(() => checkCompletion()).observe(document.body, {
     childList: true,
     subtree: true,
-    characterData: true
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["data-talvt-turn-state"]
   });
   checkCompletion();
   chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

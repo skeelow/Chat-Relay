@@ -24,6 +24,7 @@ const chromeApi = (globalThis as unknown as { chrome?: ChromeRuntime }).chrome;
 const seen = new Set<string>();        // data-dil-message-ids already logged
 const witnessed = new Set<string>();   // message-ids seen streaming this page session
 let stabilityTimer: ReturnType<typeof setTimeout> | null = null;
+let watchingId = '';                   // the reply the stability watch belongs to
 let watchingText = '';
 let warnedNoTurns = false;
 
@@ -85,29 +86,49 @@ function checkCompletion(): void {
   const id = messageId(reply);
   if (id === '' || !witnessed.has(id) || seen.has(id)) return;
 
+  // A different reply always starts a fresh watch cycle, even when its text is
+  // identical to the previous one — keying on the message id is what lets a
+  // second "PONG" log (a text-only guard silently undid the message-id fix).
+  if (id !== watchingId) {
+    watchingId = id;
+    watchingText = '';
+  }
   const text = reply.innerText;
   if (text === watchingText) return; // unchanged since the last tick
   watchingText = text;
   if (stabilityTimer !== null) clearTimeout(stabilityTimer);
-  stabilityTimer = setTimeout(async () => {
-    const expected = watchingText;
-    const current = lastReply();
-    if (current === null || messageId(current) !== id) return;
-    if (current.innerText !== expected) return; // it changed again — keep waiting
-    if (streamingNow()) return;                 // a new reply started
-    const currentTurns = turns();
-    const state = currentTurns.length > 0
-      ? currentTurns[currentTurns.length - 1].getAttribute('data-talvt-turn-state')
-      : null;
-    if (state !== 'complete') return;           // turn not finished
-    const hash = await sha256(current.innerText);
-    seen.add(id);
-    console.log(`[relay-spike] assistant reply completed (message-id: ${id})\nhash: ${hash}\n---\n${current.innerText}\n---`);
-  }, 1500);
+  stabilityTimer = setTimeout(onStableText, 1500);
+}
+
+function onStableText(): void {
+  const id = watchingId;
+  const expected = watchingText;
+  const current = lastReply();
+  if (current === null || messageId(current) !== id) return;
+  if (current.innerText !== expected) return; // changed again — the tick rescheduled us
+  if (streamingNow()) return;                 // a new reply started
+  const currentTurns = turns();
+  const state = currentTurns.length > 0
+    ? currentTurns[currentTurns.length - 1].getAttribute('data-talvt-turn-state')
+    : null;
+  if (state !== 'complete') {
+    // The turn is marked complete a moment late: keep waiting instead of
+    // silently dropping the reply — re-check after another stability window.
+    stabilityTimer = setTimeout(onStableText, 1500);
+    return;
+  }
+  seen.add(id);
+  watchingId = '';   // fresh cycle: the next reply logs even with identical text
+  watchingText = '';
+  void (async () => {
+    const hash = await sha256(expected);
+    console.log(`[relay-spike] assistant reply completed (message-id: ${id})\nhash: ${hash}\n---\n${expected}\n---`);
+  })();
 }
 
 new MutationObserver(() => checkCompletion()).observe(document.body, {
   childList: true, subtree: true, characterData: true,
+  attributes: true, attributeFilter: ['data-talvt-turn-state'],
 });
 checkCompletion();
 
