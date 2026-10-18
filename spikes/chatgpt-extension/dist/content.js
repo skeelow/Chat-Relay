@@ -1,61 +1,95 @@
 (() => {
   // spikes/chatgpt-extension/src/selectors.ts
   var SELECTORS = {
-    /** One element per assistant reply. */
-    assistantMessage: '[data-message-author-role="assistant"]',
-    /** The composer (desktop UI: ProseMirror contenteditable with id prompt-textarea). */
-    composer: '#prompt-textarea, div[contenteditable="true"], form textarea',
-    /** The send button — completion signal 1: the stop button has returned to send. */
-    sendButton: 'button[data-testid="send-button"], button[aria-label="Send prompt"]',
-    /** The stop button — its presence means a reply is still streaming. */
-    stopButton: 'button[data-testid="stop-button"], button[aria-label="Stop streaming"]'
+    /** One element per exchange. data-talvt-turn-state: "in_progress" while streaming, "complete" when done. */
+    turn: "[data-talvt-turn-state]",
+    /** The reply body inside a turn; data-dil-message-id is a stable per-message id. */
+    replyBody: "[data-dil-message-id]",
+    /** The stop button while a reply is streaming (data-testid is gone in the current UI). */
+    stopButton: 'form[data-chatgpt-composer] button[aria-label="Stop"]',
+    /** The composer (ProseMirror contenteditable; the old #prompt-textarea no longer exists). */
+    composer: 'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]',
+    /**
+     * The send button. NOT present while the box is empty (a Dictate button shows instead),
+     * so the spike deliberately never relies on it: completion is judged by the stop button
+     * disappearing, the turn state, and text stability. Kept here so the M1.4 adapter can
+     * adopt it when needed — deliberate deviation, noted in docs/status/m0.2.md.
+     */
+    sendButton: 'form[data-chatgpt-composer] button[aria-label="Send"]'
   };
 
   // spikes/chatgpt-extension/src/content.ts
   var chromeApi = globalThis.chrome;
   var seen = /* @__PURE__ */ new Set();
+  var witnessed = /* @__PURE__ */ new Set();
   var stabilityTimer = null;
   var watchingText = "";
+  var warnedNoTurns = false;
   async function sha256(text) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
-  function lastAssistant() {
-    const all = document.querySelectorAll(SELECTORS.assistantMessage);
+  function turns() {
+    return [...document.querySelectorAll(SELECTORS.turn)];
+  }
+  function replyBodies() {
+    return [...document.querySelectorAll(SELECTORS.replyBody)];
+  }
+  function lastReply() {
+    const all = replyBodies();
     return all.length > 0 ? all[all.length - 1] : null;
   }
   function streamingNow() {
     return document.querySelector(SELECTORS.stopButton) !== null;
   }
-  async function seedSeen() {
-    for (const el of document.querySelectorAll(SELECTORS.assistantMessage)) {
-      seen.add(await sha256(el.innerText));
-    }
+  function messageId(el) {
+    return el.getAttribute("data-dil-message-id") ?? "";
+  }
+  function onConversationUrl() {
+    return /^\/(c|g)\//.test(location.pathname);
   }
   function checkCompletion() {
-    if (streamingNow()) return;
-    const el = lastAssistant();
-    if (el === null) return;
-    const text = el.innerText;
+    const allTurns = turns();
+    if (!warnedNoTurns && onConversationUrl() && allTurns.length === 0) {
+      warnedNoTurns = true;
+      console.warn("[relay-spike] WARNING: no turns found, selectors may be stale");
+    }
+    for (const turn of allTurns) {
+      if (turn.getAttribute("data-talvt-turn-state") === "in_progress") {
+        const replies = turn.querySelectorAll(SELECTORS.replyBody);
+        const last = replies.length > 0 ? replies[replies.length - 1] : null;
+        if (last !== null && messageId(last) !== "") witnessed.add(messageId(last));
+      }
+    }
+    if (streamingNow()) {
+      const last = lastReply();
+      if (last !== null && messageId(last) !== "") witnessed.add(messageId(last));
+      return;
+    }
+    const reply = lastReply();
+    if (reply === null) return;
+    const id = messageId(reply);
+    if (id === "" || !witnessed.has(id) || seen.has(id)) return;
+    const text = reply.innerText;
     if (text === watchingText) return;
     watchingText = text;
     if (stabilityTimer !== null) clearTimeout(stabilityTimer);
     stabilityTimer = setTimeout(async () => {
       const expected = watchingText;
-      const current = lastAssistant();
-      if (current === null) return;
-      const currentText = current.innerText;
-      if (currentText !== expected) return;
+      const current = lastReply();
+      if (current === null || messageId(current) !== id) return;
+      if (current.innerText !== expected) return;
       if (streamingNow()) return;
-      const hash = await sha256(currentText);
-      if (!seen.has(hash)) {
-        seen.add(hash);
-        console.log(`[relay-spike] assistant reply completed
+      const currentTurns = turns();
+      const state = currentTurns.length > 0 ? currentTurns[currentTurns.length - 1].getAttribute("data-talvt-turn-state") : null;
+      if (state !== "complete") return;
+      const hash = await sha256(current.innerText);
+      seen.add(id);
+      console.log(`[relay-spike] assistant reply completed (message-id: ${id})
 hash: ${hash}
 ---
-${currentText}
+${current.innerText}
 ---`);
-      }
     }, 1500);
   }
   new MutationObserver(() => checkCompletion()).observe(document.body, {
@@ -63,8 +97,8 @@ ${currentText}
     subtree: true,
     characterData: true
   });
-  void seedSeen();
-  chromeApi?.runtime?.addListener((msg, _sender, sendResponse) => {
+  checkCompletion();
+  chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type !== "type-test-text" || typeof msg.text !== "string") return;
     const composer = document.querySelector(SELECTORS.composer);
     if (composer === null) {
