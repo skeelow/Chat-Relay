@@ -8,6 +8,10 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test tests/store.test.ts"
+    "test": "node --test tests/store.test.ts",
+    "build:ext": "node spikes/chatgpt-extension/build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }

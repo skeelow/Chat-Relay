@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Relay Chat — M0.2 spike",
+  "version": "0.0.1",
+  "description": "Logs completed assistant replies on chatgpt.com to the console. Sends nothing.",
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab"]
+}
