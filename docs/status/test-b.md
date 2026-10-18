@@ -1,14 +1,14 @@
 # Test B — M0.1 Codex spike
 
 Task: Test B — task M0.1, `spikes/codex-resume.ts`: generate protocol types, spawn `codex app-server`, confirm ChatGPT login, list the 10 most recent threads, resume a thread and print its last turns, start a `[Relay · test]` PONG turn and stream every event.
-Result: partial — every script-verifiable acceptance check passes; one check needs the publisher's eyes in the ChatGPT desktop app.
+Result: pass
 
 Acceptance checks:
 
 - [x] Resumed thread shows the user's real earlier history — resumed `01a1424e-…` ("Run Scout Chapter 9 cold read"); `thread/turns/list` returned the prior turn with genuine content: user messages ("verify scout works the way we intend"), agent messages, reasoning items, tool calls, file changes.
 - [x] The script detects turn completion from an event, not a timer — it resolves on the `turn/completed` notification (status=`completed`); the only timer is a 180s safety guard that FAILS the spike rather than completing it.
 - [x] Final text is separated from reasoning and tool events — the final assistant text is printed on its own section (`=== final assistant text ===` → `PONG`); the event stream lists item types as they arrive, and the completed turn's item types are reported separately (`[agentMessage]`).
-- [ ] Opening the same thread in the ChatGPT desktop app shows the PONG turn (live vs only after reopen) — needs the publisher: open thread `01a1424e-8e67-7d93-9f9a-6700ac34c538` ("Run Scout Chapter 9 cold read") in the ChatGPT desktop app and look for the `[Relay · test]` turn answering PONG.
+- [x] Opening the same thread in the ChatGPT desktop app shows the PONG turn — publisher verified: the turn appears **after reopening, not live**.
 - [x] No API key was used — `getAuthStatus` (called with `includeToken: false`, `refreshToken: false`; the token is never requested or printed) returned `authMethod: chatgpt`.
 
 How it ran (codex-cli 0.161.0):
@@ -29,9 +29,14 @@ Surprises:
 - Resume emits a burst of lifecycle notifications before the response (9x `mcpServer/startupStatus/updated`, `thread/status/changed`, `thread/goal/cleared`, `thread/tokenUsage/updated`) — an adapter must tolerate the noise.
 - The user's `~/.codex/config.toml` has 2 unrecognized legacy settings; app-server logs warnings to stderr. Cosmetic, not ours.
 - Node logs DEP0190 for `spawn(..., {shell: true})` on Windows (needed for the npm `.cmd` shim). Cosmetic; the adapter can resolve the shim path directly to silence it.
+- Single-writer rule confirmed by experiment: while the thread was open in the ChatGPT desktop app, a second spike run failed with `-32600 thread-store conflict: thread … already has an active writer`. One writer per thread — a thread open in the desktop app blocks the relay from resuming it. (The spike's own app-server processes exit cleanly when stdin closes; the conflicting writer was the desktop app's.)
+
+Notes for M1.3 (adapter task):
+
+- The adapter spawns its own `codex app-server` child process. Never proxy into the ChatGPT desktop app's internal app-server — that is the app's machinery, not a relay endpoint.
+- Detect the active-writer error (`-32600 thread-store conflict … already has an active writer`) and report it as a status in the GUI (thread is open elsewhere) rather than a crash.
+- Test turns and relay traffic must never touch the publisher's existing book threads; create a dedicated thread with `thread/start` for test traffic.
 
 Open questions for the publisher:
 
-- The desktop-app check above: does the PONG turn appear live or only after reopening?
-- The PONG turn now permanently sits in the "Run Scout Chapter 9 cold read" thread. Acceptable, or should future test turns use a dedicated `thread/start` test thread?
 - The generated schema is committed for reproducibility. Keep it pinned in the repo, or ignore it and regenerate per machine?
