@@ -1,0 +1,13 @@
+{
+  "name": "chat-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay Chat - localhost engine routing messages between AIs (see docs/SPEC.md)",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test tests/store.test.ts"
+  }
+}

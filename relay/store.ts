@@ -1,0 +1,235 @@
+// Relay Chat — SQLite store.
+// Implements the Interfaces section of docs/SPEC.md (bake-off Test A / task M1.1):
+//   tables:    messages, deliveries, settings, adapter_state (relay.db)
+//   functions: insertMessage, markStatus, pendingDeliveries, isDuplicate
+// Zero dependencies: node:sqlite + node:crypto only.
+
+import { DatabaseSync } from 'node:sqlite';
+import { createHash, randomInt } from 'node:crypto';
+
+export type Participant = 'user' | 'astra' | 'codex';
+
+export type Status =
+  | 'captured'
+  | 'pending_approval'
+  | 'queued'
+  | 'delivering'
+  | 'delivered'
+  | 'failed'
+  | 'cancelled';
+
+export interface RelayMessage {
+  id: string;            // ULID, assigned by the engine
+  source: Participant;
+  targets: Participant[]; // who should receive it
+  body: string;          // final Markdown only: no reasoning, tool logs or partial text
+  contentHash: string;   // sha256 of body after trimming whitespace
+  sourceRef?: string;    // Codex turn id, or ChatGPT message element id
+  hop: number;           // 0 = written by the user; +1 each AI-to-AI relay
+  createdAt: string;     // ISO 8601
+}
+
+export type StoreErrorCode = 'duplicate' | 'relay_header' | 'not_found';
+
+export class StoreError extends Error {
+  readonly code: StoreErrorCode;
+  constructor(code: StoreErrorCode, message: string) {
+    super(message);
+    this.name = 'StoreError';
+    this.code = code;
+  }
+}
+
+/** Crockford base32 — the ULID alphabet (no I, L, O, U). */
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** ULID: 10 chars of millisecond timestamp + 16 chars of randomness = 26 chars. */
+export function ulid(epochMs: number = Date.now()): string {
+  let t = epochMs;
+  let time = '';
+  for (let i = 0; i < 10; i++) {
+    time = CROCKFORD[t % 32] + time;
+    t = Math.floor(t / 32);
+  }
+  let rand = '';
+  for (let i = 0; i < 16; i++) rand += CROCKFORD[randomInt(0, 32)];
+  return time + rand;
+}
+
+/** sha256 of the body after trimming whitespace (SPEC: contentHash). */
+export function hashBody(body: string): string {
+  return createHash('sha256').update(body.trim(), 'utf8').digest('hex');
+}
+
+/** SPEC relay header. A first line matching this means the relay itself
+ *  injected the text: it is never stored as a new capture. */
+const RELAY_HEADER = /^\[Relay ·/;
+
+/** Same source + content_hash counts as a duplicate inside this window (SPEC: duplicate rule). */
+export const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+
+export interface InsertInput {
+  source: Participant;
+  targets: Participant[];
+  body: string;
+  /** Codex turn id, or ChatGPT message element id. */
+  sourceRef?: string;
+  hop: number;
+  /** Set when the engine already assigned one; otherwise a ULID is generated. */
+  id?: string;
+  /** ISO 8601, defaults to now. The duplicate window follows this timestamp. */
+  createdAt?: string;
+}
+
+export interface PendingDelivery {
+  messageId: string;
+  target: Participant;
+  status: Status;
+  attempts: number;
+  updatedAt: string;
+  source: Participant;
+  body: string;
+  contentHash: string;
+  sourceRef: string | null;
+  hop: number;
+  createdAt: string;
+}
+
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS messages (
+    id           TEXT PRIMARY KEY,
+    source       TEXT NOT NULL CHECK (source IN ('user','astra','codex')),
+    body         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_ref   TEXT,
+    hop          INTEGER NOT NULL CHECK (hop >= 0),
+    created_at   TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS messages_source_ref
+    ON messages (source_ref) WHERE source_ref IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS messages_dedupe
+    ON messages (source, content_hash, created_at);
+
+  CREATE TABLE IF NOT EXISTS deliveries (
+    message_id TEXT NOT NULL REFERENCES messages (id),
+    target     TEXT NOT NULL CHECK (target IN ('user','astra','codex')),
+    status     TEXT NOT NULL CHECK (status IN
+      ('captured','pending_approval','queued','delivering','delivered','failed','cancelled')),
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, target)
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS adapter_state (
+    adapter       TEXT PRIMARY KEY,
+    last_seen_ref TEXT,
+    updated_at    TEXT NOT NULL
+  );
+`;
+
+export interface RelayStore {
+  /** Store one captured message plus one queued delivery row per target.
+   *  Throws StoreError('relay_header') if the body's first line is a relay header,
+   *  StoreError('duplicate') per the SPEC duplicate rule. */
+  insertMessage(input: InsertInput): RelayMessage;
+  /** Update one delivery row. Attempts increment each time status becomes 'delivering'. */
+  markStatus(messageId: string, target: Participant, status: Status): void;
+  /** Every delivery not yet settled: queued, pending_approval or delivering. */
+  pendingDeliveries(): PendingDelivery[];
+  /** SPEC duplicate rule: same source + content_hash within 10 minutes, or a source_ref already stored. */
+  isDuplicate(source: Participant, contentHash: string, sourceRef?: string): boolean;
+  close(): void;
+}
+
+export function openStore(dbPath: string = 'relay.db'): RelayStore {
+  const db = new DatabaseSync(dbPath);
+  db.exec('PRAGMA foreign_keys = ON;');
+  db.exec(SCHEMA);
+
+  const now = (): string => new Date().toISOString();
+
+  const isDuplicate = (source: Participant, contentHash: string, sourceRef?: string): boolean => {
+    const cutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString();
+    const recent =
+      db.prepare('SELECT 1 FROM messages WHERE source = ? AND content_hash = ? AND created_at >= ? LIMIT 1')
+        .get(source, contentHash, cutoff);
+    if (recent !== undefined) return true;
+    if (sourceRef !== undefined) {
+      const known = db.prepare('SELECT 1 FROM messages WHERE source_ref = ? LIMIT 1').get(sourceRef);
+      if (known !== undefined) return true;
+    }
+    return false;
+  };
+
+  const insertMessage = (input: InsertInput): RelayMessage => {
+    if (RELAY_HEADER.test(input.body)) {
+      throw new StoreError('relay_header',
+        'message carries the relay header; it is never stored as a new capture');
+    }
+    const contentHash = hashBody(input.body);
+    if (isDuplicate(input.source, contentHash, input.sourceRef)) {
+      throw new StoreError('duplicate',
+        'same source and content_hash within 10 minutes, or a source_ref already stored');
+    }
+    const message: RelayMessage = {
+      id: input.id ?? ulid(),
+      source: input.source,
+      targets: input.targets,
+      body: input.body,
+      contentHash,
+      sourceRef: input.sourceRef,
+      hop: input.hop,
+      createdAt: input.createdAt ?? now(),
+    };
+    db.prepare(
+      'INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(message.id, message.source, message.body, message.contentHash,
+          message.sourceRef ?? null, message.hop, message.createdAt);
+    const stamp = now();
+    const addDelivery =
+      db.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at) VALUES (?, ?, ?, 0, ?)');
+    for (const target of new Set(input.targets)) addDelivery.run(message.id, target, 'queued', stamp);
+    return message;
+  };
+
+  const markStatus = (messageId: string, target: Participant, status: Status): void => {
+    const result = db.prepare(
+      `UPDATE deliveries
+         SET status = ?, updated_at = ?, attempts = attempts + ?
+       WHERE message_id = ? AND target = ?`
+    ).run(status, now(), status === 'delivering' ? 1 : 0, messageId, target);
+    if (result.changes === 0) {
+      throw new StoreError('not_found', `no delivery of ${messageId} to ${target}`);
+    }
+  };
+
+  const rowToPending = (row: Record<string, unknown>): PendingDelivery => ({
+    messageId: row.message_id as string,
+    target: row.target as Participant,
+    status: row.status as Status,
+    attempts: row.attempts as number,
+    updatedAt: row.updated_at as string,
+    source: row.source as Participant,
+    body: row.body as string,
+    contentHash: row.content_hash as string,
+    sourceRef: (row.source_ref as string | null) ?? null,
+    hop: row.hop as number,
+    createdAt: row.created_at as string,
+  });
+
+  const pendingDeliveries = (): PendingDelivery[] =>
+    (db.prepare(
+      `SELECT d.message_id, d.target, d.status, d.attempts, d.updated_at,
+              m.source, m.body, m.content_hash, m.source_ref, m.hop, m.created_at
+         FROM deliveries d JOIN messages m ON m.id = d.message_id
+        WHERE d.status IN ('queued', 'pending_approval', 'delivering')
+        ORDER BY m.created_at, d.message_id, d.target`
+    ).all() as Record<string, unknown>[]).map(rowToPending);
+
+  return { insertMessage, markStatus, pendingDeliveries, isDuplicate, close: () => db.close() };
+}
