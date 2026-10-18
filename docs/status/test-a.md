@@ -1,11 +1,11 @@
 # Test A — relay/store.ts
 
 Task: Test A — `relay/store.ts` exactly to the Interfaces section: SQLite tables plus `insertMessage`, `markStatus`, `pendingDeliveries`, `isDuplicate`, with a test script.
-Result: partial
+Result: pass
 
 Acceptance checks:
 
-- [ ] `npm test` passes on a fresh clone — passes in the working tree (9 tests, 0 failures) and the repo has zero dependencies to install or compile, but the literal fresh-clone re-run has not been executed yet: the verification command was blocked awaiting user approval. Re-run and tick once done.
+- [x] `npm test` passes on a fresh clone — fresh `git clone` of this repo into a temp dir, `npm install` (zero dependencies), `npm test`: 9 tests, 0 failures.
 - [x] Inserting the same content from the same source twice within 10 minutes is rejected as a duplicate — store.test.ts; whitespace-only differences hash the same and are rejected too; same body from another source and 11 minutes later are both accepted.
 - [x] Killing the process mid-delivery and restarting lists that message as `pending`, never as `delivered` — tests/crash-child.ts marks the delivery `delivering` then SIGKILLs itself; tests/restart-child.ts reopens the database in a new process and `pendingDeliveries()` returns that row.
 - [x] Messages carrying the relay header are never stored as new captures — `insertMessage` rejects any body whose first line matches `^\[Relay ·` with `StoreError('relay_header')`; header mentions later in the text are normal content.
