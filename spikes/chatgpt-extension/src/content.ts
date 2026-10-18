@@ -9,6 +9,25 @@
 // the log line is the fingerprint the SPEC asks for.
 import { SELECTORS } from './selectors.ts';
 
+// Bump this marker on every build so the console shows which version runs.
+const BUILD_MARKER = '2026-10-18.1';
+console.log('[relay-spike] content script loaded', BUILD_MARKER);
+
+// Temporary debug logging — set to false (or remove the calls) once M0.2 passes.
+const DEBUG = true;
+
+function debug(...parts: unknown[]): void {
+  if (DEBUG) console.log('[relay-spike]', ...parts);
+}
+
+let lastReason = '';
+/** Log a decision reason once per change, so hot ticks don't flood the console. */
+function debugReason(reason: string): void {
+  if (!DEBUG || reason === lastReason) return;
+  lastReason = reason;
+  console.log('[relay-spike]', reason);
+}
+
 interface TestMessage { type?: string; text?: string; }
 type SendResponse = (response: unknown) => void;
 
@@ -72,19 +91,28 @@ function checkCompletion(): void {
     if (turn.getAttribute('data-talvt-turn-state') === 'in_progress') {
       const replies = turn.querySelectorAll<HTMLElement>(SELECTORS.replyBody);
       const last = replies.length > 0 ? replies[replies.length - 1] : null;
-      if (last !== null && messageId(last) !== '') witnessed.add(messageId(last));
+      if (last !== null && messageId(last) !== '') {
+        if (!witnessed.has(messageId(last))) debug('witnessed (turn in_progress):', messageId(last));
+        witnessed.add(messageId(last));
+      }
     }
   }
   if (streamingNow()) {
     const last = lastReply();
-    if (last !== null && messageId(last) !== '') witnessed.add(messageId(last));
+    if (last !== null && messageId(last) !== '' && !witnessed.has(messageId(last))) {
+      debug('witnessed (stop button):', messageId(last));
+      witnessed.add(messageId(last));
+    }
+    debugReason('tick skipped: reply is streaming (stop button present)');
     return; // still streaming: never log mid-stream
   }
 
   const reply = lastReply();
-  if (reply === null) return;
+  if (reply === null) { debugReason('tick skipped: no reply body on the page'); return; }
   const id = messageId(reply);
-  if (id === '' || !witnessed.has(id) || seen.has(id)) return;
+  if (id === '') { debugReason('tick skipped: reply has no data-dil-message-id'); return; }
+  if (!witnessed.has(id)) { debugReason(`tick skipped: ${id} was not witnessed streaming this session`); return; }
+  if (seen.has(id)) { debugReason(`tick skipped: ${id} was already logged`); return; }
 
   // A different reply always starts a fresh watch cycle, even when its text is
   // identical to the previous one — keying on the message id is what lets a
@@ -92,34 +120,41 @@ function checkCompletion(): void {
   if (id !== watchingId) {
     watchingId = id;
     watchingText = '';
+    debug('watching reply:', id);
   }
   const text = reply.innerText;
-  if (text === watchingText) return; // unchanged since the last tick
+  if (text === watchingText) { debugReason('tick skipped: text unchanged (stability timer is running)'); return; }
   watchingText = text;
   if (stabilityTimer !== null) clearTimeout(stabilityTimer);
   stabilityTimer = setTimeout(onStableText, 1500);
+  debug('timer armed for', id, '(1.5s stability window)');
 }
 
 function onStableText(): void {
+  debug('timer fired; watching:', watchingId);
   const id = watchingId;
   const expected = watchingText;
   const current = lastReply();
-  if (current === null || messageId(current) !== id) return;
-  if (current.innerText !== expected) return; // changed again — the tick rescheduled us
-  if (streamingNow()) return;                 // a new reply started
+  if (current === null) { debug('timer: no reply body — nothing to log'); return; }
+  if (messageId(current) !== id) { debug('timer: last reply changed to', messageId(current), '— standing down'); return; }
+  if (current.innerText !== expected) { debug('timer: text changed again — the tick rescheduled us'); return; }
+  if (streamingNow()) { debug('timer: a new reply is streaming — standing down'); return; }
   const currentTurns = turns();
   const state = currentTurns.length > 0
     ? currentTurns[currentTurns.length - 1].getAttribute('data-talvt-turn-state')
     : null;
+  debug('turn state:', state);
   if (state !== 'complete') {
     // The turn is marked complete a moment late: keep waiting instead of
     // silently dropping the reply — re-check after another stability window.
+    debug('turn not complete — re-arming the timer');
     stabilityTimer = setTimeout(onStableText, 1500);
     return;
   }
   seen.add(id);
   watchingId = '';   // fresh cycle: the next reply logs even with identical text
   watchingText = '';
+  debug('logging reply:', id);
   void (async () => {
     const hash = await sha256(expected);
     console.log(`[relay-spike] assistant reply completed (message-id: ${id})\nhash: ${hash}\n---\n${expected}\n---`);
@@ -136,6 +171,7 @@ checkCompletion();
 // It must NOT press send — the user clicks Send (SPEC M0.2 step 4).
 chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type !== 'type-test-text' || typeof msg.text !== 'string') return;
+  debug('popup asked to type the test text');
   const composer = document.querySelector(SELECTORS.composer) as HTMLTextAreaElement | HTMLElement | null;
   if (composer === null) {
     sendResponse({ ok: false, error: 'composer not found on this page' });
