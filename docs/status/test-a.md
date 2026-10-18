@@ -5,7 +5,7 @@ Result: pass
 
 Acceptance checks:
 
-- [x] `npm test` passes on a fresh clone — fresh `git clone` of this repo into a temp dir, `npm install` (zero dependencies), `npm test`: 9 tests, 0 failures.
+- [x] `npm test` passes on a fresh clone — fresh `git clone` from github.com into a temp dir, `npm install` (zero dependencies), `npm test`: 9 tests, 0 failures. Re-verified from the remote after GitHub auth was set up; first verified from a local clone of the same commit.
 - [x] Inserting the same content from the same source twice within 10 minutes is rejected as a duplicate — store.test.ts; whitespace-only differences hash the same and are rejected too; same body from another source and 11 minutes later are both accepted.
 - [x] Killing the process mid-delivery and restarting lists that message as `pending`, never as `delivered` — tests/crash-child.ts marks the delivery `delivering` then SIGKILLs itself; tests/restart-child.ts reopens the database in a new process and `pendingDeliveries()` returns that row.
 - [x] Messages carrying the relay header are never stored as new captures — `insertMessage` rejects any body whose first line matches `^\[Relay ·` with `StoreError('relay_header')`; header mentions later in the text are normal content.
@@ -20,6 +20,6 @@ Surprises:
 
 Open questions for the publisher:
 
-- Push access: work is committed locally; no github.com credentials exist on this machine (no gh CLI, no stored token).
+- Push access — resolved: gh CLI installed and authenticated via device flow; Test A commits pushed to `main`.
 - Runtime: stay on Node 26.7.0 here, or install Node 22 LTS as the packet targets?
 - Delivery rows start `queued`; when the engine implements approve-each mode it should either mark them `pending_approval` itself or the store should take an initial status. Preference?
