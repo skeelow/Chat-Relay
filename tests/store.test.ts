@@ -175,6 +175,46 @@ test('a delivered or cancelled delivery never changes again', () => {
   } finally { done(); }
 });
 
+test('recentMessages: an empty store returns an empty list', () => {
+  const { store, done } = freshStore('recent-empty');
+  try {
+    assert.deepEqual(store.recentMessages(200), []);
+  } finally { done(); }
+});
+
+test('recentMessages returns the newest limit messages, oldest first', () => {
+  const { store, done } = freshStore('recent-limit');
+  try {
+    // Explicit ULIDs keep the order deterministic: the generated ids are only
+    // millisecond-ordered — the 16-char suffix is random within one millisecond.
+    store.insertMessage({ id: '0000000000000000000000000A', source: 'astra', targets: ['user'], body: 'oldest reply', hop: 0 });
+    store.insertMessage({ id: '0000000000000000000000000B', source: 'codex', targets: ['user'], body: 'middle reply', hop: 0 });
+    store.insertMessage({ id: '0000000000000000000000000C', source: 'astra', targets: ['user'], body: 'newest reply', hop: 0 });
+    const recent = store.recentMessages(2);
+    assert.deepEqual(recent.map((m) => m.id),
+      ['0000000000000000000000000B', '0000000000000000000000000C'],
+      'the newest two, oldest first (ids are ULIDs, so id order is time order)');
+    assert.deepEqual(recent.map((m) => m.body), ['middle reply', 'newest reply']);
+  } finally { done(); }
+});
+
+test('recentMessages fills targets from the deliveries rows, sorted', () => {
+  const { store, done } = freshStore('recent-targets');
+  try {
+    const msg = store.insertMessage({ source: 'astra', targets: ['user', 'codex'], body: 'both targets', hop: 0 });
+    const recent = store.recentMessages(10);
+    assert.equal(recent.length, 1);
+    const row = recent[0];
+    assert.equal(row.id, msg.id);
+    assert.deepEqual(row.targets, ['codex', 'user'], 'targets rebuilt from deliveries, sorted');
+    assert.equal(row.body, 'both targets');
+    assert.equal(row.source, 'astra');
+    assert.equal(row.hop, 0);
+    assert.equal(row.contentHash, hashBody('both targets'));
+    assert.ok(row.createdAt.endsWith('Z'));
+  } finally { done(); }
+});
+
 test('an empty targets list is rejected', () => {
   const { store, done } = freshStore('empty-targets');
   try {

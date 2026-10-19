@@ -7,13 +7,18 @@
   "engines": {
     "node": ">=22.5.0"
   },
+  "main": "app/dist/main.cjs",
   "scripts": {
     "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts",
     "typecheck": "tsc --noEmit",
-    "build:ext": "tsc --noEmit && node adapters/chatgpt-ext/build.mjs"
+    "build:ext": "tsc --noEmit && node adapters/chatgpt-ext/build.mjs",
+    "build:gui": "tsc --noEmit && node app/build.mjs",
+    "start:gui": "electron .",
+    "start:engine": "node relay/engine.ts"
   },
   "devDependencies": {
     "@types/ws": "^8.18.2",
+    "electron": "^44.9.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   },

@@ -11,6 +11,8 @@
 //   adapter → engine {type:'hello', name, version}   name is the participant it speaks for
 //   adapter → engine {type:'status', status}         idle|thinking|streaming|awaiting_approval|disconnected
 //   adapter → engine {type:'captured', body, sourceRef?}
+//   GUI → engine     {type:'gui_hello'}                      once, right after auth (M1.5)
+//   engine → GUI     {type:'snapshot', statuses, messages}   one-time catch-up, to that socket only
 //   engine → GUI     {type:'transcript_update', message}
 //   engine → GUI     {type:'status_update', adapter, status}
 //
@@ -51,9 +53,13 @@ const VALID_STATUSES: readonly string[] =
    'selectors_stale'];
 const AUTH_GRACE_MS = 5000;
 
+/** Messages a joining GUI receives in its snapshot (M1.5 handshake). */
+const SNAPSHOT_LIMIT = 200;
+
 interface ClientState {
   authenticated: boolean;
   participant: Participant | null;   // set by hello — adapters only
+  isGui: boolean;                   // set by gui_hello — GUIs only (M1.5)
   status: string;
   authTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -99,8 +105,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
 
   const clients = new Map<WebSocket, ClientState>();
 
+  // Current status per adapter participant (M1.5): set on hello, status
+  // frames and disconnect, read by the snapshot so a late-joining GUI sees
+  // reality. The 'user' entry exists only for the Participant key type —
+  // no adapter registers as the user, and the snapshot reads codex/astra.
+  const adapterStatuses: Record<Participant, string> = {
+    user: 'disconnected', astra: 'disconnected', codex: 'disconnected',
+  };
+
+  // Broadcasts reach only GUIs that greeted (M1.5); authenticated sockets
+  // that sent neither hello nor gui_hello receive nothing.
   const guiSockets = (): WebSocket[] =>
-    [...clients.entries()].filter(([, s]) => s.authenticated && s.participant === null)
+    [...clients.entries()].filter(([, s]) => s.authenticated && s.isGui && s.participant === null)
       .map(([ws]) => ws);
 
   const broadcast = (frame: unknown): void => {
@@ -121,7 +137,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     });
 
     const state: ClientState = {
-      authenticated: false, participant: null, status: 'disconnected', authTimer: null,
+      authenticated: false, participant: null, isGui: false, status: 'disconnected', authTimer: null,
     };
     clients.set(ws, state);
     state.authTimer = setTimeout(() => {
@@ -131,7 +147,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     ws.on('close', () => {
       if (state.authTimer !== null) clearTimeout(state.authTimer);
       clients.delete(ws);
-      if (state.participant !== null) broadcastAdapterStatus(state.participant, 'disconnected');
+      if (state.participant !== null) {
+        adapterStatuses[state.participant] = 'disconnected';
+        broadcastAdapterStatus(state.participant, 'disconnected');
+      }
     });
 
     ws.on('message', (data) => {
@@ -177,6 +196,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             }
             state.participant = name;
             state.status = 'idle';
+            adapterStatuses[name] = 'idle';
             broadcastAdapterStatus(name, 'idle');
             return;
           }
@@ -185,6 +205,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const status = record.status;
             if (typeof status !== 'string' || !VALID_STATUSES.includes(status)) return;
             state.status = status;
+            adapterStatuses[state.participant] = status;
             broadcastAdapterStatus(state.participant, status);
             return;
           }
@@ -209,6 +230,22 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               }
               throw err;
             }
+            return;
+          }
+          case 'gui_hello': {
+            // M1.5: a GUI announces itself once, right after auth. Only
+            // authenticated non-adapter sockets may send it; a duplicate is
+            // ignored (one snapshot per connection). Nothing is ever sent to
+            // an adapter because of this — the no-replay rule concerns the
+            // AIs and holds as ever.
+            if (state.participant !== null) { ws.close(4400, 'adapters cannot be GUIs'); return; }
+            if (state.isGui) return;
+            state.isGui = true;
+            ws.send(JSON.stringify({
+              type: 'snapshot',
+              statuses: { codex: adapterStatuses.codex, astra: adapterStatuses.astra },
+              messages: store.recentMessages(SNAPSHOT_LIMIT),
+            }));
             return;
           }
           case 'send':

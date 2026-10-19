@@ -10,6 +10,6 @@
     "lib": ["es2022", "dom", "dom.iterable"],
     "skipLibCheck": true
   },
-  "include": ["adapters/**/*.ts", "relay/**/*.ts", "tests/**/*.ts"],
+  "include": ["adapters/**/*.ts", "app/src/**/*.ts", "relay/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules", "**/dist"]
 }

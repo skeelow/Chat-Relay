@@ -113,6 +113,15 @@ async function openAdapter(url: string, token: string, name: string): Promise<Cl
   return client;
 }
 
+/** A GUI that authenticated and greeted: auth, gui_hello, consume the snapshot. */
+async function openGui(url: string, token: string): Promise<Client> {
+  const client = await openClient(url, token);
+  client.send({ type: 'gui_hello' });
+  const snapshot = await client.nextMessage();
+  assert.equal(snapshot.type, 'snapshot');
+  return client;
+}
+
 /**
  * Best-effort temp dir cleanup. On Windows a just-released handle (SQLite file,
  * async socket teardown, antivirus scan) can outlast every retry; test
@@ -182,7 +191,7 @@ test('hello: adapters register by participant name; unknown names are rejected',
 
 test('captured: replies are stored and broadcast to the GUI, never pending', async () => {
   await withEngine('captured', async (engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
     const codex = await openAdapter(url, token, 'codex');
 
     // hello announces the adapter's initial status to GUIs:
@@ -208,7 +217,7 @@ test('captured: replies are stored and broadcast to the GUI, never pending', asy
 
 test('captured: duplicates are skipped, not re-broadcast', async () => {
   await withEngine('dupes', async (_engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
     const codex = await openAdapter(url, token, 'codex');
     await gui.nextMessage(); // status_update from hello
 
@@ -227,7 +236,7 @@ test('captured: duplicates are skipped, not re-broadcast', async () => {
 
 test('status: adapter statuses reach the GUI; a disconnect reports disconnected', async () => {
   await withEngine('status', async (_engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
     const astra = await openAdapter(url, token, 'astra');
     await gui.nextMessage(); // idle from hello
 
@@ -247,7 +256,7 @@ test('status: adapter statuses reach the GUI; a disconnect reports disconnected'
 
 test('status: selectors_stale reaches the GUI, and recovery returns to idle', async () => {
   await withEngine('stale', async (_engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
     const astra = await openAdapter(url, token, 'astra');
     await gui.nextMessage(); // idle from hello
 
@@ -261,6 +270,99 @@ test('status: selectors_stale reaches the GUI, and recovery returns to idle', as
     astra.send({ type: 'status', status: 'idle' });
     assert.deepEqual(await gui.nextMessage(),
       { type: 'status_update', adapter: 'astra', status: 'idle' });
+  });
+});
+
+test('snapshot: a late GUI gets the current adapter statuses and the stored messages', async () => {
+  await withEngine('snapshot', async (_engine, url, token) => {
+    const codex = await openAdapter(url, token, 'codex');
+    codex.send({ type: 'status', status: 'thinking' });
+    codex.send({ type: 'captured', body: 'before the GUI joined', sourceRef: 'turn-snap-1' });
+
+    const gui = await openClient(url, token);
+    gui.send({ type: 'gui_hello' });
+    const snapshot = await gui.nextMessage() as {
+      type?: string;
+      statuses?: Record<string, string>;
+      messages?: Array<{ body?: string }>;
+    };
+    assert.equal(snapshot.type, 'snapshot');
+    assert.deepEqual(snapshot.statuses, { codex: 'thinking', astra: 'disconnected' },
+      'current statuses: codex said thinking; astra never connected');
+    assert.deepEqual(snapshot.messages?.map((m) => m.body), ['before the GUI joined']);
+
+    // The snapshot goes to that socket only, and exactly once:
+    await gui.expectSilence(400);
+    gui.send({ type: 'gui_hello' }); // a duplicate is ignored — one snapshot per connection
+    await gui.expectSilence(400);
+  });
+});
+
+test('snapshot after a restart: stored messages in order, nothing replayed as updates', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-snaprestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    // Run 1: two captures, a few milliseconds apart so their ULID time parts
+    // differ (the suffix is random within one millisecond).
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const codex = await openAdapter(`ws://127.0.0.1:${engine.port}`, token, 'codex');
+      codex.send({ type: 'captured', body: 'first stored reply', sourceRef: 'turn-r1' });
+      await new Promise((r) => setTimeout(r, 10));
+      codex.send({ type: 'captured', body: 'second stored reply', sourceRef: 'turn-r2' });
+      await new Promise((r) => setTimeout(r, 200)); // let the writes land
+      engine.stop();
+    }
+    // Run 2: a GUI that greets gets the stored messages in order and no
+    // transcript_update is ever pushed for them.
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as {
+        type?: string;
+        statuses?: Record<string, string>;
+        messages?: Array<{ body?: string }>;
+      };
+      assert.equal(snapshot.type, 'snapshot');
+      assert.deepEqual(snapshot.statuses, { codex: 'disconnected', astra: 'disconnected' },
+        'a restart forgets adapter connections but not the stored transcript');
+      assert.deepEqual(snapshot.messages?.map((m) => m.body),
+        ['first stored reply', 'second stored reply'], 'stored messages, oldest first');
+      await gui.expectSilence(500); // no transcript_update is pushed
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('a socket that never sends gui_hello receives no broadcasts', async () => {
+  await withEngine('nogui', async (_engine, url, token) => {
+    const bystander = await openClient(url, token); // authenticated, never greets
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+    codex.send({ type: 'status', status: 'streaming' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'streaming' });
+    codex.send({ type: 'captured', body: 'gui-only broadcast', sourceRef: 'turn-ng-1' });
+    const update = await gui.nextMessage() as { type?: string; message?: { body?: string } };
+    assert.equal(update.type, 'transcript_update');
+    assert.equal(update.message?.body, 'gui-only broadcast');
+    // The bystander saw none of it:
+    await bystander.expectSilence(600);
+  });
+});
+
+test('an adapter that sends gui_hello is closed 4400', async () => {
+  await withEngine('adapterspam', async (_engine, url, token) => {
+    const codex = await openAdapter(url, token, 'codex');
+    codex.send({ type: 'gui_hello' });
+    assert.equal(await codex.expectClosed(), 4400);
   });
 });
 
@@ -294,18 +396,27 @@ test('no replay: a restart broadcasts nothing from the stored transcript', async
       await new Promise((r) => setTimeout(r, 200)); // let the write land
       engine.stop();
     }
-    // Run 2: same db, same token. A freshly connected GUI must hear nothing from
-    // the old transcript — only live events.
+    // Run 2: same db, same token. A GUI that greets gets exactly ONE frame
+    // from the past — the snapshot carrying the stored transcript — and no
+    // unsolicited frames after it. The stored rows are never re-sent as
+    // transcript_update; only live events flow.
     {
       const engine = await startEngine({ port: 0, dbPath, tokenPath });
       const token = readFileSync(tokenPath, 'utf8').trim();
       const url = `ws://127.0.0.1:${engine.port}`;
       const gui = await openClient(url, token);
-      await gui.expectSilence(600); // nothing replayed on connect
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { type?: string; messages?: Array<{ body?: string }> };
+      assert.equal(snapshot.type, 'snapshot');
+      assert.deepEqual(snapshot.messages?.map((m) => m.body), ['persisted reply'],
+        'the stored message arrives only inside the snapshot, never as an update');
+      await gui.expectSilence(500); // nothing unsolicited: no transcript_update, no status_update
+      // Live events flow as before:
       const codex = await openAdapter(url, token, 'codex');
-      await gui.nextMessage(); // idle status_update from the new hello
+      assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
       codex.send({ type: 'captured', body: 'live reply', sourceRef: 'turn-new' });
-      const update = await gui.nextMessage() as { message?: { body?: string } };
+      const update = await gui.nextMessage() as { type?: string; message?: { body?: string } };
+      assert.equal(update.type, 'transcript_update');
       assert.equal(update.message?.body, 'live reply');
       engine.stop();
     }
@@ -316,7 +427,7 @@ test('no replay: a restart broadcasts nothing from the stored transcript', async
 
 test('a malformed frame crashes nothing: the engine serves the next client normally', async () => {
   await withEngine('robust', async (engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
 
     // Handshake with the ws client, then write a masked text frame containing
     // invalid UTF-8 directly to the underlying socket.
@@ -344,7 +455,7 @@ test('a malformed frame crashes nothing: the engine serves the next client norma
 
 test('a replaced adapter is not reported as disconnected', async () => {
   await withEngine('replace', async (engine, url, token) => {
-    const gui = await openClient(url, token);
+    const gui = await openGui(url, token);
     const a = await openAdapter(url, token, 'codex');
     assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
 
@@ -395,6 +506,10 @@ test('any frame before auth closes with 4401 and stores nothing', async () => {
     const intruder = await Client.open(url);
     intruder.send({ type: 'captured', body: 'x' });
     assert.equal(await intruder.expectClosed(), 4401);
+    // gui_hello is no exception — only authenticated sockets may send it:
+    const guiIntruder = await Client.open(url);
+    guiIntruder.send({ type: 'gui_hello' });
+    assert.equal(await guiIntruder.expectClosed(), 4401);
     assert.equal(engine.store.isDuplicate('codex', hashBody('x')), false);
   });
 });

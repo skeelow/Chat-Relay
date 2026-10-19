@@ -149,6 +149,11 @@ export interface RelayStore {
   markStatus(messageId: string, target: Participant, status: Status): void;
   /** Every delivery not yet settled: queued, pending_approval or delivering. */
   pendingDeliveries(): PendingDelivery[];
+  /** The newest `limit` messages, oldest first (ids are ULIDs, so id order is
+   *  time order). Targets are rebuilt from the deliveries rows, sorted.
+   *  A limit <= 0 returns nothing (SQLite would read a negative LIMIT as
+   *  unlimited, which is never what a caller wants here). */
+  recentMessages(limit: number): RelayMessage[];
   /** SPEC duplicate rule: same source + content_hash within 10 minutes, or a source_ref already stored. */
   isDuplicate(source: Participant, contentHash: string, sourceRef?: string): boolean;
   close(): void;
@@ -265,5 +270,47 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
         ORDER BY m.created_at, d.message_id, d.target`
     ).all() as Record<string, unknown>[]).map(rowToPending);
 
-  return { insertMessage, markStatus, pendingDeliveries, isDuplicate, close: () => db.close() };
+  const recentMessages = (limit: number): RelayMessage[] => {
+    if (limit <= 0) return [];
+    // Newest first by id (ULIDs are time-ordered), then reversed to oldest
+    // first — the order a GUI replays them into the transcript.
+    const rows = db.prepare(
+      `SELECT id, source, body, content_hash, source_ref, hop, created_at
+         FROM messages ORDER BY id DESC LIMIT ?`
+    ).all(limit) as Record<string, unknown>[];
+    if (rows.length === 0) return [];
+    // Targets live in the deliveries table (SPEC interfaces); one grouped
+    // query rebuilds them, sorted per message.
+    const placeholders = rows.map(() => '?').join(', ');
+    const deliveryRows = db.prepare(
+      `SELECT message_id, target FROM deliveries
+        WHERE message_id IN (${placeholders}) ORDER BY message_id, target`
+    ).all(...rows.map((row) => row.id as string)) as Record<string, unknown>[];
+    const targetsById = new Map<string, Participant[]>();
+    for (const row of deliveryRows) {
+      const id = row.message_id as string;
+      const list = targetsById.get(id);
+      if (list !== undefined) list.push(row.target as Participant);
+      else targetsById.set(id, [row.target as Participant]);
+    }
+    return rows.reverse().map((row) => ({
+      id: row.id as string,
+      source: row.source as Participant,
+      targets: targetsById.get(row.id as string) ?? [],
+      body: row.body as string,
+      contentHash: row.content_hash as string,
+      ...(row.source_ref !== null ? { sourceRef: row.source_ref as string } : {}),
+      hop: row.hop as number,
+      createdAt: row.created_at as string,
+    }));
+  };
+
+  return {
+    insertMessage,
+    markStatus,
+    pendingDeliveries,
+    recentMessages,
+    isDuplicate,
+    close: () => db.close(),
+  };
 }

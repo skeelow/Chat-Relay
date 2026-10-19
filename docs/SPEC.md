@@ -117,7 +117,11 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `approve` / `reject` | message id |
 | GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap |
 | GUI → engine | `stop` | none |
+| GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
+
+Broadcasts reach only GUIs that sent `gui_hello`; a freshly greeted GUI first receives one `snapshot` as its catch-up.
 
 ### Adapter contract
 
