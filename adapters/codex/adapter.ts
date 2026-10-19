@@ -9,9 +9,10 @@
 //   - It polls thread/turns/list on the configured thread WITHOUT resuming it,
 //     so it never holds the thread's single-writer lock and the user's own
 //     Codex sessions (desktop app, CLI) keep working on that thread.
-//   - A live foreign turn appears as status "interrupted" to a non-owner; a
-//     fresh interrupted turn therefore reads as "streaming", guarded by a
-//     time window so a genuinely interrupted turn falls back to "idle".
+//   - A live foreign turn appears to a non-owner as status "interrupted" with
+//     completedAt null; a genuinely interrupted turn has completedAt set (live
+//     observation on a dedicated thread, 2026-10-19). Streaming therefore reads
+//     as: inProgress, or interrupted with completedAt null — no time window.
 //   - A turn that reaches "completed" is captured: its last agentMessage text
 //     is sent to the engine as {type:'captured'} with the turn id as sourceRef.
 //     The engine's store dedupes across restarts via that sourceRef.
@@ -29,14 +30,15 @@ import type { ThreadTurnsListResponse } from '../../spikes/codex-schema/v2/Threa
 
 const ADAPTER_VERSION = '0.1.0';
 
-/** How long a foreign turn showing "interrupted" still counts as streaming. */
-export const STREAMING_WINDOW_SEC = 180;
+/** First poll only: a completed turn counts as fresh if it finished within this window. */
+export const FIRST_POLL_WINDOW_SEC = 600;
 
 /** Minimal structural view of a Turn — the generated Turn type is assignable to this. */
 export interface ObservedTurn {
   id: string;
   status: string;                          // TurnStatus values, kept loose for resilience
   startedAt: number | null;               // unix seconds
+  completedAt: number | null;             // unix seconds — null while a foreign turn is live
   items: Array<{ type: string; text?: string }>;
 }
 
@@ -54,12 +56,21 @@ export interface PollPlan {
  * Pure decision from one turns/list poll (newest-first list, never mutates its inputs).
  * The caller marks sourceRefs seen only after successful sends, so disconnects
  * retry instead of losing turns.
+ *
+ * firstPoll: on the first successful poll, completed turns older than
+ * FIRST_POLL_WINDOW_SEC (or with a null completedAt) are marked seen instead
+ * of captured — the adapter never dumps the thread's whole history on start.
  */
-export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, nowMs: number): PollPlan {
+export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, nowMs: number, firstPoll: boolean): PollPlan {
   const captures: PlannedCapture[] = [];
   const seenWithoutCapture: string[] = [];
   for (const turn of turnsDesc) {
     if (turn.status !== 'completed' || reportedIds.has(turn.id)) continue;
+    if (firstPoll && (turn.completedAt === null ||
+        nowMs / 1000 - turn.completedAt > FIRST_POLL_WINDOW_SEC)) {
+      seenWithoutCapture.push(turn.id); // history, not fresh news
+      continue;
+    }
     const agent = [...turn.items].reverse()
       .find((item) => item.type === 'agentMessage' && (item.text ?? '').trim() !== '');
     if (agent !== undefined && agent.text !== undefined) {
@@ -73,8 +84,11 @@ export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, no
   const newest = turnsDesc[0];
   let adapterStatus: 'idle' | 'streaming' = 'idle';
   if (newest !== undefined) {
-    const fresh = newest.startedAt !== null && nowMs / 1000 - newest.startedAt < STREAMING_WINDOW_SEC;
-    if (newest.status === 'inProgress' || (newest.status === 'interrupted' && fresh)) {
+    // Live observation (dedicated thread, 2026-10-19): a live foreign turn reads
+    // as interrupted with completedAt null; a genuinely interrupted turn has
+    // completedAt set. So no time window is needed.
+    if (newest.status === 'inProgress' ||
+        (newest.status === 'interrupted' && newest.completedAt === null)) {
       adapterStatus = 'streaming';
     }
   }
@@ -83,14 +97,54 @@ export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, no
 
 // --- minimal codex app-server client (NDJSON JSON-RPC over stdio, M0.1-proven) ---
 
-interface Pending { resolve: (v: unknown) => void; reject: (e: Error) => void; }
+interface Pending { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; }
+
+export const REQUEST_TIMEOUT_MS = 10000;
+
+/**
+ * Pending-request bookkeeping with per-request timeouts, exported so the
+ * timeout logic is testable without spawning codex. A response arriving for
+ * a timed-out id is simply ignored (the lookup misses), and a hung request
+ * counts as a poll failure so the failure logic behaves as designed.
+ */
+export class RequestTracker {
+  private readonly pending = new Map<number, Pending>();
+  private nextId = 1;
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number = REQUEST_TIMEOUT_MS) {
+    this.timeoutMs = timeoutMs;
+  }
+
+  request<T>(method: string, write: (id: number) => void): Promise<T> {
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id); // late responses for this id are then ignored
+        reject(new Error(`codex request timed out: ${method}`));
+      }, this.timeoutMs);
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      write(id);
+    });
+  }
+
+  /** Settle a response; unknown ids (already timed out) are ignored. */
+  handleResponse(id: number, result: unknown, error: unknown): void {
+    const waiter = this.pending.get(id);
+    if (waiter === undefined) return;
+    this.pending.delete(id);
+    clearTimeout(waiter.timer);
+    if (error !== undefined) waiter.reject(new Error(JSON.stringify(error)));
+    else waiter.resolve(result);
+  }
+}
 
 class CodexClient {
   private readonly child: ChildProcess;
-  private readonly pending = new Map<number, Pending>();
-  private nextId = 1;
+  private readonly tracker: RequestTracker;
 
-  constructor() {
+  constructor(timeoutMs: number = REQUEST_TIMEOUT_MS) {
+    this.tracker = new RequestTracker(timeoutMs);
     this.child = spawn('codex', ['app-server'], {
       shell: process.platform === 'win32', // npm's codex shim is a .cmd on Windows
       stdio: ['pipe', 'pipe', 'inherit'],
@@ -118,12 +172,7 @@ class CodexClient {
       return; // lifecycle noise is tolerated, not acted on
     }
     if (frame.id !== undefined) {
-      const waiter = this.pending.get(Number(frame.id));
-      if (waiter !== undefined) {
-        this.pending.delete(Number(frame.id));
-        if (frame.error !== undefined) waiter.reject(new Error(JSON.stringify(frame.error)));
-        else waiter.resolve(frame.result);
-      }
+      this.tracker.handleResponse(Number(frame.id), frame.result, frame.error);
     }
   }
 
@@ -132,11 +181,7 @@ class CodexClient {
   }
 
   request<T>(method: string, params: unknown): Promise<T> {
-    const id = this.nextId++;
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this.send({ method, id, params });
-    });
+    return this.tracker.request(method, (id) => this.send({ method, id, params }));
   }
 
   async handshake(): Promise<void> {
@@ -186,7 +231,21 @@ function sendFrame(frame: unknown): boolean {
   return false;
 }
 
-function connectEngine(url: string, token: string): void {
+let tokenMissingLogged = false;
+
+function connectEngine(url: string, tokenPath: string): void {
+  // The token is re-read on every attempt (never logged), so a token recreated
+  // by a restarted engine is picked up on the next reconnect.
+  if (!existsSync(tokenPath)) {
+    if (!tokenMissingLogged) {
+      console.error(`[codex-adapter] token file not found: ${tokenPath} — will keep retrying (start the engine)`);
+      tokenMissingLogged = true;
+    }
+    setTimeout(() => { if (!shuttingDown) connectEngine(url, tokenPath); }, 2000);
+    return;
+  }
+  tokenMissingLogged = false;
+  const token = readFileSync(tokenPath, 'utf8').trim();
   const socket = new WebSocket(url);
   engineSocket = socket;
   socket.onopen = () => {
@@ -199,7 +258,7 @@ function connectEngine(url: string, token: string): void {
     if (engineSocket === socket) engineSocket = null;
     if (!shuttingDown) {
       console.error('[codex-adapter] engine connection lost — retrying in 2s');
-      setTimeout(() => { if (!shuttingDown) connectEngine(url, token); }, 2000);
+      setTimeout(() => { if (!shuttingDown) connectEngine(url, tokenPath); }, 2000);
     }
   };
   socket.onerror = () => { /* onclose follows; retry handled there */ };
@@ -214,11 +273,8 @@ async function main(): Promise<void> {
     console.error('Usage: node adapters/codex/adapter.ts <thread-id> [--engine url] [--token path] [--poll-ms n]');
     process.exit(2);
   }
-  if (!existsSync(tokenPath)) {
-    console.error(`[codex-adapter] token file not found: ${tokenPath} — start the engine first (it creates the token)`);
-    process.exit(1);
-  }
-  const token = readFileSync(tokenPath, 'utf8').trim(); // value never logged
+  // The token file is read per connection attempt inside connectEngine, so a
+  // missing file is retried (Fix 4) and a recreated token is picked up.
 
   const codex = new CodexClient();
   process.on('SIGINT', () => shutdown(codex));
@@ -254,10 +310,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  connectEngine(engineUrl, token);
+  connectEngine(engineUrl, tokenPath);
   console.log(`[codex-adapter] watching thread ${threadId} (read-only, every ${pollMs}ms)`);
 
   const reported = new Set<string>();
+  let firstPoll = true; // the first successful poll must not dump the thread's history
   let consecutiveFailures = 0;
   let reportedDisconnect = false;
   let inFlight = false;
@@ -270,7 +327,8 @@ async function main(): Promise<void> {
         { threadId, limit: 10, itemsView: 'full' });
       consecutiveFailures = 0;
       reportedDisconnect = false;
-      const plan = planPoll(resp.data as ObservedTurn[], reported, Date.now());
+      const plan = planPoll(resp.data as ObservedTurn[], reported, Date.now(), firstPoll);
+      firstPoll = false; // the window applied to this poll's data; excluded turns were marked seen
       for (const capture of plan.captures) {
         if (!sendFrame({ type: 'captured', body: capture.body, sourceRef: capture.sourceRef })) break;
         reported.add(capture.sourceRef); // only mark seen after a successful send
