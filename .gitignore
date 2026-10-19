@@ -3,3 +3,4 @@ relay.db
 relay.db-journal
 relay.db-wal
 relay.db-shm
+RelayChat/

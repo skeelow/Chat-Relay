@@ -54,8 +54,14 @@ interface ClientState {
   authTimer: ReturnType<typeof setTimeout> | null;
 }
 
+const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+
 function loadOrCreateToken(tokenPath: string): string {
-  if (existsSync(tokenPath)) return readFileSync(tokenPath, 'utf8').trim();
+  if (existsSync(tokenPath)) {
+    const existing = readFileSync(tokenPath, 'utf8').trim();
+    if (TOKEN_PATTERN.test(existing)) return existing;
+    // an empty or malformed token file is regenerated, not trusted
+  }
   mkdirSync(dirname(tokenPath), { recursive: true });
   const token = randomBytes(32).toString('hex');
   writeFileSync(tokenPath, token);
@@ -75,11 +81,17 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const store = openStore(options.dbPath ?? 'relay.db');
 
   const server = new WebSocketServer({ host, port: options.port ?? 8787 });
-  await new Promise<void>((resolve, reject) => {
-    server.once('listening', resolve);
-    server.once('error', reject);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('listening', resolve);
+      server.once('error', reject);
+    });
+  } catch (err) {
+    store.close(); // the db handle must not leak when listening fails (e.g. EADDRINUSE)
+    throw err;
+  }
   const port = (server.address() as { port: number }).port;
+  server.on('error', (err: Error) => console.error('[engine] server error:', err));
 
   const clients = new Map<WebSocket, ClientState>();
 
@@ -97,6 +109,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   };
 
   server.on('connection', (ws: WebSocket) => {
+    // First thing on every socket: a malformed frame (e.g. invalid UTF-8)
+    // emits 'error' and would crash the process without a listener. Log one
+    // line — never the token — and let ws close the socket.
+    ws.on('error', (err: Error) => {
+      console.error(`[engine] socket error: ${err.message}`);
+    });
+
     const state: ClientState = {
       authenticated: false, participant: null, status: 'disconnected', authTimer: null,
     };
@@ -112,17 +131,26 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     });
 
     ws.on('message', (data) => {
-      let frame: Record<string, unknown>;
+      let frame: unknown;
       try {
-        frame = JSON.parse(String(data)) as Record<string, unknown>;
+        frame = JSON.parse(String(data));
       } catch {
-        return; // non-JSON frames are ignored
+        if (!state.authenticated) ws.close(4401, 'unauthorized'); // non-JSON before auth
+        return;
       }
-      if (frame === null || typeof frame.type !== 'string') return;
+      // Any frame before auth — other than auth itself — is rejected up front.
+      if (!state.authenticated) {
+        const isAuth = frame !== null && typeof frame === 'object' &&
+          (frame as Record<string, unknown>).type === 'auth';
+        if (!isAuth) { ws.close(4401, 'unauthorized'); return; }
+      }
+      if (frame === null || typeof frame !== 'object') return; // authenticated junk is ignored
+      const record = frame as Record<string, unknown>;
+      if (typeof record.type !== 'string') return;
       try {
-        switch (frame.type) {
+        switch (record.type) {
           case 'auth': {
-            if (state.authenticated || typeof frame.token !== 'string' || !tokenMatches(token, frame.token)) {
+            if (state.authenticated || typeof record.token !== 'string' || !tokenMatches(token, record.token)) {
               ws.close(4401, 'unauthorized');
               return;
             }
@@ -131,12 +159,17 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'hello': {
-            if (!state.authenticated) { ws.close(4401, 'unauthorized'); return; }
-            const name = frame.name;
+            const name = record.name;
             if (name !== 'codex' && name !== 'astra') { ws.close(4400, 'unknown adapter'); return; }
             // One adapter per participant: a new connection replaces the old one.
+            // Null the old socket's participant FIRST, so its close handler
+            // reports nothing — it was replaced, not disconnected — and any
+            // frames it races in are ignored by the participant === null checks.
             for (const [other, otherState] of clients) {
-              if (other !== ws && otherState.participant === name) other.close(4400, 'replaced by a new connection');
+              if (other !== ws && otherState.participant === name) {
+                otherState.participant = null;
+                other.close(4400, 'replaced by a new connection');
+              }
             }
             state.participant = name;
             state.status = 'idle';
@@ -144,18 +177,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'status': {
-            if (!state.authenticated || state.participant === null) return;
-            const status = frame.status;
+            if (state.participant === null) return;
+            const status = record.status;
             if (typeof status !== 'string' || !VALID_STATUSES.includes(status)) return;
             state.status = status;
             broadcastAdapterStatus(state.participant, status);
             return;
           }
           case 'captured': {
-            if (!state.authenticated || state.participant === null) return;
-            const body = frame.body;
+            if (state.participant === null) return;
+            const body = record.body;
             if (typeof body !== 'string' || body.length === 0) return;
-            const sourceRef = typeof frame.sourceRef === 'string' ? frame.sourceRef : undefined;
+            const sourceRef = typeof record.sourceRef === 'string' ? record.sourceRef : undefined;
             try {
               const message: RelayMessage = store.insertMessage({
                 source: state.participant,
@@ -202,11 +235,17 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
 }
 
 async function main(): Promise<void> {
-  const engine = await startEngine();
-  console.log(`[engine] listening on ws://127.0.0.1:${engine.port} (read-only room)`);
-  const shutdown = (): void => { engine.stop(); process.exit(0); };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  try {
+    const engine = await startEngine();
+    console.log(`[engine] listening on ws://127.0.0.1:${engine.port} (read-only room)`);
+    const shutdown = (): void => { engine.stop(); process.exit(0); };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  } catch (err) {
+    const code = (err as { code?: string }).code ?? String(err);
+    console.error(`[engine] cannot listen on 127.0.0.1:8787: ${code}`);
+    process.exit(1);
+  }
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

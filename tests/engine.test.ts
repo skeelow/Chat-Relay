@@ -4,9 +4,10 @@
 // OS-assigned port and temp token/db files per test.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { WebSocket as WsRawClient } from 'ws';
 import { startEngine, type EngineHandle } from '../relay/engine.ts';
 import { hashBody } from '../relay/store.ts';
 
@@ -292,4 +293,89 @@ test('no replay: a restart broadcasts nothing from the stored transcript', async
   } finally {
     cleanupDir(dir);
   }
+});
+
+test('a malformed frame crashes nothing: the engine serves the next client normally', async () => {
+  await withEngine('robust', async (engine, url, token) => {
+    const gui = await openClient(url, token);
+
+    // Handshake with the ws client, then write a masked text frame containing
+    // invalid UTF-8 directly to the underlying socket.
+    const bad = new WsRawClient(url);
+    await new Promise<void>((resolve, reject) => {
+      bad.once('open', resolve);
+      bad.once('error', reject);
+    });
+    (bad as unknown as { _socket: { write(buf: Buffer): void } })._socket
+      .write(Buffer.from([0x81, 0x82, 1, 2, 3, 4, 0xff ^ 1, 0xfe ^ 2]));
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 2000);
+      bad.once('close', () => { clearTimeout(timer); resolve(); });
+    });
+
+    // The engine must still be running and serving normally:
+    const codex = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+    codex.send({ type: 'captured', body: 'still alive', sourceRef: 'turn-after-bad-frame' });
+    const update = await gui.nextMessage() as { message?: { body?: string } };
+    assert.equal(update.message?.body, 'still alive');
+    assert.ok(engine.store.isDuplicate('codex', hashBody('still alive')));
+  });
+});
+
+test('a replaced adapter is not reported as disconnected', async () => {
+  await withEngine('replace', async (engine, url, token) => {
+    const gui = await openClient(url, token);
+    const a = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+
+    const b = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+
+    // A raced capture from the replaced connection must be ignored:
+    a.send({ type: 'captured', body: 'from replaced A', sourceRef: 'turn-a' });
+    await a.expectClosed();
+    await new Promise((r) => setTimeout(r, 200));
+    await gui.expectSilence(400); // exactly idle, idle — no disconnected after B's hello
+    assert.equal(engine.store.isDuplicate('codex', hashBody('from replaced A')), false,
+      'a captured frame from the replaced connection must not be stored');
+
+    b.close();
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'disconnected' });
+  });
+});
+
+test('an empty token file is regenerated, not trusted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-emptytoken-'));
+  const tokenPath = join(dir, 'token');
+  try {
+    writeFileSync(tokenPath, '');
+    const engine = await startEngine({ port: 0, dbPath: join(dir, 'relay.db'), tokenPath });
+    try {
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      assert.match(token, /^[0-9a-f]{64}$/, 'the token file was regenerated with a valid token');
+
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const empty = await Client.open(url);
+      empty.send({ type: 'auth', token: '' });
+      assert.equal(await empty.expectClosed(), 4401);
+
+      const good = await openClient(url, token);
+      await good.expectSilence(300);
+      good.close();
+    } finally {
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('any frame before auth closes with 4401 and stores nothing', async () => {
+  await withEngine('preauth', async (engine, url) => {
+    const intruder = await Client.open(url);
+    intruder.send({ type: 'captured', body: 'x' });
+    assert.equal(await intruder.expectClosed(), 4401);
+    assert.equal(engine.store.isDuplicate('codex', hashBody('x')), false);
+  });
 });
