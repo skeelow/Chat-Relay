@@ -366,6 +366,14 @@ test('an adapter that sends gui_hello is closed 4400', async () => {
   });
 });
 
+test('a GUI that sends hello is closed 4400 (GUIs cannot be adapters)', async () => {
+  await withEngine('guispam', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    gui.send({ type: 'hello', name: 'codex', version: '0.0.0-test' });
+    assert.equal(await gui.expectClosed(), 4400);
+  });
+});
+
 test('read-only: send/approve/set_mode/stop are ignored and store nothing', async () => {
   await withEngine('readonly', async (engine, url, token) => {
     const gui = await openClient(url, token);

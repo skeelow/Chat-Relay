@@ -19,7 +19,7 @@
     if (pill === null) return;
     pill.dataset.status = status;
     const statusEl = pill.querySelector(".status");
-    if (statusEl !== null) statusEl.textContent = status.replace("_", " ");
+    if (statusEl !== null) statusEl.textContent = status.replaceAll("_", " ");
     console.log(`[relay-gui] pill ${adapter}: ${status}`);
   }
   function appendMessage(message) {
@@ -51,6 +51,7 @@
       const messages = frame.messages ?? [];
       for (const message of messages) appendMessage(message);
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
+      engineState("engine connected", true);
       return;
     }
     if (type === "transcript_update") {
@@ -79,7 +80,6 @@
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: "auth", token }));
         ws.send(JSON.stringify({ type: "gui_hello" }));
-        engineState("engine connected", true);
       };
       ws.onmessage = (event) => {
         let frame;
@@ -90,9 +90,13 @@
         }
         handleFrame(frame);
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (socket === ws) socket = null;
-        engineState("engine disconnected \u2014 retrying", false);
+        if (event.code === 4401) {
+          engineState("token rejected \u2014 restart the engine or check %APPDATA%\\RelayChat\\token", false);
+        } else {
+          engineState("engine disconnected \u2014 retrying", false);
+        }
         setTimeout(() => connect(), RECONNECT_MS);
       };
       ws.onerror = () => {

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { openStore, hashBody, StoreError, type Participant, type RelayStore } from '../relay/store.ts';
+import { openStore, hashBody, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const here = (...parts: string[]): string =>
@@ -252,6 +252,19 @@ test('a failure while writing deliveries rolls the message back', () => {
     store.insertMessage({ source: 'astra', targets: ['codex'], body: 'atomic insert', hop: 0 });
     assert.equal(store.pendingDeliveries().length, 1);
   } finally { done(); }
+});
+
+test('ulid is monotonic: 1000 ids in a tight loop are strictly increasing', () => {
+  let previous = '';
+  for (let i = 0; i < 1000; i++) {
+    const id = ulid();
+    if (previous !== '') {
+      assert.ok(previous < id,
+        `id #${i} (${id}) must sort after the previous one (${previous}) — ` +
+        'same-millisecond ids increment instead of redrawing (N1)');
+    }
+    previous = id;
+  }
 });
 
 test('killing the process mid-delivery and restarting lists the message as pending, never delivered', () => {

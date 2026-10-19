@@ -182,6 +182,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'hello': {
+            // N2: a socket that greeted as a GUI must not silently turn
+            // itself into an adapter — the mirror of gui_hello's guard.
+            if (state.isGui) { ws.close(4400, 'GUIs cannot be adapters'); return; }
             const name = record.name;
             if (name !== 'codex' && name !== 'astra') { ws.close(4400, 'unknown adapter'); return; }
             // One adapter per participant: a new connection replaces the old one.

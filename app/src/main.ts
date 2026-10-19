@@ -30,6 +30,11 @@ app.whenReady().then(() => {
   win.webContents.on('console-message', (event) => {
     console.log(`[renderer] ${event.message}`);
   });
+  // N4: the room is read-only local data — deny window.open and any
+  // navigation away from the loaded file (cheap insurance before Markdown
+  // rendering, and the links it brings, arrive in a later milestone).
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (event) => event.preventDefault());
   void win.loadFile(join(__dirname, '..', 'index.html'));
 });
 

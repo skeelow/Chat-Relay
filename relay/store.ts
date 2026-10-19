@@ -43,7 +43,27 @@ export class StoreError extends Error {
 /** Crockford base32 — the ULID alphabet (no I, L, O, U). */
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
-/** ULID: 10 chars of millisecond timestamp + 16 chars of randomness = 26 chars. */
+/** ULID: 10 chars of millisecond timestamp + 16 chars of randomness = 26 chars.
+ * Monotonic (M1.5 N1): within the same millisecond the previous random part
+ * is incremented instead of drawing fresh randomness, so ids sort in
+ * generation order even inside one ms — recentMessages' id ordering then
+ * equals capture order. */
+let lastUlidMs = -1;
+let lastUlidRand = '';
+
+/** Carry-increment over the Crockford alphabet (only used when the
+ * millisecond repeats; a full 80-bit overflow wraps to zeros — that takes
+ * 2^80 ids inside one millisecond). */
+function incrementCrockford(value: string): string {
+  const chars = value.split('');
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const digit = CROCKFORD.indexOf(chars[i]);
+    if (digit < 31) { chars[i] = CROCKFORD[digit + 1]; return chars.join(''); }
+    chars[i] = '0'; // carry into the next position
+  }
+  return chars.join('');
+}
+
 export function ulid(epochMs: number = Date.now()): string {
   let t = epochMs;
   let time = '';
@@ -51,8 +71,15 @@ export function ulid(epochMs: number = Date.now()): string {
     time = CROCKFORD[t % 32] + time;
     t = Math.floor(t / 32);
   }
-  let rand = '';
-  for (let i = 0; i < 16; i++) rand += CROCKFORD[randomInt(0, 32)];
+  let rand: string;
+  if (lastUlidRand !== '' && epochMs === lastUlidMs) {
+    rand = incrementCrockford(lastUlidRand);
+  } else {
+    rand = '';
+    for (let i = 0; i < 16; i++) rand += CROCKFORD[randomInt(0, 32)];
+  }
+  lastUlidMs = epochMs;
+  lastUlidRand = rand;
   return time + rand;
 }
 

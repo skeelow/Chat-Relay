@@ -11,7 +11,7 @@
   }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-19.2";
+  var BUILD_MARKER = "2026-10-19.3";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -60,13 +60,15 @@
   async function restoreQueue() {
     const bag = await chromeApi.storage.session.get(QUEUE_KEY);
     const stored = bag[QUEUE_KEY];
-    if (!Array.isArray(stored)) return;
-    for (const raw of stored) {
-      const item = raw;
-      if (typeof item.body === "string" && typeof item.sourceRef === "string" && !queuedCaptures.some((q) => q.sourceRef === item.sourceRef)) {
-        queuedCaptures.push({ body: item.body, sourceRef: item.sourceRef });
+    if (Array.isArray(stored)) {
+      for (const raw of stored) {
+        const item = raw;
+        if (typeof item.body === "string" && typeof item.sourceRef === "string" && !queuedCaptures.some((q) => q.sourceRef === item.sourceRef)) {
+          queuedCaptures.push({ body: item.body, sourceRef: item.sourceRef });
+        }
       }
     }
+    persistQueue();
   }
   function drainCaptures() {
     let drained = false;

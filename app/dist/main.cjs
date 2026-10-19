@@ -24,6 +24,8 @@ import_electron.app.whenReady().then(() => {
   win.webContents.on("console-message", (event) => {
     console.log(`[renderer] ${event.message}`);
   });
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event) => event.preventDefault());
   void win.loadFile((0, import_node_path.join)(__dirname, "..", "index.html"));
 });
 import_electron.app.on("window-all-closed", () => import_electron.app.quit());

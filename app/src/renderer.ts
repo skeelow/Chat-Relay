@@ -41,9 +41,9 @@ function engineState(label: string, on: boolean): void {
 function setPill(adapter: string, status: string): void {
   const pill = document.getElementById(`pill-${adapter}`);
   if (pill === null) return;
-  pill.dataset.status = status;
+  pill.dataset.status = status; // raw value — the CSS keys on it (S1)
   const statusEl = pill.querySelector('.status');
-  if (statusEl !== null) statusEl.textContent = status.replace('_', ' ');
+  if (statusEl !== null) statusEl.textContent = status.replaceAll('_', ' ');
   console.log(`[relay-gui] pill ${adapter}: ${status}`);
 }
 
@@ -77,6 +77,7 @@ function handleFrame(frame: Frame): void {
     const messages = (frame.messages ?? []) as GuiMessage[];
     for (const message of messages) appendMessage(message);
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
+    engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
     return;
   }
   if (type === 'transcript_update') {
@@ -105,18 +106,26 @@ function connect(): void {
     const ws = new WebSocket(ENGINE_URL);
     socket = ws;
     ws.onopen = () => {
+      // N3: no "engine connected" here — the socket being open says nothing
+      // until auth is accepted and the snapshot arrives; the label stays on
+      // its previous state until the snapshot handler flips it.
       ws.send(JSON.stringify({ type: 'auth', token }));
       ws.send(JSON.stringify({ type: 'gui_hello' })); // M1.5 handshake
-      engineState('engine connected', true);
     };
     ws.onmessage = (event) => {
       let frame: Frame;
       try { frame = JSON.parse(String(event.data)) as Frame; } catch { return; }
       handleFrame(frame);
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (socket === ws) socket = null;
-      engineState('engine disconnected — retrying', false);
+      // N3: a rejected token gets its own message; the 2 s retry loop
+      // keeps trying either way (a fresh token file is re-read per attempt).
+      if (event.code === 4401) {
+        engineState('token rejected — restart the engine or check %APPDATA%\\RelayChat\\token', false);
+      } else {
+        engineState('engine disconnected — retrying', false);
+      }
       setTimeout(() => connect(), RECONNECT_MS);
     };
     ws.onerror = () => { /* onclose follows; retry handled there */ };
