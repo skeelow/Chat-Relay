@@ -8,10 +8,14 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test tests/store.test.ts",
+    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts",
     "build:ext": "node spikes/chatgpt-extension/build.mjs"
   },
   "devDependencies": {
+    "@types/ws": "^8.18.2",
     "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
   }
 }
