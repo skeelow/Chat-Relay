@@ -44,7 +44,11 @@ export interface EngineHandle {
 type AdapterName = 'codex' | 'astra';
 
 const VALID_STATUSES: readonly string[] =
-  ['idle', 'thinking', 'streaming', 'awaiting_approval', 'disconnected'];
+  ['idle', 'thinking', 'streaming', 'awaiting_approval', 'disconnected',
+   // M1.4 (astra adapter, m0.2 carry item 5): chatgpt.com renames its DOM
+   // selectors regularly; the extension reports 'selectors_stale' so the
+   // breakage is visible in the room instead of a silently dead adapter.
+   'selectors_stale'];
 const AUTH_GRACE_MS = 5000;
 
 interface ClientState {

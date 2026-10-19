@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Relay Chat — Astra adapter options</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 560px; margin: 24px auto; padding: 0 16px; }
+    code { background: #f1f1f1; padding: 2px 4px; border-radius: 4px; }
+    textarea { width: 100%; height: 90px; font: 12px ui-monospace, monospace; margin-top: 8px; box-sizing: border-box; }
+    button { margin-top: 8px; padding: 6px 16px; }
+    #state { margin-top: 12px; }
+    .ok { color: #0a7d32; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h2>Relay Chat — Astra adapter</h2>
+  <p>
+    Paste the relay engine's token (64 hex characters) once. Find it in
+    <code>%APPDATA%\RelayChat\token</code> — the engine creates the file on
+    first start. The extension cannot read that folder itself, so the token
+    is stored in <code>chrome.storage.local</code> on this machine only.
+  </p>
+  <textarea id="token" spellcheck="false" placeholder="64-character hex token, one line"></textarea>
+  <button id="save">Save token</button>
+  <div id="state"></div>
+  <script src="dist/options.js"></script>
+</body>
+</html>

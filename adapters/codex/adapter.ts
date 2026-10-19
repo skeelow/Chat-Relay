@@ -149,11 +149,13 @@ class CodexClient {
       shell: process.platform === 'win32', // npm's codex shim is a .cmd on Windows
       stdio: ['pipe', 'pipe', 'inherit'],
     });
+    // stdio is piped above, so stdin/stdout are never null at runtime —
+    // the nullable spawn typings cannot see the configuration (M1.4 typecheck).
     this.child.on('exit', (code) => {
       console.error(`[codex-adapter] codex app-server exited (code=${code ?? '?'})`);
       process.exit(1);
     });
-    createInterface({ input: this.child.stdout }).on('line', (line) => this.onLine(line));
+    createInterface({ input: this.child.stdout! }).on('line', (line) => this.onLine(line));
   }
 
   private onLine(line: string): void {
@@ -177,7 +179,7 @@ class CodexClient {
   }
 
   send(frame: unknown): void {
-    this.child.stdin.write(JSON.stringify(frame) + '\n');
+    this.child.stdin!.write(JSON.stringify(frame) + '\n');
   }
 
   request<T>(method: string, params: unknown): Promise<T> {
@@ -193,7 +195,7 @@ class CodexClient {
   }
 
   close(): void {
-    this.child.stdin.end(); // makes app-server exit cleanly (M0.1 finding)
+    this.child.stdin!.end(); // makes app-server exit cleanly (M0.1 finding)
     this.child.kill();
   }
 }

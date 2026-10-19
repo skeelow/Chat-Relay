@@ -245,6 +245,25 @@ test('status: adapter statuses reach the GUI; a disconnect reports disconnected'
   });
 });
 
+test('status: selectors_stale reaches the GUI, and recovery returns to idle', async () => {
+  await withEngine('stale', async (_engine, url, token) => {
+    const gui = await openClient(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // idle from hello
+
+    // M1.4 carry item 5: the astra adapter reports a stale-selector page
+    // as a status so a chatgpt.com rename fails visibly.
+    astra.send({ type: 'status', status: 'selectors_stale' });
+    assert.deepEqual(await gui.nextMessage(),
+      { type: 'status_update', adapter: 'astra', status: 'selectors_stale' });
+
+    // Selectors working again (e.g. after an extension reload) recover:
+    astra.send({ type: 'status', status: 'idle' });
+    assert.deepEqual(await gui.nextMessage(),
+      { type: 'status_update', adapter: 'astra', status: 'idle' });
+  });
+});
+
 test('read-only: send/approve/set_mode/stop are ignored and store nothing', async () => {
   await withEngine('readonly', async (engine, url, token) => {
     const gui = await openClient(url, token);

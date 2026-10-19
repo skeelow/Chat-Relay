@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Relay Chat — Astra adapter",
+  "version": "0.1.0",
+  "description": "Read-only Relay Chat adapter for chatgpt.com: reports completed replies to the local relay engine. Sends nothing into ChatGPT.",
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["storage", "alarms", "activeTab"]
+}

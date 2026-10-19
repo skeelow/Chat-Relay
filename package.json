@@ -8,12 +8,14 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts",
-    "build:ext": "node spikes/chatgpt-extension/build.mjs"
+    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build:ext": "tsc --noEmit && node adapters/chatgpt-ext/build.mjs"
   },
   "devDependencies": {
     "@types/ws": "^8.18.2",
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "ws": "^8.22.0"
