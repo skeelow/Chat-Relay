@@ -43,6 +43,19 @@ export function pageStatus(view: {
 }
 
 /**
+ * F2 (review): the engine resets an adapter to `idle` on every hello, and
+ * MV3 can restart the worker at any time — so the worker remembers the
+ * latest status it was given (chrome.storage.session, owned by the
+ * background script) and replays it after each successful hello.
+ * Replaying `idle` is pointless: the engine already assumes it. The
+ * decision is pure so Node can test it directly; takes `string | null`
+ * because storage reads back untyped values.
+ */
+export function statusToReplayAfterHello(latest: string | null): string | null {
+  return latest !== null && latest !== 'idle' ? latest : null;
+}
+
+/**
  * Minimal structural view of a DOM element. The real HTMLElement satisfies
  * this (the content script casts it in); tests provide a small stub.
  */
@@ -64,8 +77,16 @@ export interface ReplyElement {
  * that contains a button (and no <pre> of its own) is a header bar.
  * Buttons are dropped everywhere — their labels are never reply content.
  * All removals happen on a clone; the live element is untouched.
+ *
+ * F1 (review, verified in real Chrome): innerText is only laid out for
+ * ATTACHED elements — a detached clone's innerText falls back to flat
+ * textContent and every paragraph, list and <br> break vanishes. So the
+ * clone must be mounted before the read. The mount is injected
+ * (mount(el) → unmount) to keep this module free of DOM calls; the
+ * content script supplies the offscreen mount, tests supply a stub, and
+ * the unmount always runs, even when the read throws.
  */
-export function replyText(reply: ReplyElement): string {
+export function replyText(reply: ReplyElement, mount: (el: ReplyElement) => () => void): string {
   const clone = reply.cloneNode(true);
   // Collect header candidates from the intact clone first — removing one
   // must not change what sits before the next <pre> (consecutive blocks).
@@ -80,5 +101,10 @@ export function replyText(reply: ReplyElement): string {
   }
   for (const header of headers) header.remove();
   for (const button of clone.querySelectorAll('button')) button.remove();
-  return clone.innerText;
+  const unmount = mount(clone);
+  try {
+    return clone.innerText;
+  } finally {
+    unmount();
+  }
 }

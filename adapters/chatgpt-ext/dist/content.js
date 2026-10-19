@@ -29,7 +29,7 @@
     if (view.stopButtonPresent || view.anyTurnInProgress) return "streaming";
     return "idle";
   }
-  function replyText(reply) {
+  function replyText(reply, mount) {
     const clone = reply.cloneNode(true);
     const headers = [];
     for (const pre of clone.querySelectorAll("pre")) {
@@ -40,11 +40,16 @@
     }
     for (const header of headers) header.remove();
     for (const button of clone.querySelectorAll("button")) button.remove();
-    return clone.innerText;
+    const unmount = mount(clone);
+    try {
+      return clone.innerText;
+    } finally {
+      unmount();
+    }
   }
 
   // adapters/chatgpt-ext/src/content.ts
-  var BUILD_MARKER = "2026-10-19.1";
+  var BUILD_MARKER = "2026-10-19.2";
   console.log("[relay-astra] content script loaded", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -66,6 +71,16 @@
   var staleTimer = null;
   var staleConfirmed = false;
   var lastStatus = null;
+  function mountOffscreen(el) {
+    const node = el;
+    node.style.position = "fixed";
+    node.style.left = "-100000px";
+    node.style.top = "0";
+    document.body.appendChild(node);
+    return () => {
+      node.remove();
+    };
+  }
   function turns() {
     return [...document.querySelectorAll(SELECTORS.turn)];
   }
@@ -210,7 +225,7 @@
     watchingId = "";
     watchingText = "";
     debug("reporting reply:", id);
-    const body = replyText(current);
+    const body = replyText(current, mountOffscreen);
     void deliverCapture(body, id);
   }
   var DELIVERY_ATTEMPTS = 15;

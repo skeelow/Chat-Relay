@@ -109,8 +109,9 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | Direction | `type` | Payload |
 | --- | --- | --- |
 | adapter → engine | `hello` | adapter name, version |
-| adapter → engine | `status` | idle, thinking, streaming, awaiting\_approval, disconnected |
+| adapter → engine | `status` | idle, thinking, streaming, awaiting\_approval, disconnected, selectors\_stale (astra only) |
 | adapter → engine | `captured` | body, sourceRef |
+| adapter → engine | `ping` | none — keepalive, ignored by the engine |
 | engine → adapter | `deliver` | message id, text with relay header |
 | adapter → engine | `delivered` / `failed` | message id, error |
 | GUI → engine | `send` | body, targets |

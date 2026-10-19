@@ -17,7 +17,7 @@ import { SELECTORS } from './selectors.ts';
 import { pageStatus, replyText, type AstraStatus, type ReplyElement } from './protocol.ts';
 
 // Bump this marker on every build so the console shows which version runs.
-const BUILD_MARKER = '2026-10-19.1';
+const BUILD_MARKER = '2026-10-19.2';
 console.log('[relay-astra] content script loaded', BUILD_MARKER);
 
 // Debug logging is off by default (carry item 3); flip to true to trace
@@ -67,6 +67,22 @@ let staleConfirmed = false;
 // Status reporting: send to the service worker only on change; a failed
 // send leaves lastStatus untouched so the next tick retries it.
 let lastStatus: AstraStatus | null = null;
+
+/**
+ * F1 (review): innerText is only laid out for attached elements, so the
+ * clone replyText strips must be mounted for the read. Fixed offscreen
+ * style — never display:none or visibility:hidden, both defeat innerText.
+ * Passed in so protocol.ts stays free of DOM calls; replyText always
+ * unmounts via the returned callback, even when the read throws.
+ */
+function mountOffscreen(el: ReplyElement): () => void {
+  const node = el as unknown as HTMLElement;
+  node.style.position = 'fixed';
+  node.style.left = '-100000px';
+  node.style.top = '0';
+  document.body.appendChild(node);
+  return () => { node.remove(); };
+}
 
 function turns(): HTMLElement[] {
   return [...document.querySelectorAll<HTMLElement>(SELECTORS.turn)];
@@ -206,7 +222,7 @@ function onStableText(): void {
   watchingId = '';   // fresh cycle: the next reply reports even with identical text
   watchingText = '';
   debug('reporting reply:', id);
-  const body = replyText(current as unknown as ReplyElement); // carry item 1
+  const body = replyText(current as unknown as ReplyElement, mountOffscreen); // carry item 1 + F1
   void deliverCapture(body, id);
 }
 

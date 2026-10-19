@@ -6,9 +6,12 @@
     const firstLine = body.split("\n", 1)[0] ?? "";
     return RELAY_HEADER.test(firstLine);
   }
+  function statusToReplayAfterHello(latest) {
+    return latest !== null && latest !== "idle" ? latest : null;
+  }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-19.1";
+  var BUILD_MARKER = "2026-10-19.2";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -21,12 +24,19 @@
   var RECONNECT_MS = 2e3;
   var WATCHDOG_ALARM = "relay-astra-watchdog";
   var WATCHDOG_PERIOD_MIN = 0.5;
+  var STATUS_KEY = "latestStatus";
+  var QUEUE_KEY = "queuedCaptures";
+  var DRAIN_SETTLE_MS = 500;
+  var PING_INTERVAL_MS = 2e4;
+  var MAX_PERSISTED_QUEUE = 20;
+  var PING_FRAME = JSON.stringify({ type: "ping" });
   var maybeChrome = globalThis.chrome;
   if (maybeChrome === void 0) {
     throw new Error("[relay-astra worker] no chrome API \u2014 this file must run as the extension service worker");
   }
   var chromeApi = maybeChrome;
   var socket = null;
+  var socketOpenAt = null;
   var connectInFlight = false;
   var tokenMissingLogged = false;
   var authRejected = false;
@@ -35,18 +45,49 @@
   function engineSocketOpen() {
     return socket !== null && socket.readyState === WebSocket.OPEN;
   }
+  function drainReady() {
+    return engineSocketOpen() && socketOpenAt !== null && Date.now() - socketOpenAt >= DRAIN_SETTLE_MS;
+  }
   async function storedToken() {
     const bag = await chromeApi.storage.local.get(TOKEN_KEY);
     const value = bag[TOKEN_KEY];
     return typeof value === "string" && TOKEN_PATTERN.test(value) ? value : null;
   }
+  function persistQueue() {
+    const persistable = queuedCaptures.slice(-MAX_PERSISTED_QUEUE).map(({ body, sourceRef }) => ({ body, sourceRef }));
+    void chromeApi.storage.session.set({ [QUEUE_KEY]: persistable });
+  }
+  async function restoreQueue() {
+    const bag = await chromeApi.storage.session.get(QUEUE_KEY);
+    const stored = bag[QUEUE_KEY];
+    if (!Array.isArray(stored)) return;
+    for (const raw of stored) {
+      const item = raw;
+      if (typeof item.body === "string" && typeof item.sourceRef === "string" && !queuedCaptures.some((q) => q.sourceRef === item.sourceRef)) {
+        queuedCaptures.push({ body: item.body, sourceRef: item.sourceRef });
+      }
+    }
+  }
   function drainCaptures() {
+    let drained = false;
     while (queuedCaptures.length > 0 && engineSocketOpen() && socket !== null) {
       const item = queuedCaptures.shift();
       if (item === void 0) break;
       socket.send(JSON.stringify({ type: "captured", body: item.body, sourceRef: item.sourceRef }));
       item.ack?.({ ok: true, sent: true });
+      drained = true;
       debug("captured frame sent:", item.sourceRef);
+    }
+    if (drained) persistQueue();
+  }
+  async function replayStatusAfterHello(ws) {
+    const bag = await chromeApi.storage.session.get(STATUS_KEY);
+    const stored = bag[STATUS_KEY];
+    const replay = statusToReplayAfterHello(typeof stored === "string" ? stored : null);
+    if (replay !== null && ws === socket && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "status", status: replay }));
+      lastSentStatus = replay;
+      debug("status replayed after hello:", replay);
     }
   }
   function scheduleReconnect() {
@@ -69,15 +110,36 @@
       tokenMissingLogged = false;
       const ws = new WebSocket(ENGINE_URL);
       socket = ws;
+      let drainTimer = null;
+      let pingTimer = null;
       ws.onopen = () => {
+        socketOpenAt = Date.now();
         ws.send(JSON.stringify({ type: "auth", token }));
         ws.send(JSON.stringify({ type: "hello", name: "astra", version: ADAPTER_VERSION }));
         lastSentStatus = null;
-        drainCaptures();
         console.log("[relay-astra worker] engine connection open");
+        drainTimer = setTimeout(() => {
+          drainTimer = null;
+          drainCaptures();
+        }, DRAIN_SETTLE_MS);
+        pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(PING_FRAME);
+        }, PING_INTERVAL_MS);
+        void replayStatusAfterHello(ws);
       };
       ws.onclose = (event) => {
-        if (socket === ws) socket = null;
+        if (pingTimer !== null) {
+          clearInterval(pingTimer);
+          pingTimer = null;
+        }
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+        if (socket === ws) {
+          socket = null;
+          socketOpenAt = null;
+        }
         if (event.code === 4401) {
           authRejected = true;
           console.error("[relay-astra worker] engine rejected the saved token \u2014 paste the current one in the extension options");
@@ -115,7 +177,8 @@
       } else {
         queuedCaptures.push({ body: frame.body, sourceRef: frame.sourceRef, ack });
       }
-      if (engineSocketOpen()) {
+      persistQueue();
+      if (drainReady()) {
         drainCaptures();
         return;
       }
@@ -123,12 +186,19 @@
       return true;
     }
     if (frame?.type === "status") {
-      if (typeof frame.status === "string" && frame.status !== lastSentStatus && engineSocketOpen() && socket !== null) {
+      if (typeof frame.status !== "string") {
+        sendResponse({ ok: false, error: "malformed status" });
+        return;
+      }
+      void chromeApi.storage.session.set({ [STATUS_KEY]: frame.status });
+      if (frame.status !== lastSentStatus && engineSocketOpen() && socket !== null) {
         socket.send(JSON.stringify({ type: "status", status: frame.status }));
         lastSentStatus = frame.status;
         debug("status frame sent:", frame.status);
+        sendResponse({ ok: true, sent: true });
+      } else {
+        sendResponse({ ok: true, sent: false });
       }
-      sendResponse({ ok: true });
       return;
     }
     sendResponse({ ok: false, error: "unexpected message" });
@@ -145,5 +215,7 @@
       if (!engineSocketOpen()) void connectEngine();
     }
   });
-  void connectEngine();
+  void restoreQueue().then(() => {
+    void connectEngine();
+  });
 })();

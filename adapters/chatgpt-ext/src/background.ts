@@ -6,12 +6,23 @@
 //   forwards    → {type:'captured', body, sourceRef} and {type:'status', status}
 //
 // The user pastes the token once into the options page (the extension
-// cannot read %APPDATA%). MV3 kills idle workers: a 30s watchdog alarm
-// re-connects a dropped socket; the engine reports 'disconnected' while
-// it is down and assumes 'idle' again on hello.
-import { isRelayHeaderEcho } from './protocol.ts';
+// cannot read %APPDATA%). MV3 kills idle workers: from Chrome 116 an
+// open WebSocket with traffic every <30s keeps the worker alive, which
+// the 20s ping provides; the 30s watchdog alarm still re-connects after
+// an engine outage or browser restart. The engine reports 'disconnected'
+// while the socket is down and assumes 'idle' again on hello.
+//
+// M1.4 fixes applied (review):
+//   F2 — the latest status lives in chrome.storage.session and is
+//        replayed after every hello unless it is 'idle'.
+//   F3 — queued captures drain only after the socket has been open
+//        500ms, survive a 4401 token rejection, and persist in
+//        chrome.storage.session so a worker death cannot drop them.
+//   F4 — a 20s {"type":"ping"} keepalive; the manifest's
+//        minimum_chrome_version 116 gates the WebSocket keepalive rule.
+import { isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
 
-const BUILD_MARKER = '2026-10-19.1';
+const BUILD_MARKER = '2026-10-19.2';
 console.log('[relay-astra worker] service worker started', BUILD_MARKER);
 
 const DEBUG = false;
@@ -26,6 +37,12 @@ const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const RECONNECT_MS = 2000;
 const WATCHDOG_ALARM = 'relay-astra-watchdog';
 const WATCHDOG_PERIOD_MIN = 0.5; // Chrome 120+ allows 30s alarm periods
+const STATUS_KEY = 'latestStatus';      // F2: last status from the content script
+const QUEUE_KEY = 'queuedCaptures';      // F3: captures that must survive worker death
+const DRAIN_SETTLE_MS = 500;             // F3: wait out the token-rejection window
+const PING_INTERVAL_MS = 20000;         // F4: under the ~30s MV3 idle kill
+const MAX_PERSISTED_QUEUE = 20;          // F3: keep the persisted queue small
+const PING_FRAME = JSON.stringify({ type: 'ping' });
 
 // --- minimal chrome API view (structural typing, as in the spike) ---
 
@@ -39,6 +56,10 @@ interface SwChrome {
   };
   storage: {
     local: { get(keys: string): Promise<Record<string, unknown>> };
+    session: {
+      get(keys: string): Promise<Record<string, unknown>>;
+      set(items: Record<string, unknown>): Promise<void>;
+    };
     onChanged: {
       addListener: (handler: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => void;
     };
@@ -59,6 +80,7 @@ const chromeApi: SwChrome = maybeChrome;
 // --- engine connection ---
 
 let socket: WebSocket | null = null;
+let socketOpenAt: number | null = null; // F3: when the current socket opened
 let connectInFlight = false;
 let tokenMissingLogged = false;
 let authRejected = false; // the engine rejected the saved token; needs a fresh paste
@@ -75,19 +97,73 @@ function engineSocketOpen(): boolean {
   return socket !== null && socket.readyState === WebSocket.OPEN;
 }
 
+/**
+ * F3: the socket has been open long enough that a drain is safe. The
+ * engine's token rejection (4401) lands right after open; captures acked
+ * before it would be lost while the content script believes them sent.
+ */
+function drainReady(): boolean {
+  return engineSocketOpen() &&
+    socketOpenAt !== null && Date.now() - socketOpenAt >= DRAIN_SETTLE_MS;
+}
+
 async function storedToken(): Promise<string | null> {
   const bag = await chromeApi.storage.local.get(TOKEN_KEY);
   const value = bag[TOKEN_KEY];
   return typeof value === 'string' && TOKEN_PATTERN.test(value) ? value : null;
 }
 
+/** F3: the queue mirrored to chrome.storage.session (no ack callbacks —
+ * they do not survive a worker death anyway), capped to stay small.
+ * Newest items win when over the cap. */
+function persistQueue(): void {
+  const persistable = queuedCaptures
+    .slice(-MAX_PERSISTED_QUEUE)
+    .map(({ body, sourceRef }) => ({ body, sourceRef }));
+  void chromeApi.storage.session.set({ [QUEUE_KEY]: persistable });
+}
+
+/** F3: on worker revival, bring back whatever the previous worker had
+ * queued — its in-memory copy died with it. */
+async function restoreQueue(): Promise<void> {
+  const bag = await chromeApi.storage.session.get(QUEUE_KEY);
+  const stored = bag[QUEUE_KEY];
+  if (!Array.isArray(stored)) return;
+  for (const raw of stored) {
+    const item = raw as { body?: unknown; sourceRef?: unknown };
+    if (typeof item.body === 'string' && typeof item.sourceRef === 'string' &&
+        !queuedCaptures.some((q) => q.sourceRef === item.sourceRef)) {
+      queuedCaptures.push({ body: item.body, sourceRef: item.sourceRef });
+    }
+  }
+}
+
 function drainCaptures(): void {
+  let drained = false;
   while (queuedCaptures.length > 0 && engineSocketOpen() && socket !== null) {
     const item = queuedCaptures.shift();
     if (item === undefined) break;
     socket.send(JSON.stringify({ type: 'captured', body: item.body, sourceRef: item.sourceRef }));
     item.ack?.({ ok: true, sent: true });
+    drained = true;
     debug('captured frame sent:', item.sourceRef);
+  }
+  if (drained) persistQueue(); // F3: drained items leave the persisted queue too
+}
+
+/**
+ * F2: the engine resets astra to 'idle' on every hello, and the worker may
+ * have restarted since the last status. Replay the remembered status
+ * unless it is 'idle' (which the engine already assumes).
+ */
+async function replayStatusAfterHello(ws: WebSocket): Promise<void> {
+  const bag = await chromeApi.storage.session.get(STATUS_KEY);
+  const stored = bag[STATUS_KEY];
+  const replay = statusToReplayAfterHello(typeof stored === 'string' ? stored : null);
+  if (replay !== null && ws === socket && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'status', status: replay }));
+    lastSentStatus = replay;
+    debug('status replayed after hello:', replay);
   }
 }
 
@@ -110,17 +186,33 @@ async function connectEngine(): Promise<void> {
     tokenMissingLogged = false;
     const ws = new WebSocket(ENGINE_URL);
     socket = ws;
+    // Per-connection timers (F3/F4): a replaced socket's close event must
+    // not clear the live socket's timers, so each closes over its own handles.
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
     ws.onopen = () => {
+      socketOpenAt = Date.now();
       ws.send(JSON.stringify({ type: 'auth', token }));
       ws.send(JSON.stringify({ type: 'hello', name: 'astra', version: ADAPTER_VERSION }));
-      lastSentStatus = null; // the engine assumes idle on hello; re-announce on change
-      drainCaptures();
+      lastSentStatus = null; // the engine assumes idle on hello; F2 may replay next
       console.log('[relay-astra worker] engine connection open');
+      // F3: the engine can still reject the token moments after open —
+      // drain only once the connection has settled, and only if still open.
+      drainTimer = setTimeout(() => { drainTimer = null; drainCaptures(); }, DRAIN_SETTLE_MS);
+      // F4: traffic every 20s keeps Chrome 116+ from killing the worker.
+      pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(PING_FRAME);
+      }, PING_INTERVAL_MS);
+      void replayStatusAfterHello(ws); // F2
     };
     ws.onclose = (event) => {
-      if (socket === ws) socket = null;
+      if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
+      if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
+      if (socket === ws) { socket = null; socketOpenAt = null; }
       if (event.code === 4401) {
         // The engine rejected the token — retrying with the same one loops forever.
+        // F3: anything not yet drained stays queued (and persisted) for the
+        // next successful connect after a fresh token paste.
         authRejected = true;
         console.error('[relay-astra worker] engine rejected the saved token — paste the current one in the extension options');
         return;
@@ -163,21 +255,30 @@ function handleMessage(
     } else {
       queuedCaptures.push({ body: frame.body, sourceRef: frame.sourceRef, ack });
     }
-    if (engineSocketOpen()) {
+    persistQueue(); // F3: the queue survives worker death
+    if (drainReady()) {
       drainCaptures(); // sends and acks synchronously
       return;
     }
-    void connectEngine(); // start reconnecting; the queued item acks when sent
+    void connectEngine(); // no-op while connected; reconnects when down
     return true;         // keep the sendResponse channel open for the async ack
   }
   if (frame?.type === 'status') {
-    if (typeof frame.status === 'string' && frame.status !== lastSentStatus &&
-        engineSocketOpen() && socket !== null) {
+    if (typeof frame.status !== 'string') {
+      sendResponse({ ok: false, error: 'malformed status' });
+      return;
+    }
+    void chromeApi.storage.session.set({ [STATUS_KEY]: frame.status }); // F2: survives worker death
+    if (frame.status !== lastSentStatus && engineSocketOpen() && socket !== null) {
       socket.send(JSON.stringify({ type: 'status', status: frame.status }));
       lastSentStatus = frame.status;
       debug('status frame sent:', frame.status);
+      sendResponse({ ok: true, sent: true });
+    } else {
+      // Not sent now; the worker replays the remembered status after the
+      // next hello (F2), so the content script may treat this as handled.
+      sendResponse({ ok: true, sent: false });
     }
-    sendResponse({ ok: true });
     return;
   }
   sendResponse({ ok: false, error: 'unexpected message' });
@@ -200,4 +301,6 @@ chromeApi.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-void connectEngine();
+// Restore the persisted queue first (F3), then connect — a capture the
+// previous worker had queued must be in place before the post-hello drain.
+void restoreQueue().then(() => { void connectEngine(); });
