@@ -87,7 +87,7 @@ interface RelayMessage {
 | --- | --- | --- |
 | `messages` | id, source, body, content\_hash, source\_ref, hop, created\_at | One row per captured message |
 | `deliveries` | message\_id, target, status, attempts, updated\_at | One row per message per target |
-| `settings` | key, value | Relay mode, AI turn cap, Codex thread id |
+| `settings` | key, value | Relay mode, AI turn cap, auto-send on/off, auto-send delay (seconds), Codex thread id |
 | `adapter_state` | adapter, last\_seen\_ref, updated\_at | Lets adapters resume without replaying |
 
 Duplicate rule: same `source` and `content_hash` within 10 minutes, or a `source_ref` already stored, is rejected.
@@ -116,17 +116,28 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | adapter → engine | `delivered` / `failed` | message id, error |
 | GUI → engine | `send` | body, targets |
 | GUI → engine | `approve` / `reject` | message id |
-| GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap |
+| GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |
 | GUI → engine | `stop` | none |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
 | engine → GUI | `snapshot` | status per adapter + the newest 200 messages — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
+| engine → GUI | `countdown` | message id, target, seconds left (sent when a countdown starts and when it is cancelled) |
 
 Broadcasts reach only GUIs that sent `gui_hello`; a freshly greeted GUI first receives one `snapshot` as its catch-up.
 
 ### Adapter contract
 
 Each adapter does four things and nothing else: report status, report completed messages, deliver text it is given, and confirm delivery. Routing decisions never happen inside an adapter.
+
+### Auto-send timer
+
+The GUI has an "Auto-send after N seconds" tick box (default off, N default 10, allowed 3 seconds to 30 minutes; the GUI lets you enter it in seconds or minutes).
+
+- Off (manual): every relayed message waits as a pending item until the user clicks Send. This is the default and the only behaviour before Milestone 5.
+- On (automatic): when a relayed message becomes ready, the engine starts a countdown for it and the GUI shows the seconds left on that pending item, with Cancel and Send now buttons. At zero the engine delivers it. Cancel marks the delivery `cancelled`.
+- The countdown is a delivery delay only. It never answers Codex approval requests, which always wait for the user (Hard rule: no automatic approvals). The ChatGPT side still follows M3.1: by default the text is typed into the box and the user clicks Send there.
+- The turn cap, Stop and Pause all win over the timer: hitting the cap, pressing Stop or pausing cancels every running countdown and the items stay pending.
+- Countdowns are not persisted. After a restart, nothing resumes counting; items wait for the user (Hard rule: no replay). Unticking the box cancels running countdowns and leaves those items pending.
 
 ## Hard rules
 
@@ -217,7 +228,7 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 ### Milestone 4 — Shared chat
 
 1. M4.1 GUI input box with @Astra, @Codex, @both.
-2. M4.2 Relay-mode switch (manual, approve each, auto) and turn-cap setting.
+2. M4.2 Relay-mode switch (manual, approve each, auto), turn-cap setting, and the auto-send tick box with its delay in seconds (see Auto-send timer).
 3. M4.3 Pause/resume, transcript search, Markdown export, system-tray icon, settings saved between runs.
 
 - [ ] The publisher can hold a three-way conversation without touching the ChatGPT or Codex windows except to click Send
@@ -225,11 +236,13 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 
 ### Milestone 5 — Controlled automatic collaboration
 
-1. M5.1 Auto mode routes replies between the AIs up to the turn cap, then pauses with a notice.
+1. M5.1 Auto mode routes replies between the AIs up to the turn cap, then pauses with a notice. With auto-send ticked, each delivery waits for its countdown; unticked, each waits for Send.
 2. M5.2 A per-session summary line in the transcript: turns used, held messages, approvals pending.
 
 - [ ] Auto mode never exceeds the cap, even when both AIs reply quickly
 - [ ] Destructive Codex actions still wait for the publisher
+- [ ] With auto-send ticked at 10 s, a message is delivered 10 s after it becomes ready, and Cancel during the countdown marks it `cancelled` with nothing delivered
+- [ ] Stop, Pause, the turn cap, unticking the box, or a restart during a countdown leaves the item pending and delivers nothing
 
 ## Review checkpoints and status reports
 
