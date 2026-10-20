@@ -22,7 +22,7 @@
 //        minimum_chrome_version 116 gates the WebSocket keepalive rule.
 import { isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
 
-const BUILD_MARKER = '2026-10-19.3';
+const BUILD_MARKER = '2026-10-19.4';
 console.log('[relay-astra worker] service worker started', BUILD_MARKER);
 
 const DEBUG = false;
@@ -215,6 +215,14 @@ async function connectEngine(): Promise<void> {
       if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
       if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
       if (socket === ws) { socket = null; socketOpenAt = null; }
+      if (event.code === 1000) {
+        // B2: we closed the socket for a token change — reconnect now with
+        // no 2 s wait (the fresh token is re-read per attempt). This is not
+        // an auth rejection and not a replacement; it never sets authRejected.
+        console.log('[relay-astra worker] token changed — reconnecting with the new one');
+        void connectEngine();
+        return;
+      }
       if (event.code === 4401) {
         // The engine rejected the token — retrying with the same one loops forever.
         // F3: anything not yet drained stays queued (and persisted) for the
@@ -303,7 +311,14 @@ chromeApi.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes[TOKEN_KEY] !== undefined) {
     authRejected = false; // a new token deserves fresh attempts
     tokenMissingLogged = false;
-    if (!engineSocketOpen()) void connectEngine();
+    if (socket !== null) {
+      // B2: close with 1000 so onclose reconnects straight away with the
+      // new token — a bad paste surfaces as a 4401 rejection immediately,
+      // instead of at the next idle watchdog pass.
+      socket.close(1000, 'token replaced');
+    } else {
+      void connectEngine();
+    }
   }
 });
 

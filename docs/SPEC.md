@@ -115,12 +115,14 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | engine → adapter | `deliver` | message id, text with relay header |
 | adapter → engine | `delivered` / `failed` | message id, error |
 | GUI → engine | `send` | body, targets |
-| GUI → engine | `approve` / `reject` | message id |
+| GUI → engine | `forward` | message id, target |
+| GUI → engine | `approve` / `reject` | message id, target |
 | GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |
 | GUI → engine | `stop` | none |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
-| engine → GUI | `snapshot` | status per adapter + the newest 200 messages — sent once, to that socket only |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user` — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
+| engine → GUI | `delivery_update` | message id, target, status, attempts, updatedAt, error if any |
 | engine → GUI | `countdown` | message id, target, seconds left (sent when a countdown starts and when it is cancelled) |
 
 Broadcasts reach only GUIs that sent `gui_hello`; a freshly greeted GUI first receives one `snapshot` as its catch-up.

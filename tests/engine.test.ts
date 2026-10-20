@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket as WsRawClient } from 'ws';
@@ -519,5 +520,358 @@ test('any frame before auth closes with 4401 and stores nothing', async () => {
     guiIntruder.send({ type: 'gui_hello' });
     assert.equal(await guiIntruder.expectClosed(), 4401);
     assert.equal(engine.store.isDuplicate('codex', hashBody('x')), false);
+  });
+});
+
+// --- M2.1: forward / approve / reject / deliver workflow ---
+
+/** Assert a delivery_update frame's payload, minus the timestamp text. */
+function assertDeliveryUpdate(frame: Frame, messageId: string, target: string, status: string, attempts: number): void {
+  assert.equal(frame.type, 'delivery_update', `expected a delivery_update, got ${JSON.stringify(frame)}`);
+  assert.equal(frame.messageId, messageId);
+  assert.equal(frame.target, target);
+  assert.equal(frame.status, status);
+  assert.equal(frame.attempts, attempts);
+  assert.ok(typeof frame.updatedAt === 'string' && frame.updatedAt !== '', 'delivery_update carries updatedAt');
+}
+
+/** Capture one astra reply and return its message id (gui must be drained to the transcript_update). */
+async function captureFromAstra(gui: Client, astra: Client, body: string, ref: string): Promise<string> {
+  astra.send({ type: 'captured', body, sourceRef: ref });
+  const update = await gui.nextMessage() as { message?: { id?: string } };
+  const id = String(update.message?.id);
+  assert.notEqual(id, '', 'the capture produced a message id');
+  return id;
+}
+
+test('forward: a codex target gets a pending_approval row and one delivery_update; a second forward changes nothing', async () => {
+  await withEngine('forward', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'astra', status: 'idle' });
+    const id = await captureFromAstra(gui, astra, 'please relay me', 'turn-fwd-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    const row = engine.store.getDelivery(id, 'codex');
+    assert.ok(row !== null && row.status === 'pending_approval');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' }); // idempotent
+    await gui.expectSilence(400);
+  });
+});
+
+test('forward: astra targets, a message\'s own source and unknown messages are ignored', async () => {
+  await withEngine('forwardignored', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const astraId = await captureFromAstra(gui, astra, 'not for astra', 'turn-fwd-2');
+    const codexId = await captureFromAstra(gui, codex, 'not for codex either', 'turn-fwd-3');
+
+    gui.send({ type: 'forward', messageId: astraId, target: 'astra' });   // only codex is a forward target in M2
+    gui.send({ type: 'forward', messageId: codexId, target: 'codex' });   // target equals the message's source
+    gui.send({ type: 'forward', messageId: 'UNKNOWN', target: 'codex' }); // unknown message
+    await gui.expectSilence(400);
+
+    assert.equal(engine.store.getDelivery(astraId, 'astra'), null, 'no astra-target row may exist');
+    assert.equal(engine.store.getDelivery(codexId, 'codex'), null, 'a message is never forwarded to its own source');
+  });
+});
+
+test('approve: the connected codex adapter receives one deliver with the exact relay header; the row goes delivering then delivered', async () => {
+  await withEngine('approve', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const id = await captureFromAstra(gui, astra, 'relay this body', 'turn-ap-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.messageId, id);
+    assert.equal(deliver.text, `[Relay · from Astra · #${id} · hop 1]\nrelay this body`);
+
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+  });
+});
+
+test('approve twice: exactly one deliver is sent', async () => {
+  await withEngine('approvetwice', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const id = await captureFromAstra(gui, astra, 'just once please', 'turn-ap-2');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+
+    gui.send({ type: 'approve', messageId: id, target: 'codex' }); // the row is delivering — ignored
+    await gui.expectSilence(300);
+    await codex.expectSilence(300);
+  });
+});
+
+test('approve with no codex adapter: the row queues and goes out exactly once when codex says hello', async () => {
+  await withEngine('queuedhello', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+    const id = await captureFromAstra(gui, astra, 'waiting for codex', 'turn-qh-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    await gui.expectSilence(200);
+
+    const codex = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.messageId, id);
+    assert.equal(deliver.text, `[Relay · from Astra · #${id} · hop 1]\nwaiting for codex`);
+    await codex.expectSilence(300); // exactly one deliver, ever
+  });
+});
+
+test('reject: a pending row becomes cancelled (final); a later approve is ignored', async () => {
+  await withEngine('reject', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+    const id = await captureFromAstra(gui, astra, 'never mind', 'turn-rj-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'reject', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'cancelled', 0);
+
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    await gui.expectSilence(300);
+    assert.equal(engine.store.getDelivery(id, 'codex')?.status, 'cancelled');
+  });
+});
+
+test('delivered from the astra socket or a GUI socket is ignored', async () => {
+  await withEngine('wrongack', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const id = await captureFromAstra(gui, astra, 'only codex may confirm', 'turn-wa-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+
+    astra.send({ type: 'delivered', messageId: id }); // wrong adapter
+    gui.send({ type: 'delivered', messageId: id });    // a GUI is not an adapter at all
+    await gui.expectSilence(400);
+    assert.equal(engine.store.getDelivery(id, 'codex')?.status, 'delivering',
+      'a confirmation from the wrong socket changes nothing');
+
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+  });
+});
+
+test('the target adapter disconnecting mid-delivery fails the row', async () => {
+  await withEngine('disconnectfail', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const id = await captureFromAstra(gui, astra, 'gone too soon', 'turn-df-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+
+    codex.close();
+    const failed = await gui.nextMessage();
+    assertDeliveryUpdate(failed, id, 'codex', 'failed', 1);
+    assert.equal(failed.error, 'adapter disconnected before confirming');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'disconnected' });
+    assert.equal(engine.store.getDelivery(id, 'codex')?.error, 'adapter disconnected before confirming');
+  });
+});
+
+test('the ack timer expires: the row fails with "no confirmation from adapter"', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-ackto-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  let engine: EngineHandle | undefined;
+  try {
+    engine = await startEngine({ port: 0, dbPath, tokenPath, deliverAckTimeoutMs: 80 });
+    const token = readFileSync(tokenPath, 'utf8').trim();
+    const url = `ws://127.0.0.1:${engine.port}`;
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+    const id = await captureFromAstra(gui, astra, 'slow adapter', 'turn-ackto');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver'); // never confirmed
+
+    const failed = await gui.nextMessage(3000);
+    assertDeliveryUpdate(failed, id, 'codex', 'failed', 1);
+    assert.equal(failed.error, 'no confirmation from adapter');
+  } finally {
+    engine?.stop();
+    cleanupDir(dir);
+  }
+});
+
+test('engine start resets queued and delivering rows to pending_approval; a connecting adapter gets nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-reset-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: one queued row, one delivering row.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const queued = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'queued one', hop: 0 });
+      engine.store.insertDelivery(queued.id, 'codex');
+      engine.store.markStatus(queued.id, 'codex', 'queued');
+      const flying = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'delivering one', hop: 0 });
+      engine.store.insertDelivery(flying.id, 'codex');
+      engine.store.markStatus(flying.id, 'codex', 'queued');
+      engine.store.markStatus(flying.id, 'codex', 'delivering');
+      engine.stop();
+    }
+    { // Run 2: the start reset put both back to pending_approval; codex hello delivers nothing.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+      await codex.expectSilence(400); // nothing goes out without a fresh approval
+      await gui.expectSilence(400);
+      const rows = engine.store.pendingDeliveries().filter((p) => p.target === 'codex');
+      assert.equal(rows.length, 2);
+      assert.ok(rows.every((p) => p.status === 'pending_approval'),
+        'a restart must never resume a delivery on its own (hard rule: no replay)');
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('echo: a codex capture matching a recently delivered body is dropped; 11 minutes later it is stored', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-echo-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  const body = 'the echoed body text';
+  try {
+    { // Run 1: deliver to codex, then let codex "echo" the same body back.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const astra = await openAdapter(url, token, 'astra');
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); // astra idle
+      await gui.nextMessage(); // codex idle
+      const id = await captureFromAstra(gui, astra, body, 'turn-echo-src');
+
+      gui.send({ type: 'forward', messageId: id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+      gui.send({ type: 'approve', messageId: id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+      assert.equal((await codex.nextMessage()).type, 'deliver');
+      codex.send({ type: 'delivered', messageId: id });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+
+      codex.send({ type: 'captured', body, sourceRef: 'turn-echo-1' }); // the echo, ~1 minute later
+      await gui.expectSilence(400); // no transcript_update — silently dropped
+      assert.equal(engine.store.isDuplicate('codex', hashBody(body)), false, 'the echo was never stored');
+      engine.stop();
+    }
+    { // Backdate the delivery 11 minutes; restart: the same capture is now stored.
+      const db = new DatabaseSync(dbPath);
+      db.prepare('UPDATE deliveries SET updated_at = ? WHERE target = ?')
+        .run(new Date(Date.now() - 11 * 60 * 1000).toISOString(), 'codex');
+      db.close();
+
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+      codex.send({ type: 'captured', body, sourceRef: 'turn-echo-2' });
+      const stored = await gui.nextMessage() as { type?: string; message?: { source?: string; body?: string } };
+      assert.equal(stored.type, 'transcript_update', 'outside the echo window the capture is stored');
+      assert.equal(stored.message?.source, 'codex');
+      assert.equal(stored.message?.body, body);
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('the snapshot carries deliveries for the snapshot messages, minus user-target rows', async () => {
+  await withEngine('snapshotdeliv', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+    const id = await captureFromAstra(gui, astra, 'snapshot me', 'turn-snap-1');
+
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snap = await late.nextMessage() as {
+      type?: string;
+      deliveries?: Array<{ messageId?: string; target?: string; status?: string; attempts?: number }>;
+    };
+    assert.equal(snap.type, 'snapshot');
+    assert.ok(Array.isArray(snap.deliveries), 'the snapshot carries a deliveries array');
+    assert.equal(snap.deliveries?.length, 1, "the message's user-target row is not a delivery in the UI sense");
+    const row = snap.deliveries?.[0];
+    assert.equal(row?.messageId, id);
+    assert.equal(row?.target, 'codex');
+    assert.equal(row?.status, 'queued');
+    assert.equal(row?.attempts, 0);
   });
 });

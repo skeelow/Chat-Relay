@@ -1,28 +1,39 @@
 // Relay Chat — engine (M1.2): the localhost WebSocket server.
 //
 // One engine owns all routing and state (SPEC: Architecture); adapters connect
-// through it and never decide where a message goes. Milestone 1 is the read-only
-// room: captured replies are stored and broadcast to GUI connections, and nothing
-// is ever sent to either AI — send/approve/reject/set_mode/stop are ignored until
-// their milestones.
+// through it and never decide where a message goes. Milestone 1 was the
+// read-only room; M2.1 adds the approved-delivery workflow: the GUI forwards
+// a stored message to codex, approves or rejects it, and the engine delivers
+// with the relay header. Nothing is ever delivered without an explicit approve,
+// and a restart resets every in-flight delivery to pending (hard rule:
+// no replay).
 //
 // Protocol (SPEC: WebSocket protocol, ws://127.0.0.1:8787, JSON one per frame):
 //   client → engine  {type:'auth', token}            first frame on every connection
 //   adapter → engine {type:'hello', name, version}   name is the participant it speaks for
-//   adapter → engine {type:'status', status}         idle|thinking|streaming|awaiting_approval|disconnected
+//   adapter → engine {type:'status', status}         idle|thinking|streaming|awaiting_approval|disconnected|selectors_stale
 //   adapter → engine {type:'captured', body, sourceRef?}
+//   adapter → engine {type:'delivered' / 'failed', messageId, error?}   ack for a delivery (M2.1)
+//   GUI → engine     {type:'forward', messageId, target}                 request a delivery row (M2.1)
+//   GUI → engine     {type:'approve' / 'reject', messageId, target}      M2.1: approve now requires the target
 //   GUI → engine     {type:'gui_hello'}                      once, right after auth (M1.5)
-//   engine → GUI     {type:'snapshot', statuses, messages}   one-time catch-up, to that socket only
+//   engine → adapter {type:'deliver', messageId, text}        text carries the relay header (M2.1)
+//   engine → GUI     {type:'snapshot', statuses, messages, deliveries}   one-time catch-up (deliveries: M2.1)
 //   engine → GUI     {type:'transcript_update', message}
 //   engine → GUI     {type:'status_update', adapter, status}
+//   engine → GUI     {type:'delivery_update', messageId, target, status, attempts, updatedAt, error?} (M2.1)
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
 // binds 127.0.0.1, never 0.0.0.0. Hard rule: no replay — connecting a GUI
-// broadcasts nothing from the stored transcript.
+// broadcasts nothing from the stored transcript, and nothing is delivered
+// without a fresh approval.
 
 import { WebSocketServer, type WebSocket } from 'ws';
-import { openStore, StoreError, type Participant, type RelayMessage, type RelayStore } from './store.ts';
+import {
+  openStore, StoreError,
+  type Participant, type PendingDelivery, type RelayMessage, type RelayStore,
+} from './store.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -33,6 +44,9 @@ export interface EngineOptions {
   host?: string;       // default '127.0.0.1' — hard rule: never 0.0.0.0
   dbPath?: string;     // default 'relay.db'
   tokenPath?: string;  // default %APPDATA%\RelayChat\token
+  /** M2.1: how long a delivery waits for the adapter's delivered/failed
+   *  ack before the row is marked failed. Default 30 s. */
+  deliverAckTimeoutMs?: number;
 }
 
 export interface EngineHandle {
@@ -55,6 +69,21 @@ const AUTH_GRACE_MS = 5000;
 
 /** Messages a joining GUI receives in its snapshot (M1.5 handshake). */
 const SNAPSHOT_LIMIT = 200;
+
+/** M2.1: default ack window for a delivery before the row is marked failed. */
+const DEFAULT_ACK_TIMEOUT_MS = 30000;
+
+/** Display names for the relay header (SPEC: '[Relay · from <Name> · #<id> · hop <n>]'). */
+const SOURCE_NAMES: Record<Participant, string> = { user: 'You', astra: 'Astra', codex: 'Codex' };
+
+/** M2.1 SPEC relay header — the first line of every delivered text. */
+function relayHeader(pending: { messageId: string; source: Participant; hop: number }): string {
+  return `[Relay · from ${SOURCE_NAMES[pending.source]} · #${pending.messageId} · hop ${pending.hop + 1}]`;
+}
+
+function isParticipant(value: unknown): value is Participant {
+  return value === 'user' || value === 'astra' || value === 'codex';
+}
 
 interface ClientState {
   authenticated: boolean;
@@ -89,8 +118,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const tokenPath = options.tokenPath ?? join(process.env.APPDATA ?? '.', 'RelayChat', 'token');
   const token = loadOrCreateToken(tokenPath);
   const store = openStore(options.dbPath ?? 'relay.db');
+  const ackTimeoutMs = options.deliverAckTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+  // M2.1 no-replay: nothing resumes on its own after a (re)start — every
+  // in-flight delivery goes back to waiting for the user's approval.
+  const resetCount = store.resetInFlightToPending();
+  if (resetCount > 0) {
+    console.log(`[engine] reset ${resetCount} in-flight delivery(ies) to pending_approval`);
+  }
 
   const server = new WebSocketServer({ host, port: options.port ?? 8787 });
+  // M2.1: once stop() runs, socket close events are just teardown noise —
+  // they are not adapter disconnects (and the store is closing anyway).
+  let stopped = false;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once('listening', resolve);
@@ -128,6 +167,60 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     broadcast({ type: 'status_update', adapter: participant, status });
   };
 
+  // --- M2.1: the approved-delivery workflow ---
+
+  /** One ack timer per in-flight delivery, keyed `${messageId}:${target}`. */
+  const ackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const clearAckTimer = (messageId: string, target: Participant): void => {
+    const key = `${messageId}:${target}`;
+    const timer = ackTimers.get(key);
+    if (timer !== undefined) { clearTimeout(timer); ackTimers.delete(key); }
+  };
+
+  const broadcastDeliveryUpdate = (messageId: string, target: Participant): void => {
+    const row = store.getDelivery(messageId, target);
+    if (row === null) return;
+    broadcast({
+      type: 'delivery_update',
+      messageId,
+      target,
+      status: row.status,
+      attempts: row.attempts,
+      updatedAt: row.updatedAt,
+      ...(row.error !== null ? { error: row.error } : {}),
+    });
+  };
+
+  const adapterSocketFor = (participant: Participant): WebSocket | null => {
+    for (const [ws, state] of clients) {
+      if (state.participant === participant && state.authenticated) return ws;
+    }
+    return null;
+  };
+
+  const failDelivery = (messageId: string, target: Participant, error: string): void => {
+    const row = store.getDelivery(messageId, target);
+    if (row === null || row.status !== 'delivering') return;
+    store.markStatus(messageId, target, 'failed', error);
+    clearAckTimer(messageId, target);
+    broadcastDeliveryUpdate(messageId, target);
+  };
+
+  /** Send one queued row to its adapter, mark it delivering, arm the ack timer. */
+  const deliverTo = (ws: WebSocket, pending: PendingDelivery): void => {
+    const text = `${relayHeader(pending)}\n${pending.body}`;
+    ws.send(JSON.stringify({ type: 'deliver', messageId: pending.messageId, text }));
+    store.markStatus(pending.messageId, pending.target, 'delivering');
+    clearAckTimer(pending.messageId, pending.target); // a re-delivery replaces any stale timer
+    const key = `${pending.messageId}:${pending.target}`;
+    ackTimers.set(key, setTimeout(() => {
+      ackTimers.delete(key);
+      failDelivery(pending.messageId, pending.target, 'no confirmation from adapter');
+    }, ackTimeoutMs));
+    broadcastDeliveryUpdate(pending.messageId, pending.target);
+  };
+
   server.on('connection', (ws: WebSocket) => {
     // First thing on every socket: a malformed frame (e.g. invalid UTF-8)
     // emits 'error' and would crash the process without a listener. Log one
@@ -147,7 +240,12 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     ws.on('close', () => {
       if (state.authTimer !== null) clearTimeout(state.authTimer);
       clients.delete(ws);
+      if (stopped) return; // engine shutdown, not an adapter disconnect
       if (state.participant !== null) {
+        // M2.1: a delivery dies with its adapter — the ack will never come.
+        for (const pending of store.deliveriesForTarget(state.participant, 'delivering')) {
+          failDelivery(pending.messageId, state.participant, 'adapter disconnected before confirming');
+        }
         adapterStatuses[state.participant] = 'disconnected';
         broadcastAdapterStatus(state.participant, 'disconnected');
       }
@@ -201,6 +299,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             state.status = 'idle';
             adapterStatuses[name] = 'idle';
             broadcastAdapterStatus(name, 'idle');
+            // M2.1: approved items waiting for this adapter go out now,
+            // oldest first, each exactly once (each leaves 'queued').
+            for (const pending of store.deliveriesForTarget(name, 'queued')) {
+              deliverTo(ws, pending);
+            }
             return;
           }
           case 'status': {
@@ -228,11 +331,95 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               });
               broadcast({ type: 'transcript_update', message });
             } catch (err) {
-              if (err instanceof StoreError && (err.code === 'duplicate' || err.code === 'relay_header')) {
-                return; // adapters may resend; the store is the authority on duplicates
+              if (err instanceof StoreError &&
+                  (err.code === 'duplicate' || err.code === 'relay_header' || err.code === 'echo')) {
+                return; // adapters may resend or echo; the store is the authority
               }
               throw err;
             }
+            return;
+          }
+          case 'forward': {
+            // M2.1: the GUI asks for a delivery row. Only codex is a valid
+            // target in M2 (astra delivery arrives in M3.1).
+            const messageId = record.messageId;
+            if (typeof messageId !== 'string') return;
+            if (record.target !== 'codex') {
+              console.log(`[engine] forward ignored: target ${String(record.target)} — only codex is forwardable in M2`);
+              return;
+            }
+            const target: Participant = 'codex';
+            const message = store.getMessage(messageId);
+            if (message === null) {
+              console.log(`[engine] forward ignored: unknown message ${messageId}`);
+              return;
+            }
+            if (message.source === target) {
+              console.log(`[engine] forward ignored: ${target} is the message's own source`);
+              return;
+            }
+            const existing = store.getDelivery(messageId, target);
+            if (existing === null) {
+              store.insertDelivery(messageId, target);
+              broadcastDeliveryUpdate(messageId, target);
+            } else if (existing.status === 'failed') {
+              // A failed delivery gets a fresh start: forward again, approve again.
+              store.markStatus(messageId, target, 'pending_approval');
+              broadcastDeliveryUpdate(messageId, target);
+            }
+            // Any other state: idempotent — nothing changes, nothing broadcasts.
+            return;
+          }
+          case 'approve': {
+            // M2.1: only a pending_approval row can be approved. It queues,
+            // and goes out immediately when the target adapter is connected
+            // (otherwise its hello sends it) — approving twice sends once.
+            const messageId = record.messageId;
+            if (typeof messageId !== 'string' || !isParticipant(record.target)) return;
+            const target = record.target;
+            const row = store.getDelivery(messageId, target);
+            if (row === null || row.status !== 'pending_approval') return;
+            store.markStatus(messageId, target, 'queued');
+            broadcastDeliveryUpdate(messageId, target);
+            const adapter = adapterSocketFor(target);
+            if (adapter !== null) {
+              const pending = store.deliveriesForTarget(target, 'queued')
+                .find((p) => p.messageId === messageId);
+              if (pending !== undefined) deliverTo(adapter, pending);
+            }
+            return;
+          }
+          case 'reject': {
+            // M2.1: pending or queued rows become cancelled — final, nothing sent.
+            const messageId = record.messageId;
+            if (typeof messageId !== 'string' || !isParticipant(record.target)) return;
+            const target = record.target;
+            const row = store.getDelivery(messageId, target);
+            if (row === null || (row.status !== 'pending_approval' && row.status !== 'queued')) return;
+            store.markStatus(messageId, target, 'cancelled');
+            broadcastDeliveryUpdate(messageId, target);
+            return;
+          }
+          case 'delivered':
+          case 'failed': {
+            // M2.1: accept the ack only from the socket registered as this
+            // delivery's target participant, and only while the row is in flight.
+            const target = state.participant;
+            if (target === null) return;
+            const messageId = record.messageId;
+            if (typeof messageId !== 'string') return;
+            const row = store.getDelivery(messageId, target);
+            if (row === null || row.status !== 'delivering') return;
+            if (record.type === 'delivered') {
+              store.markStatus(messageId, target, 'delivered');
+            } else {
+              const error = typeof record.error === 'string' && record.error.length > 0
+                ? record.error
+                : 'delivery failed';
+              store.markStatus(messageId, target, 'failed', error);
+            }
+            clearAckTimer(messageId, target);
+            broadcastDeliveryUpdate(messageId, target);
             return;
           }
           case 'gui_hello': {
@@ -244,19 +431,21 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (state.participant !== null) { ws.close(4400, 'adapters cannot be GUIs'); return; }
             if (state.isGui) return;
             state.isGui = true;
+            const messages = store.recentMessages(SNAPSHOT_LIMIT);
             ws.send(JSON.stringify({
               type: 'snapshot',
               statuses: { codex: adapterStatuses.codex, astra: adapterStatuses.astra },
-              messages: store.recentMessages(SNAPSHOT_LIMIT),
+              messages,
+              // M2.1: every non-user delivery row of those messages.
+              deliveries: store.deliveriesOf(messages.map((m) => m.id)),
             }));
             return;
           }
           case 'send':
-          case 'approve':
-          case 'reject':
           case 'set_mode':
           case 'stop':
-            // Milestone 1 is read-only: nothing is ever sent to either AI.
+            // Still read-only from the GUI's side until their milestones
+            // (M2.1 delivered only what the user explicitly approved).
             return;
           default:
             return; // unknown frame types are ignored
@@ -271,7 +460,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     port,
     store,
     stop(): void {
+      stopped = true;
       for (const ws of server.clients) ws.terminate(); // server.clients is the authoritative set
+      for (const timer of ackTimers.values()) clearTimeout(timer); // M2.1: no dangling ack timers
+      ackTimers.clear();
       server.close();
       store.close();
     },
@@ -286,8 +478,15 @@ async function main(): Promise<void> {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   } catch (err) {
-    const code = (err as { code?: string }).code ?? String(err);
-    console.error(`[engine] cannot listen on 127.0.0.1:8787: ${code}`);
+    const info = err as { code?: string; message?: string };
+    if (info.code === 'EADDRINUSE') {
+      // B1: the one failure a user can fix from the message alone.
+      console.error('[engine] cannot listen on 127.0.0.1:8787 (port in use)');
+    } else if (info.code !== undefined && info.message !== undefined) {
+      console.error(`[engine] cannot listen on 127.0.0.1:8787: ${info.code} ${info.message}`);
+    } else {
+      console.error(`[engine] cannot listen on 127.0.0.1:8787: ${String(err)}`);
+    }
     process.exit(1);
   }
 }

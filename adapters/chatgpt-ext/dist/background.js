@@ -11,7 +11,7 @@
   }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-19.3";
+  var BUILD_MARKER = "2026-10-19.4";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -142,6 +142,11 @@
           socket = null;
           socketOpenAt = null;
         }
+        if (event.code === 1e3) {
+          console.log("[relay-astra worker] token changed \u2014 reconnecting with the new one");
+          void connectEngine();
+          return;
+        }
         if (event.code === 4401) {
           authRejected = true;
           console.error("[relay-astra worker] engine rejected the saved token \u2014 paste the current one in the extension options");
@@ -214,7 +219,11 @@
     if (area === "local" && changes[TOKEN_KEY] !== void 0) {
       authRejected = false;
       tokenMissingLogged = false;
-      if (!engineSocketOpen()) void connectEngine();
+      if (socket !== null) {
+        socket.close(1e3, "token replaced");
+      } else {
+        void connectEngine();
+      }
     }
   });
   void restoreQueue().then(() => {

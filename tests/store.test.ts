@@ -281,3 +281,33 @@ test('killing the process mid-delivery and restarting lists the message as pendi
     assert.notEqual(pending[0].status, 'delivered');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// --- M2.1 ---
+
+test('B4: ulid stays strictly increasing when the clock steps backwards', () => {
+  const a = ulid(1_700_000_000_000);
+  const b = ulid(1_700_000_000_000 - 5000);
+  assert.ok(a < b, `a backwards clock step must not sort the new id first (${a} → ${b})`);
+  const c = ulid(1_699_999_000_000);
+  assert.ok(b < c, 'repeated backwards steps keep incrementing');
+  assert.match(c, ULID);
+});
+
+test('resetInFlightToPending: queued and delivering rows wait for approval again', () => {
+  const { store, done } = freshStore('reset');
+  try {
+    const one = store.insertMessage({ source: 'astra', targets: ['user'], body: 'queued one', hop: 0 });
+    store.insertDelivery(one.id, 'codex');
+    store.markStatus(one.id, 'codex', 'queued');
+    const two = store.insertMessage({ source: 'astra', targets: ['user'], body: 'delivering one', hop: 0 });
+    store.insertDelivery(two.id, 'codex');
+    store.markStatus(two.id, 'codex', 'queued');
+    store.markStatus(two.id, 'codex', 'delivering');
+
+    assert.equal(store.resetInFlightToPending(), 2);
+    const rows = store.pendingDeliveries().filter((p) => p.target === 'codex');
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((p) => p.status === 'pending_approval'),
+      'a restart must never resume a delivery on its own (hard rule: no replay)');
+  } finally { done(); }
+});
