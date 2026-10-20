@@ -24,6 +24,8 @@
 //
 // Usage: node adapters/codex/adapter.ts [thread-id] [--engine ws://127.0.0.1:8787]
 //                                                [--token <path>] [--poll-ms 1000]
+// A thread id given on the command line is saved (settings.codex_thread_id) —
+// later runs without the arg reuse it.
 // The token comes from %APPDATA%\RelayChat\token (the engine creates it).
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -320,6 +322,9 @@ let tokenMissingLogged = false;
 
 /** The thread this adapter reads and writes: CLI arg > engine config > a fresh dedicated one. */
 let activeThread: string | null = null;
+/** A1: the last resolveThread failure — while set, new deliveries fail at once
+ *  instead of waiting for the engine's ack timeout; the next config retries. */
+let resolveError: string | null = null;
 /** Set once in main(); the delivery path needs the app-server client. */
 let codexClient: CodexClient | null = null;
 /** Resume (taking the writer) happens once, when the first deliver arrives. */
@@ -378,7 +383,9 @@ function handleEngineFrame(frame: unknown): void {
   const record = frame as { type?: unknown; threadId?: unknown; messageId?: unknown; text?: unknown };
   if (record?.type === 'config') {
     // The CLI arg overrides the stored id; otherwise settle the thread now.
+    // A1: every config is a fresh chance to resolve — clear a stale failure.
     if (activeThread === null) {
+      resolveError = null;
       const configThreadId = typeof record.threadId === 'string' && record.threadId !== ''
         ? record.threadId
         : null;
@@ -390,15 +397,26 @@ function handleEngineFrame(frame: unknown): void {
     if (typeof record.messageId === 'string' && typeof record.text === 'string') {
       const request = { messageId: record.messageId, text: record.text };
       if (activeThread === null) {
-        // config precedes the first deliver, but a fresh thread/start is still
-        // in flight — buffer instead of failing; resolveThread flushes these.
-        earlyDeliveries.push(request);
+        if (resolveError !== null) {
+          // A1: resolution already failed — fail at once, don't let the row
+          // sit in the buffer until the engine's ack timeout.
+          sendFrame({ type: 'failed', messageId: request.messageId, error: unresolvedDeliveryError(resolveError) });
+        } else {
+          // config precedes the first deliver, but a fresh thread/start is still
+          // in flight — buffer instead of failing; resolveThread flushes these.
+          earlyDeliveries.push(request);
+        }
       } else {
         deliveryChain = deliveryChain.then(() => performDelivery(request));
       }
     }
     return;
   }
+}
+
+/** A1: the delivery failure text while the relay thread is unresolved. */
+export function unresolvedDeliveryError(error: string): string {
+  return `relay thread not resolved: ${error}`;
 }
 
 /** Deliveries that arrived before the thread was resolved — flushed by resolveThread. */
@@ -428,9 +446,10 @@ async function resolveThread(configThreadId: string | null): Promise<void> {
     }
   } catch (err) {
     const error = deliverFailureText(err);
+    resolveError = error; // A1: fail later deliveries at once until the next config
     console.error(`[codex-adapter] cannot resolve the relay thread: ${error}`);
     for (const early of earlyDeliveries.splice(0)) {
-      sendFrame({ type: 'failed', messageId: early.messageId, error: `relay thread not resolved: ${error}` });
+      sendFrame({ type: 'failed', messageId: early.messageId, error: unresolvedDeliveryError(error) });
     }
   }
 }
@@ -586,6 +605,9 @@ async function main(): Promise<void> {
   if (threadId !== undefined) {
     // The CLI arg overrides everything; it is reported to the engine after hello.
     activeThread = threadId;
+    // A2: say it once — the id is saved (settings.codex_thread_id), so a later
+    // run without the arg silently reuses this thread.
+    console.log(`[codex-adapter] relay thread ${threadId} (from command line — saved; later runs reuse it)`);
     startWatching(threadId);
     connectEngine(engineUrl, tokenPath);
     return;

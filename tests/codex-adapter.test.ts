@@ -14,6 +14,7 @@ import {
   deliveredBodyOf,
   planPoll,
   RequestTracker,
+  unresolvedDeliveryError,
   type ObservedTurn,
 } from '../adapters/codex/adapter.ts';
 import { hashBody } from '../relay/store.ts';
@@ -212,4 +213,10 @@ test('deliveredBodyOf splits the header line off the delivered text', () => {
   assert.equal(deliveredBodyOf('[Relay · from Astra · #01HXYZ · hop 1]\nthe actual body'), 'the actual body');
   assert.equal(deliveredBodyOf('no newline at all'), '',
     'a malformed deliver has no memorable body');
+});
+
+test('A1: the unresolved-thread failure text carries the resolve error', () => {
+  assert.equal(
+    unresolvedDeliveryError('codex request timed out: thread/start'),
+    'relay thread not resolved: codex request timed out: thread/start');
 });

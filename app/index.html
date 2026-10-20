@@ -35,6 +35,15 @@
     .msg .sender { font-size: 11px; font-weight: 600; color: #9aa0a6;
                    margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
     .msg .body { white-space: pre-wrap; word-break: break-word; }
+    .msg .delivery { margin-top: 6px; display: flex; gap: 8px; align-items: center;
+                     flex-wrap: wrap; font-size: 12px; color: #9aa0a6; }
+    .msg .delivery .delivery-status:empty { display: none; }
+    .msg .delivery button { font: inherit; font-size: 12px; padding: 2px 10px;
+                            border-radius: 999px; border: 1px solid #33373c;
+                            background: #1b1e21; color: #e6e6e6; cursor: pointer; }
+    .msg .delivery button:disabled { opacity: 0.45; cursor: default; }
+    #pending { font-size: 12px; color: #e3b341; }
+    #pending:empty { display: none; }
   </style>
 </head>
 <body>
@@ -42,6 +51,7 @@
     <span class="title">Relay Chat</span>
     <span class="pill" id="pill-astra"><span class="name">Astra</span><span class="status">disconnected</span></span>
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
+    <span id="pending"></span>
     <span id="engine"><span id="dot"></span><span id="engine-label">connecting…</span></span>
   </header>
   <div id="transcript"></div>
