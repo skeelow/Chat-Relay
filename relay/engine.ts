@@ -291,6 +291,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             // frames it races in are ignored by the participant === null checks.
             for (const [other, otherState] of clients) {
               if (other !== ws && otherState.participant === name) {
+                // E2: the replaced socket's in-flight rows die with it — the
+                // new connection never saw those deliveries.
+                for (const pending of store.deliveriesForTarget(name, 'delivering')) {
+                  failDelivery(pending.messageId, name, 'adapter replaced before confirming');
+                }
                 otherState.participant = null;
                 other.close(4400, 'replaced by a new connection');
               }
@@ -299,6 +304,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             state.status = 'idle';
             adapterStatuses[name] = 'idle';
             broadcastAdapterStatus(name, 'idle');
+            if (name === 'codex') {
+              // M2.2: the relay's dedicated thread (or null) — sent before
+              // any queued deliver so the adapter can resolve its thread.
+              ws.send(JSON.stringify({ type: 'config', threadId: store.getSetting('codex_thread_id') }));
+            }
             // M2.1: approved items waiting for this adapter go out now,
             // oldest first, each exactly once (each leaves 'queued').
             for (const pending of store.deliveriesForTarget(name, 'queued')) {
@@ -400,6 +410,16 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             broadcastDeliveryUpdate(messageId, target);
             return;
           }
+          case 'thread': {
+            // M2.2: only the codex adapter may report the relay thread; the
+            // engine persists it for the next adapter launch (and restarts).
+            if (state.participant !== 'codex') return;
+            const threadId = record.threadId;
+            if (typeof threadId !== 'string' || threadId === '') return;
+            store.setSetting('codex_thread_id', threadId);
+            console.log(`[engine] codex relay thread recorded: ${threadId}`);
+            return;
+          }
           case 'delivered':
           case 'failed': {
             // M2.1: accept the ack only from the socket registered as this
@@ -409,6 +429,16 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const messageId = record.messageId;
             if (typeof messageId !== 'string') return;
             const row = store.getDelivery(messageId, target);
+            if (record.type === 'delivered' &&
+                row !== null && row.status === 'failed' && row.error === 'no confirmation from adapter') {
+              // E1: the ack only lost the race with the timer — the adapter
+              // did receive the text. Upgrade; a genuinely failed row (the
+              // adapter itself reported failure, or a replacement) stays failed.
+              store.markStatus(messageId, target, 'delivered');
+              clearAckTimer(messageId, target);
+              broadcastDeliveryUpdate(messageId, target);
+              return;
+            }
             if (row === null || row.status !== 'delivering') return;
             if (record.type === 'delivered') {
               store.markStatus(messageId, target, 'delivered');

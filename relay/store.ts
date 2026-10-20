@@ -204,6 +204,10 @@ export interface RelayStore {
   /** M2.1 no-replay: on engine start, queued/delivering rows go back to
    *  pending_approval. Returns how many rows were reset. */
   resetInFlightToPending(): number;
+  /** M2.2: settings table accessors (SPEC Interfaces: relay mode, turn cap,
+   *  codex thread id...). A missing key reads back null. */
+  getSetting(key: string): string | null;
+  setSetting(key: string, value: string): void;
   /** Every delivery not yet settled: queued, pending_approval or delivering. */
   pendingDeliveries(): PendingDelivery[];
   /** The newest `limit` messages, oldest first (ids are ULIDs, so id order is
@@ -405,6 +409,17 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     return Number(result.changes);
   };
 
+  const getSetting = (key: string): string | null => {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?')
+      .get(key) as Record<string, unknown> | undefined;
+    return row === undefined ? null : row.value as string;
+  };
+
+  const setSetting = (key: string, value: string): void => {
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, value);
+  };
+
   const rowToPending = (row: Record<string, unknown>): PendingDelivery => ({
     messageId: row.message_id as string,
     target: row.target as Participant,
@@ -472,6 +487,8 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     deliveriesOf,
     deliveriesForTarget,
     resetInFlightToPending,
+    getSetting,
+    setSetting,
     pendingDeliveries,
     recentMessages,
     isDuplicate,

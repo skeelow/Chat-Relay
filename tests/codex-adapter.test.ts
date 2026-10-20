@@ -2,9 +2,21 @@
 // (planPoll) and the RequestTracker timeout behavior. The live pipeline —
 // engine + adapter + a real codex app-server — is exercised by the manual
 // smoke run documented in docs/status/m1.3.md.
+//
+// M2.2 additions: the thread choice (arg > config > start), the turn/start
+// failure mapping (the -32600 busy hint), the relay-header and recent-hash
+// capture drops, and splitting the body off a delivered text.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planPoll, RequestTracker, type ObservedTurn } from '../adapters/codex/adapter.ts';
+import {
+  chooseThread,
+  deliverFailureText,
+  deliveredBodyOf,
+  planPoll,
+  RequestTracker,
+  type ObservedTurn,
+} from '../adapters/codex/adapter.ts';
+import { hashBody } from '../relay/store.ts';
 
 const NOW_MS = 1_700_000_000_000;
 const fresh = (secAgo: number): number => Math.floor(NOW_MS / 1000 - secAgo);
@@ -144,4 +156,60 @@ test('a response before the timeout resolves the request; duplicates are ignored
   });
   assert.equal(await promise, 42);
   tracker.handleResponse(1, 43, undefined); // duplicate late response: no-op, no throw
+});
+
+// --- M2.2: thread choice, failure mapping, echo drops ---
+
+test('chooseThread: the CLI arg wins over config; config wins over starting a thread', () => {
+  assert.deepEqual(chooseThread('arg-id', 'config-id'), { action: 'use', threadId: 'arg-id' });
+  assert.deepEqual(chooseThread('arg-id', null), { action: 'use', threadId: 'arg-id' });
+  assert.deepEqual(chooseThread(undefined, 'config-id'), { action: 'use', threadId: 'config-id' });
+  assert.deepEqual(chooseThread(undefined, null), { action: 'start' });
+});
+
+test('deliverFailureText: the writer conflict maps to the busy hint; other errors pass through', () => {
+  const busy = 'thread busy — close the Relay Chat thread in the Codex app, then forward again';
+  assert.equal(
+    deliverFailureText('Error: {"code":-32600,"message":"thread-store conflict: already has an active writer"}'),
+    busy);
+  assert.equal(deliverFailureText('Error: active writer already exists'), busy);
+  assert.equal(deliverFailureText('Error: {"code":-32000,"message":"codex exploded"}'), 'codex exploded',
+    'a JSON-RPC error surfaces its message text');
+  assert.equal(deliverFailureText('Error: plain failure'), 'Error: plain failure',
+    'unrecognized text passes through unchanged');
+});
+
+test('a turn whose text starts with the relay header is dropped and marked seen', () => {
+  // The engine injects '[Relay · from …]' as the first line; a codex turn
+  // that starts with it is the relayed text echoing back, never a reply.
+  const turns = [turn('echo-hdr', 'completed',
+    [{ type: 'agentMessage', text: '[Relay · from Astra · #01HXYZ · hop 1]\nthe relayed body' }],
+    fresh(30), fresh(10))];
+  const plan = planPoll(turns, new Set(), NOW_MS, false);
+  assert.deepEqual(plan.captures, []);
+  assert.deepEqual(plan.seenWithoutCapture, ['echo-hdr']);
+});
+
+test('a capture whose body hash matches a recent delivery is dropped', () => {
+  const body = 'PONG reply';
+  const turns = [turn('echo-hash', 'completed', [{ type: 'agentMessage', text: body }], fresh(30), fresh(10))];
+  const recent = [{ bodyHash: hashBody(body), atMs: NOW_MS - 60_000 }];
+  const plan = planPoll(turns, new Set(), NOW_MS, false, recent);
+  assert.deepEqual(plan.captures, []);
+  assert.deepEqual(plan.seenWithoutCapture, ['echo-hash']);
+});
+
+test('a delivery hash older than the echo window no longer drops the capture', () => {
+  const body = 'PONG reply';
+  const turns = [turn('old-echo', 'completed', [{ type: 'agentMessage', text: body }], fresh(30), fresh(10))];
+  const stale = [{ bodyHash: hashBody(body), atMs: NOW_MS - 11 * 60 * 1000 }];
+  const plan = planPoll(turns, new Set(), NOW_MS, false, stale);
+  assert.deepEqual(plan.captures, [{ body, sourceRef: 'old-echo' }]);
+  assert.deepEqual(plan.seenWithoutCapture, []);
+});
+
+test('deliveredBodyOf splits the header line off the delivered text', () => {
+  assert.equal(deliveredBodyOf('[Relay · from Astra · #01HXYZ · hop 1]\nthe actual body'), 'the actual body');
+  assert.equal(deliveredBodyOf('no newline at all'), '',
+    'a malformed deliver has no memorable body');
 });

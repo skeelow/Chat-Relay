@@ -109,11 +109,13 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | Direction | `type` | Payload |
 | --- | --- | --- |
 | adapter → engine | `hello` | adapter name, version |
+| adapter → engine | `thread` | threadId |
 | adapter → engine | `status` | idle, thinking, streaming, awaiting\_approval, disconnected, selectors\_stale (astra only) |
 | adapter → engine | `captured` | body, sourceRef |
 | adapter → engine | `ping` | none — keepalive, ignored by the engine |
 | engine → adapter | `deliver` | message id, text with relay header |
 | adapter → engine | `delivered` / `failed` | message id, error |
+| engine → adapter | `config` | threadId (or null) — sent to the codex adapter right after `hello` |
 | GUI → engine | `send` | body, targets |
 | GUI → engine | `forward` | message id, target |
 | GUI → engine | `approve` / `reject` | message id, target |
@@ -210,7 +212,7 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 ### Milestone 2 — One-way, approved
 
 1. M2.1 Engine: `deliveries` rows, `approve` / `reject`, relay header, echo filter.
-2. M2.2 Codex adapter: `deliver` starts a turn on the resumed thread.
+2. M2.2 Codex adapter: `deliver` starts a turn on the relay's dedicated Codex thread (see Interfaces > settings).
 3. M2.3 GUI: "Send to Codex" button on each Astra message; pending items wait for approval.
 
 - [ ] An approved Astra reply reaches Codex once, with the header

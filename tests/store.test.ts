@@ -311,3 +311,17 @@ test('resetInFlightToPending: queued and delivering rows wait for approval again
       'a restart must never resume a delivery on its own (hard rule: no replay)');
   } finally { done(); }
 });
+
+// --- M2.2 ---
+
+test('getSetting/setSetting: round-trip, overwrite; a missing key returns null', () => {
+  const { store, done } = freshStore('settings');
+  try {
+    assert.equal(store.getSetting('codex_thread_id'), null, 'a missing key reads back null');
+    store.setSetting('codex_thread_id', 't-123');
+    assert.equal(store.getSetting('codex_thread_id'), 't-123');
+    store.setSetting('codex_thread_id', 't-456');
+    assert.equal(store.getSetting('codex_thread_id'), 't-456', 'the second write overwrites');
+    assert.equal(store.getSetting('something_else'), null, 'other keys are untouched');
+  } finally { done(); }
+});

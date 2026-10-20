@@ -1,24 +1,29 @@
-// Relay Chat — Codex adapter (M1.3). Read-only.
+// Relay Chat — Codex adapter (M1.3 + M2.2).
 //
-// Turns the M0.1 spike into an adapter per the SPEC's adapter contract: report
-// status, report completed messages — nothing else. It NEVER starts, resumes or
-// writes turns; the spike's write path belongs to M2.2's `deliver`.
+// Read side (M1.3, validated by experiment, docs/status/m1.3.md): the adapter
+// spawns its OWN `codex app-server` (never the desktop app's) and polls
+// thread/turns/list on the relay thread WITHOUT resuming it for reads, so it
+// never holds the thread's single-writer lock for reading and the user's own
+// Codex sessions (desktop app, CLI) keep working. A live foreign turn reads
+// as status "interrupted" with completedAt null; a genuinely interrupted turn
+// has completedAt set (live observation on a dedicated thread, 2026-10-19).
+// A completed turn's last agentMessage text is sent to the engine as
+// {type:'captured'} with the turn id as sourceRef; the store dedupes across
+// restarts via that sourceRef.
 //
-// Architecture (validated by experiment, docs/status/m1.3.md):
-//   - The adapter spawns its OWN `codex app-server` (never the desktop app's).
-//   - It polls thread/turns/list on the configured thread WITHOUT resuming it,
-//     so it never holds the thread's single-writer lock and the user's own
-//     Codex sessions (desktop app, CLI) keep working on that thread.
-//   - A live foreign turn appears to a non-owner as status "interrupted" with
-//     completedAt null; a genuinely interrupted turn has completedAt set (live
-//     observation on a dedicated thread, 2026-10-19). Streaming therefore reads
-//     as: inProgress, or interrupted with completedAt null — no time window.
-//   - A turn that reaches "completed" is captured: its last agentMessage text
-//     is sent to the engine as {type:'captured'} with the turn id as sourceRef.
-//     The engine's store dedupes across restarts via that sourceRef.
+// Write side (M2.2, publisher decision): `deliver` starts a turn on the
+// relay's DEDICATED Codex thread — chosen by CLI arg, then the engine's
+// config {threadId} (settings.codex_thread_id), then a fresh thread/start
+// named "Relay Chat". The writer is taken only when the first deliver arrives
+// (thread/resume, never at startup). turn/start's acceptance acks `delivered`
+// immediately — the engine's ack timer never waits for the turn to finish.
+// A -32600 writer conflict fails visibly with the busy hint and is never
+// retried. Experiment (2026-10-19, dedicated thread): thread/unsubscribe does
+// NOT release the writer — the subscription is kept, so the relay thread
+// cannot be typed into in the Codex app while the adapter runs.
 //
-// Usage: node adapters/codex/adapter.ts <thread-id> [--engine ws://127.0.0.1:8787]
-//                                          [--token <path>] [--poll-ms 1000]
+// Usage: node adapters/codex/adapter.ts [thread-id] [--engine ws://127.0.0.1:8787]
+//                                                [--token <path>] [--poll-ms 1000]
 // The token comes from %APPDATA%\RelayChat\token (the engine creates it).
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -27,11 +32,65 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { ThreadTurnsListResponse } from '../../spikes/codex-schema/v2/ThreadTurnsListResponse.ts';
+import { hashBody } from '../../relay/store.ts';
 
 const ADAPTER_VERSION = '0.1.0';
 
 /** First poll only: a completed turn counts as fresh if it finished within this window. */
 export const FIRST_POLL_WINDOW_SEC = 600;
+
+/** M2.2: how the adapter picks its relay thread (publisher decision):
+ *  CLI arg > engine config > start a dedicated one. */
+export function chooseThread(
+  argThreadId: string | undefined,
+  configThreadId: string | null,
+): { action: 'use'; threadId: string } | { action: 'start' } {
+  if (argThreadId !== undefined) return { action: 'use', threadId: argThreadId };
+  if (configThreadId !== null) return { action: 'use', threadId: configThreadId };
+  return { action: 'start' };
+}
+
+/** M2.2 SPEC relay header — the same shape the store and astra's protocol use. */
+const RELAY_HEADER = /^\[Relay ·/;
+
+/** M2.2: delivered-body hashes are remembered (and echo-dropped) this long. */
+export const ECHO_WINDOW_MS = 10 * 60 * 1000;
+
+/** M2.2: the writer-conflict hint — fail visibly, never retry (publisher decision). */
+const BUSY_TEXT = 'thread busy — close the Relay Chat thread in the Codex app, then forward again';
+
+/**
+ * M2.2: map a failed turn/start (or resume) to the text the engine stores on
+ * the delivery row. The single-writer conflict (-32600 / "active writer")
+ * gets the actionable busy hint; a JSON-RPC error surfaces its message.
+ */
+export function deliverFailureText(err: unknown): string {
+  const text = String(err);
+  if (text.includes('-32600') || text.includes('active writer')) return BUSY_TEXT;
+  const match = text.match(/\{.*\}/); // the JSON.stringify'd JSON-RPC payload, if any
+  if (match !== null) {
+    try {
+      const parsed = JSON.parse(match[0]) as { message?: unknown };
+      if (typeof parsed.message === 'string' && parsed.message !== '') return parsed.message;
+    } catch { /* not JSON — fall through to the raw text */ }
+  }
+  return text;
+}
+
+/**
+ * M2.2: a delivered text is `header + '\n' + body`; only the body is worth
+ * remembering for the echo drop. A malformed text has no memorable body.
+ */
+export function deliveredBodyOf(text: string): string {
+  const newline = text.indexOf('\n');
+  return newline === -1 ? '' : text.slice(newline + 1);
+}
+
+/** One remembered delivered body, for the capture-side echo drop. */
+export interface DeliveredBody {
+  bodyHash: string;
+  atMs: number;
+}
 
 /** Minimal structural view of a Turn — the generated Turn type is assignable to this. */
 export interface ObservedTurn {
@@ -60,10 +119,24 @@ export interface PollPlan {
  * firstPoll: on the first successful poll, completed turns older than
  * FIRST_POLL_WINDOW_SEC (or with a null completedAt) are marked seen instead
  * of captured — the adapter never dumps the thread's whole history on start.
+ *
+ * delivered (M2.2): hashes of bodies this adapter delivered recently. A
+ * capture that starts with the relay header, or whose body matches one of
+ * them inside ECHO_WINDOW_MS, is the relayed text bouncing back — dropped
+ * and marked seen, never queued. The engine's echo filter is the second
+ * line of defence.
  */
-export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, nowMs: number, firstPoll: boolean): PollPlan {
+export function planPoll(
+  turnsDesc: ObservedTurn[],
+  reportedIds: Set<string>,
+  nowMs: number,
+  firstPoll: boolean,
+  delivered: DeliveredBody[] = [],
+): PollPlan {
   const captures: PlannedCapture[] = [];
   const seenWithoutCapture: string[] = [];
+  const deliveredHashes = new Set(
+    delivered.filter((d) => nowMs - d.atMs <= ECHO_WINDOW_MS).map((d) => d.bodyHash));
   for (const turn of turnsDesc) {
     if (turn.status !== 'completed' || reportedIds.has(turn.id)) continue;
     if (firstPoll && (turn.completedAt === null ||
@@ -74,6 +147,14 @@ export function planPoll(turnsDesc: ObservedTurn[], reportedIds: Set<string>, no
     const agent = [...turn.items].reverse()
       .find((item) => item.type === 'agentMessage' && (item.text ?? '').trim() !== '');
     if (agent !== undefined && agent.text !== undefined) {
+      if (RELAY_HEADER.test(agent.text.trim())) {
+        seenWithoutCapture.push(turn.id); // the relay header echoing back — never a reply
+        continue;
+      }
+      if (deliveredHashes.has(hashBody(agent.text))) {
+        seenWithoutCapture.push(turn.id); // a bounced delivery body (M1.4 carry, adapter side)
+        continue;
+      }
       captures.push({ body: agent.text, sourceRef: turn.id });
     } else {
       seenWithoutCapture.push(turn.id); // completed but no final text — never capture partials
@@ -235,6 +316,23 @@ function sendFrame(frame: unknown): boolean {
 
 let tokenMissingLogged = false;
 
+// --- M2.2: the write path ---
+
+/** The thread this adapter reads and writes: CLI arg > engine config > a fresh dedicated one. */
+let activeThread: string | null = null;
+/** Set once in main(); the delivery path needs the app-server client. */
+let codexClient: CodexClient | null = null;
+/** Resume (taking the writer) happens once, when the first deliver arrives. */
+let resumedForWriting = false;
+/** Hashes of bodies delivered inside the echo window, for the capture drop. */
+const recentDelivered = new Map<string, number>(); // bodyHash -> delivered-at ms
+/** Deliveries run one at a time — a thread has a single writer. */
+let deliveryChain: Promise<void> = Promise.resolve();
+/** The poll interval from the CLI, used by the single watch loop. */
+let pollMsGlobal = 1000;
+/** The read side starts once, on the thread this adapter settled on. */
+let watching = false;
+
 function connectEngine(url: string, tokenPath: string): void {
   // The token is re-read on every attempt (never logged), so a token recreated
   // by a restarted engine is picked up on the next reconnect.
@@ -254,7 +352,16 @@ function connectEngine(url: string, tokenPath: string): void {
     socket.send(JSON.stringify({ type: 'auth', token }));
     socket.send(JSON.stringify({ type: 'hello', name: 'codex', version: ADAPTER_VERSION }));
     lastEngineStatus = ''; // re-announce after a reconnect
+    if (activeThread !== null) {
+      // The CLI-arg case reports its thread on every hello (idempotent).
+      sendFrame({ type: 'thread', threadId: activeThread });
+    }
     console.log('[codex-adapter] engine connection open');
+  };
+  socket.onmessage = (event) => {
+    let frame: unknown;
+    try { frame = JSON.parse(String(event.data)); } catch { return; }
+    handleEngineFrame(frame);
   };
   socket.onclose = () => {
     if (engineSocket === socket) engineSocket = null;
@@ -264,33 +371,127 @@ function connectEngine(url: string, tokenPath: string): void {
     }
   };
   socket.onerror = () => { /* onclose follows; retry handled there */ };
-  // M1 is read-only: the engine sends this adapter nothing until M2's deliver.
 }
 
-// --- main ---
-
-async function main(): Promise<void> {
-  const { threadId, engineUrl, tokenPath, pollMs } = parseArgs(process.argv.slice(2));
-  if (threadId === undefined) {
-    console.error('Usage: node adapters/codex/adapter.ts <thread-id> [--engine url] [--token path] [--poll-ms n]');
-    process.exit(2);
+/** M2.2: the engine sends config (right after hello) and deliver (approved rows). */
+function handleEngineFrame(frame: unknown): void {
+  const record = frame as { type?: unknown; threadId?: unknown; messageId?: unknown; text?: unknown };
+  if (record?.type === 'config') {
+    // The CLI arg overrides the stored id; otherwise settle the thread now.
+    if (activeThread === null) {
+      const configThreadId = typeof record.threadId === 'string' && record.threadId !== ''
+        ? record.threadId
+        : null;
+      void resolveThread(configThreadId);
+    }
+    return;
   }
-  // The token file is read per connection attempt inside connectEngine, so a
-  // missing file is retried (Fix 4) and a recreated token is picked up.
-
-  const codex = new CodexClient();
-  process.on('SIGINT', () => shutdown(codex));
-  process.on('SIGTERM', () => shutdown(codex));
-
-  await codex.handshake();
-  const auth = await codex.request<{ authMethod: string | null }>('getAuthStatus',
-    { includeToken: false, refreshToken: false });
-  if (auth.authMethod !== 'chatgpt') {
-    console.error(`[codex-adapter] codex is not logged in with a ChatGPT account (authMethod=${String(auth.authMethod)}). Run: codex login`);
-    codex.close();
-    process.exit(1);
+  if (record?.type === 'deliver') {
+    if (typeof record.messageId === 'string' && typeof record.text === 'string') {
+      const request = { messageId: record.messageId, text: record.text };
+      if (activeThread === null) {
+        // config precedes the first deliver, but a fresh thread/start is still
+        // in flight — buffer instead of failing; resolveThread flushes these.
+        earlyDeliveries.push(request);
+      } else {
+        deliveryChain = deliveryChain.then(() => performDelivery(request));
+      }
+    }
+    return;
   }
+}
 
+/** Deliveries that arrived before the thread was resolved — flushed by resolveThread. */
+const earlyDeliveries: Array<{ messageId: string; text: string }> = [];
+
+/** M2.2: settle on the relay thread, tell the engine, start the read side. */
+async function resolveThread(configThreadId: string | null): Promise<void> {
+  const codex = codexClient;
+  if (codex === null || activeThread !== null) return;
+  try {
+    const decision = chooseThread(undefined, configThreadId); // the arg case never reaches here
+    let threadId: string;
+    if (decision.action === 'use') {
+      threadId = decision.threadId;
+      console.log(`[codex-adapter] using relay thread ${threadId} (from engine config)`);
+    } else {
+      const started = await codex.request<{ thread: { id: string } }>('thread/start', {});
+      threadId = started.thread.id;
+      await codex.request('thread/name/set', { threadId, name: 'Relay Chat' });
+      console.log(`[codex-adapter] created dedicated relay thread ${threadId} ("Relay Chat")`);
+    }
+    activeThread = threadId;
+    sendFrame({ type: 'thread', threadId }); // the engine stores it in settings.codex_thread_id
+    startWatching(threadId);
+    for (const early of earlyDeliveries.splice(0)) {
+      deliveryChain = deliveryChain.then(() => performDelivery(early));
+    }
+  } catch (err) {
+    const error = deliverFailureText(err);
+    console.error(`[codex-adapter] cannot resolve the relay thread: ${error}`);
+    for (const early of earlyDeliveries.splice(0)) {
+      sendFrame({ type: 'failed', messageId: early.messageId, error: `relay thread not resolved: ${error}` });
+    }
+  }
+}
+
+/**
+ * M2.2: perform one approved delivery. `delivered` acks the moment turn/start
+ * is accepted — the engine's ack timer never waits for the turn to complete.
+ * On failure (a -32600 writer conflict above all) the row fails visibly; the
+ * adapter never retries on its own (publisher decision).
+ */
+async function performDelivery(request: { messageId: string; text: string }): Promise<void> {
+  const codex = codexClient;
+  const threadId = activeThread;
+  if (codex === null || threadId === null) {
+    sendFrame({ type: 'failed', messageId: request.messageId, error: 'relay thread not resolved yet' });
+    return;
+  }
+  try {
+    if (!resumedForWriting) {
+      // The writer is taken only when a delivery actually arrives — never at
+      // startup, so the thread stays openable in the app until the relay
+      // needs it. The subscription is then held for the adapter's lifetime:
+      // thread/unsubscribe does not release the writer (experiment, 2026-10-19).
+      await codex.request('thread/resume', { threadId, excludeTurns: true });
+      resumedForWriting = true;
+      console.log(`[codex-adapter] took the writer on ${threadId} (held until the adapter exits)`);
+    }
+    await codex.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: request.text, text_elements: [] }],
+    });
+    const body = deliveredBodyOf(request.text);
+    if (body !== '') {
+      recentDelivered.set(hashBody(body), Date.now());
+      for (const [hash, at] of recentDelivered) {
+        if (Date.now() - at > ECHO_WINDOW_MS) recentDelivered.delete(hash);
+      }
+    }
+    if (sendFrame({ type: 'delivered', messageId: request.messageId })) {
+      console.log(`[codex-adapter] delivered ${request.messageId} to codex`);
+    }
+  } catch (err) {
+    const error = deliverFailureText(err);
+    if (!sendFrame({ type: 'failed', messageId: request.messageId, error })) {
+      console.error(`[codex-adapter] delivery ${request.messageId} failed (engine link down): ${error}`);
+    } else {
+      console.error(`[codex-adapter] delivery ${request.messageId} failed: ${error}`);
+    }
+  }
+}
+
+/** The M1.3 read side: readability check + poll loop, started once the thread is known. */
+function startWatching(threadId: string): void {
+  if (watching) return;
+  watching = true;
+  void watchLoop(threadId);
+}
+
+async function watchLoop(threadId: string): Promise<void> {
+  const codex = codexClient;
+  if (codex === null) return;
   // Fail fast on a thread we cannot read at all — but tolerate a brand-new
   // thread whose rollout file has not materialized on disk yet ("thread not
   // loaded"), which resolves within a few seconds.
@@ -308,12 +509,9 @@ async function main(): Promise<void> {
   }
   if (!readable) {
     console.error(`[codex-adapter] cannot read thread ${threadId}: ${lastError}`);
-    codex.close();
     process.exit(1);
   }
-
-  connectEngine(engineUrl, tokenPath);
-  console.log(`[codex-adapter] watching thread ${threadId} (read-only, every ${pollMs}ms)`);
+  console.log(`[codex-adapter] watching thread ${threadId} (read-only, every ${pollMsGlobal}ms)`);
 
   const reported = new Set<string>();
   let firstPoll = true; // the first successful poll must not dump the thread's history
@@ -329,7 +527,10 @@ async function main(): Promise<void> {
         { threadId, limit: 10, itemsView: 'full' });
       consecutiveFailures = 0;
       reportedDisconnect = false;
-      const plan = planPoll(resp.data as ObservedTurn[], reported, Date.now(), firstPoll);
+      // M2.2: bodies delivered recently bounce back as echoes — planPoll drops them.
+      const deliveredSnapshot: DeliveredBody[] = [...recentDelivered.entries()]
+        .map(([bodyHash, atMs]) => ({ bodyHash, atMs }));
+      const plan = planPoll(resp.data as ObservedTurn[], reported, Date.now(), firstPoll, deliveredSnapshot);
       firstPoll = false; // the window applied to this poll's data; excluded turns were marked seen
       for (const capture of plan.captures) {
         if (!sendFrame({ type: 'captured', body: capture.body, sourceRef: capture.sourceRef })) break;
@@ -356,8 +557,41 @@ async function main(): Promise<void> {
   };
 
   await tick();
-  const timer = setInterval(() => { void tick(); }, pollMs);
+  const timer = setInterval(() => { void tick(); }, pollMsGlobal);
   timer.unref?.();
+}
+
+// --- main ---
+
+async function main(): Promise<void> {
+  const { threadId, engineUrl, tokenPath, pollMs } = parseArgs(process.argv.slice(2));
+  // M2.2: the thread id is optional — CLI arg > engine config {threadId} > a
+  // fresh dedicated thread. The token file is re-read per connection attempt.
+  pollMsGlobal = pollMs;
+
+  const codex = new CodexClient();
+  codexClient = codex;
+  process.on('SIGINT', () => shutdown(codex));
+  process.on('SIGTERM', () => shutdown(codex));
+
+  await codex.handshake();
+  const auth = await codex.request<{ authMethod: string | null }>('getAuthStatus',
+    { includeToken: false, refreshToken: false });
+  if (auth.authMethod !== 'chatgpt') {
+    console.error(`[codex-adapter] codex is not logged in with a ChatGPT account (authMethod=${String(auth.authMethod)}). Run: codex login`);
+    codex.close();
+    process.exit(1);
+  }
+
+  if (threadId !== undefined) {
+    // The CLI arg overrides everything; it is reported to the engine after hello.
+    activeThread = threadId;
+    startWatching(threadId);
+    connectEngine(engineUrl, tokenPath);
+    return;
+  }
+  connectEngine(engineUrl, tokenPath);
+  console.log('[codex-adapter] waiting for the engine to send the relay thread (or to start one)');
 }
 
 function shutdown(codex: CodexClient): void {
