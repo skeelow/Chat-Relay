@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Relay Chat — Astra adapter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minimum_chrome_version": "116",
-  "description": "Read-only Relay Chat adapter for chatgpt.com: reports completed replies to the local relay engine. Sends nothing into ChatGPT.",
+  "description": "Relay Chat adapter for chatgpt.com: reports completed replies to the local relay engine and types relayed text into the input box. It never presses Send — the user always does.",
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],

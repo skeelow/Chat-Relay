@@ -14,10 +14,13 @@
 //   5. A still-turnless conversation page after the delay reports
 //      'selectors_stale' to the engine as a status, not just the console.
 import { SELECTORS } from './selectors.ts';
-import { pageStatus, replyText, type AstraStatus, type ReplyElement } from './protocol.ts';
+import {
+  deliveryPageDecision, linesForInsert, pageStatus, replyText, textsMatch,
+  type AstraStatus, type ReplyElement,
+} from './protocol.ts';
 
 // Bump this marker on every build so the console shows which version runs.
-const BUILD_MARKER = '2026-10-19.2';
+const BUILD_MARKER = '2026-10-20.1';
 console.log('[relay-astra] content script loaded', BUILD_MARKER);
 
 // Debug logging is off by default (carry item 3); flip to true to trace
@@ -39,7 +42,7 @@ function debugReason(reason: string): void {
 // --- minimal chrome API view (same structural-typing trick as the spike) ---
 
 type SendResponse = (response: unknown) => void;
-interface TestMessage { type?: string; text?: string; }
+interface TestMessage { type?: string; text?: string; messageId?: string; }
 interface ChromeRuntime {
   runtime: {
     onMessage: {
@@ -276,7 +279,13 @@ checkCompletion();
 
 // Manual test from the popup: type the test text into the composer.
 // It must NOT press send — the user clicks Send (SPEC M0.2 step 4).
+// M3.1: the same listener now also serves relay deliveries, which type
+// the delivered text and never, ever send it (D10 — see typeRelayText).
 chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === 'type-relay-text' && typeof msg.text === 'string' && typeof msg.messageId === 'string') {
+    sendResponse(typeRelayText(msg.text));
+    return;
+  }
   if (msg?.type !== 'type-test-text' || typeof msg.text !== 'string') return;
   debug('popup asked to type the test text');
   const composer = document.querySelector(SELECTORS.composer) as HTMLTextAreaElement | HTMLElement | null;
@@ -293,3 +302,68 @@ chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   sendResponse({ ok: true, note: 'typed — Send is yours to click' });
 });
+
+// --- M3.1: the relay deliver path (typing only — the user always clicks Send) ---
+
+/** The composer's current text, whichever shape the page uses. */
+function composerText(composer: HTMLTextAreaElement | HTMLElement): string {
+  return composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? '';
+}
+
+/** Empty the composer. Only called right after we typed into an empty box. */
+function clearComposer(composer: HTMLTextAreaElement | HTMLElement): void {
+  composer.focus();
+  if (composer instanceof HTMLTextAreaElement) {
+    composer.value = '';
+    composer.dispatchEvent(new Event('input', { bubbles: true }));
+  } else {
+    document.execCommand('selectAll');
+    document.execCommand('delete');
+  }
+}
+
+/** Insert the delivered text line by line — insertText plus an explicit line
+ *  break between lines. Enter is never synthesized: it could submit. */
+function insertRelayText(composer: HTMLTextAreaElement | HTMLElement, text: string): void {
+  composer.focus();
+  if (composer instanceof HTMLTextAreaElement) {
+    // Legacy shape: a plain textarea keeps its newlines in value assignment.
+    composer.value = text;
+    composer.dispatchEvent(new Event('input', { bubbles: true }));
+    return;
+  }
+  const lines = linesForInsert(text);
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) document.execCommand('insertLineBreak');
+    if (lines[i] !== '') document.execCommand('insertText', false, lines[i]);
+  }
+}
+
+/**
+ * Type one delivered text. The page rules run first (missing composer,
+ * streaming, existing draft); after typing, the box is verified with a
+ * whitespace-collapsed match, and on mismatch the box (which was empty
+ * before) is cleared again. Never sends, never retries.
+ */
+function typeRelayText(text: string): { ok: boolean; error?: string } {
+  const composer = document.querySelector(SELECTORS.composer) as HTMLTextAreaElement | HTMLElement | null;
+  const streaming = streamingNow() ||
+    [...document.querySelectorAll<HTMLElement>(SELECTORS.turn)]
+      .some((turn) => turn.getAttribute(SELECTORS.turnStateAttribute) === 'in_progress');
+  const decision = deliveryPageDecision({
+    composerFound: composer !== null,
+    streaming,
+    composerHasText: composer !== null && composerText(composer).trim() !== '',
+  });
+  if (!decision.ok) {
+    if (decision.selectorsStale === true) reportStatus('selectors_stale');
+    return { ok: false, error: decision.error };
+  }
+  insertRelayText(composer as HTMLTextAreaElement | HTMLElement, text);
+  if (!textsMatch(composerText(composer as HTMLTextAreaElement | HTMLElement), text)) {
+    clearComposer(composer as HTMLTextAreaElement | HTMLElement);
+    return { ok: false, error: 'typed text did not match; input box cleared' };
+  }
+  console.log('[relay-astra] relayed text typed — Send is the user\'s to click');
+  return { ok: true };
+}

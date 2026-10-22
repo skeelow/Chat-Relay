@@ -1,16 +1,20 @@
 "use strict";
 (() => {
   // app/src/deliveries.ts
-  function deliveryStatusView(status, error) {
+  function deliveryStatusView(status, target, error) {
+    const toAstra = target === "astra";
     switch (status) {
       case "pending_approval":
         return { label: "Waiting for your approval", actions: ["approve", "reject"] };
       case "queued":
-        return { label: "Approved, waiting for Codex adapter", actions: [] };
+        return {
+          label: toAstra ? "Approved, waiting for the ChatGPT extension" : "Approved, waiting for Codex adapter",
+          actions: []
+        };
       case "delivering":
-        return { label: "Sending to Codex\u2026", actions: [] };
+        return { label: toAstra ? "Typing into ChatGPT\u2026" : "Sending to Codex\u2026", actions: [] };
       case "delivered":
-        return { label: "Sent to Codex", actions: [] };
+        return { label: toAstra ? "Typed into ChatGPT \u2014 click Send there" : "Sent to Codex", actions: [] };
       case "failed":
         return { label: `Failed: ${error ?? "unknown error"}`, actions: ["forward"] };
       case "cancelled":
@@ -19,28 +23,54 @@
         return { label: status, actions: [] };
     }
   }
+  function targetFor(source) {
+    if (source === "astra") return "codex";
+    if (source === "codex") return "astra";
+    return null;
+  }
   function sendButton(source, delivery) {
-    if (source !== "astra") return { show: false, label: "" };
-    if (delivery === void 0) return { show: true, label: "Send to Codex" };
-    if (delivery.status === "failed") return { show: true, label: "Send again" };
-    return { show: false, label: "" };
+    const target = targetFor(source);
+    if (target === null) return { show: false, label: "", target: null };
+    const plain = source === "astra" ? "Send to Codex" : "Send to ChatGPT";
+    if (delivery === void 0) return { show: true, label: plain, target };
+    if (delivery.status === "failed") return { show: true, label: "Send again", target };
+    return { show: false, label: "", target };
   }
   function pendingCount(rows) {
     return rows.filter((row) => row.status === "pending_approval").length;
   }
-  function applyDeliveryUpdate(rows, update) {
-    const next = new Map(rows);
-    next.set(update.messageId, update);
-    return next;
+  function deliveryKey(messageId, target) {
+    return `${messageId}:${target}`;
   }
-  function forwardFrame(messageId) {
-    return { type: "forward", messageId, target: "codex" };
+  function emptyDeliveryState() {
+    return { rows: /* @__PURE__ */ new Map(), pendingClicks: /* @__PURE__ */ new Set() };
   }
-  function approveFrame(messageId) {
-    return { type: "approve", messageId, target: "codex" };
+  function applySnapshotDeliveries(state, rows) {
+    const nextRows = /* @__PURE__ */ new Map();
+    for (const row of rows) nextRows.set(deliveryKey(row.messageId, row.target), row);
+    return { rows: nextRows, pendingClicks: /* @__PURE__ */ new Set() };
   }
-  function rejectFrame(messageId) {
-    return { type: "reject", messageId, target: "codex" };
+  function applyDeliveryUpdate(state, update) {
+    const key = deliveryKey(update.messageId, update.target);
+    const rows = new Map(state.rows);
+    rows.set(key, update);
+    const pendingClicks = new Set(state.pendingClicks);
+    pendingClicks.delete(key);
+    return { rows, pendingClicks };
+  }
+  function applyClick(state, key) {
+    const pendingClicks = new Set(state.pendingClicks);
+    pendingClicks.add(key);
+    return { rows: state.rows, pendingClicks };
+  }
+  function forwardFrame(messageId, target) {
+    return { type: "forward", messageId, target };
+  }
+  function approveFrame(messageId, target) {
+    return { type: "approve", messageId, target };
+  }
+  function rejectFrame(messageId, target) {
+    return { type: "reject", messageId, target };
   }
 
   // app/src/renderer.ts
@@ -53,9 +83,8 @@
   var dot = document.getElementById("dot");
   var engineLabel = document.getElementById("engine-label");
   var pendingBadge = document.getElementById("pending");
-  var deliveryRows = /* @__PURE__ */ new Map();
+  var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
-  var pendingClicks = /* @__PURE__ */ new Set();
   var engineOnline = false;
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
@@ -90,7 +119,7 @@
     body.className = "body";
     body.textContent = message.body;
     row.append(sender, body);
-    if (message.source === "astra") {
+    if (targetFor(message.source) !== null) {
       const footer = document.createElement("div");
       footer.className = "delivery";
       const status = document.createElement("div");
@@ -109,8 +138,11 @@
   function renderDelivery(messageId) {
     const footer = messageFooters.get(messageId);
     if (footer === void 0) return;
-    const delivery = deliveryRows.get(messageId);
-    const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery.status, delivery.error ?? null);
+    const target = targetFor(footer.source);
+    if (target === null) return;
+    const key = deliveryKey(messageId, target);
+    const delivery = deliveryState.rows.get(key);
+    const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery.status, target, delivery.error ?? null);
     footer.status.textContent = view.label;
     footer.actions.textContent = "";
     const buttons = [];
@@ -120,15 +152,15 @@
       if (action === "approve") buttons.push({ action, label: "Approve" });
       else if (action === "reject") buttons.push({ action, label: "Reject" });
     }
-    const clickPending = pendingClicks.has(messageId);
+    const clickPending = deliveryState.pendingClicks.has(key);
     for (const spec of buttons) {
       const button = document.createElement("button");
       button.textContent = spec.label;
       button.disabled = clickPending || !engineOnline;
       button.addEventListener("click", () => {
-        pendingClicks.add(messageId);
-        sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId) : spec.action === "approve" ? approveFrame(messageId) : rejectFrame(messageId));
-        console.log(`[relay-gui] ${spec.action} sent for ${messageId}`);
+        deliveryState = applyClick(deliveryState, key);
+        sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId, target) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target));
+        console.log(`[relay-gui] ${spec.action} sent for ${messageId} \u2192 ${target}`);
         renderDelivery(messageId);
       });
       footer.actions.append(button);
@@ -136,7 +168,7 @@
   }
   function updatePendingBadge() {
     if (pendingBadge === null) return;
-    const count = pendingCount([...deliveryRows.values()]);
+    const count = pendingCount([...deliveryState.rows.values()]);
     pendingBadge.textContent = count === 0 ? "" : `${count} pending`;
   }
   function sendFrameToEngine(frame) {
@@ -149,10 +181,9 @@
       setPill("astra", statuses.astra ?? "disconnected");
       setPill("codex", statuses.codex ?? "disconnected");
       const messages = frame.messages ?? [];
-      for (const delivery of frame.deliveries ?? []) {
-        if (delivery.target === "codex") deliveryRows.set(delivery.messageId, delivery);
-      }
+      deliveryState = applySnapshotDeliveries(deliveryState, frame.deliveries ?? []);
       for (const message of messages) appendMessage(message);
+      for (const id of messageFooters.keys()) renderDelivery(id);
       updatePendingBadge();
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
@@ -177,9 +208,8 @@
         updatedAt: typeof frame.updatedAt === "string" ? frame.updatedAt : "",
         ...typeof frame.error === "string" ? { error: frame.error } : {}
       };
-      deliveryRows = applyDeliveryUpdate(deliveryRows, update);
-      pendingClicks.delete(messageId);
-      console.log(`[relay-gui] delivery ${messageId}: ${update.status}`);
+      deliveryState = applyDeliveryUpdate(deliveryState, update);
+      console.log(`[relay-gui] delivery ${messageId} \u2192 ${update.target}: ${update.status}`);
       renderDelivery(messageId);
       updatePendingBadge();
       return;

@@ -117,7 +117,7 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | adapter → engine | `delivered` / `failed` | message id, error |
 | engine → adapter | `config` | threadId (or null) — sent to the codex adapter right after `hello` |
 | GUI → engine | `send` | body, targets |
-| GUI → engine | `forward` | message id, target |
+| GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
 | GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |
 | GUI → engine | `stop` | none |
@@ -221,7 +221,7 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 
 ### Milestone 3 — Two-way relay
 
-1. M3.1 ChatGPT adapter: `deliver` types the text into the input box. Default: user clicks Send. Optional setting: the extension clicks Send, off by default.
+1. M3.1 ChatGPT adapter: `deliver` types the text into the input box and never presses Send — the user always clicks Send. The optional extension-clicks-Send setting is deferred to M4.2 (see Auto-send timer).
 2. M3.2 Engine: hop counter, turn cap, Stop handling, delivery retry (max 2), dedupe on both directions.
 3. M3.3 Codex approval requests surface in the GUI as a banner the user answers.
 

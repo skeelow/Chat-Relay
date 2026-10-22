@@ -9,9 +9,18 @@
   function statusToReplayAfterHello(latest) {
     return latest !== null && latest !== "idle" ? latest : null;
   }
+  function deliveryTabDecision(knownTabId) {
+    if (knownTabId === null) {
+      return {
+        ok: false,
+        error: "no ChatGPT tab is known to the relay extension \u2014 open chatgpt.com and let it load"
+      };
+    }
+    return { ok: true, tabId: knownTabId };
+  }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-19.4";
+  var BUILD_MARKER = "2026-10-20.1";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -92,6 +101,44 @@
       debug("status replayed after hello:", replay);
     }
   }
+  var lastSenderTabId = null;
+  function sendEngineFrame(frame) {
+    if (socket !== null && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(frame));
+      return true;
+    }
+    return false;
+  }
+  async function deliverToChatGpt(messageId, text) {
+    const decision = deliveryTabDecision(lastSenderTabId);
+    if (!decision.ok) {
+      sendEngineFrame({ type: "failed", messageId, error: decision.error });
+      return;
+    }
+    const tabId = decision.tabId;
+    try {
+      const response = await chromeApi.tabs.sendMessage(tabId, { type: "type-relay-text", messageId, text });
+      if (response?.ok === true) {
+        sendEngineFrame({ type: "delivered", messageId });
+      } else {
+        sendEngineFrame({ type: "failed", messageId, error: response?.error ?? "the ChatGPT page refused the text" });
+      }
+    } catch (err) {
+      sendEngineFrame({
+        type: "failed",
+        messageId,
+        error: `could not reach the ChatGPT tab (closed or reloaded?) \u2014 reopen chatgpt.com, then forward again: ${String(err).slice(0, 120)}`
+      });
+    }
+  }
+  function handleEngineFrame(frame) {
+    const record = frame;
+    if (record?.type === "deliver") {
+      if (typeof record.messageId === "string" && typeof record.text === "string") {
+        void deliverToChatGpt(record.messageId, record.text);
+      }
+    }
+  }
   function scheduleReconnect() {
     setTimeout(() => {
       void connectEngine();
@@ -129,6 +176,15 @@
         }, PING_INTERVAL_MS);
         void replayStatusAfterHello(ws);
       };
+      ws.onmessage = (event) => {
+        let frame;
+        try {
+          frame = JSON.parse(String(event.data));
+        } catch {
+          return;
+        }
+        handleEngineFrame(frame);
+      };
       ws.onclose = (event) => {
         if (pingTimer !== null) {
           clearInterval(pingTimer);
@@ -162,7 +218,9 @@
       connectInFlight = false;
     }
   }
-  function handleMessage(msg, _sender, sendResponse) {
+  function handleMessage(msg, sender, sendResponse) {
+    const senderTabId = sender?.tab?.id;
+    if (typeof senderTabId === "number") lastSenderTabId = senderTabId;
     const frame = msg;
     if (frame?.type === "captured") {
       if (typeof frame.body !== "string" || typeof frame.sourceRef !== "string") {

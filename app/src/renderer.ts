@@ -11,14 +11,20 @@
 // guesses. All text (error text included) renders via textContent, never HTML.
 
 import {
+  applyClick,
   applyDeliveryUpdate,
+  applySnapshotDeliveries,
   approveFrame,
+  deliveryKey,
   deliveryStatusView,
+  emptyDeliveryState,
   forwardFrame,
   pendingCount,
   rejectFrame,
   sendButton,
+  targetFor,
   type DeliveryRow,
+  type DeliveryUiState,
 } from './deliveries.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
@@ -47,11 +53,10 @@ const dot = document.getElementById('dot');
 const engineLabel = document.getElementById('engine-label');
 const pendingBadge = document.getElementById('pending');
 
-// M2.3: delivery state — rows by messageId (M2 has exactly the codex target),
-// the footer elements per shown message, and clicks waiting for their update.
-let deliveryRows = new Map<string, DeliveryRow>();
+// M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
+// waiting for their own update. All transitions live in deliveries.ts (pure).
+let deliveryState: DeliveryUiState = emptyDeliveryState();
 const messageFooters = new Map<string, { source: string; status: HTMLDivElement; actions: HTMLDivElement }>();
-const pendingClicks = new Set<string>();
 let engineOnline = false;
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
@@ -91,8 +96,8 @@ function appendMessage(message: GuiMessage): void {
   body.className = 'body';
   body.textContent = message.body; // relayed text is data, never HTML
   row.append(sender, body);
-  if (message.source === 'astra') {
-    // M2.3: every astra message carries its delivery status and actions.
+  if (targetFor(message.source) !== null) {
+    // M2.3 + M3.1: every AI message carries its delivery status and actions.
     const footer = document.createElement('div');
     footer.className = 'delivery';
     const status = document.createElement('div');
@@ -109,14 +114,17 @@ function appendMessage(message: GuiMessage): void {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-/** M2.3: render one message's delivery footer from the delivery rows. */
+/** M2.3 + M3.1: render one AI message's delivery footer from the keyed rows. */
 function renderDelivery(messageId: string): void {
   const footer = messageFooters.get(messageId);
   if (footer === undefined) return;
-  const delivery = deliveryRows.get(messageId);
+  const target = targetFor(footer.source);
+  if (target === null) return;
+  const key = deliveryKey(messageId, target);
+  const delivery = deliveryState.rows.get(key);
   const view = delivery === undefined
     ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
-    : deliveryStatusView(delivery.status, delivery.error ?? null);
+    : deliveryStatusView(delivery.status, target, delivery.error ?? null);
   footer.status.textContent = view.label; // textContent only — error text included
   footer.actions.textContent = '';
   const buttons: Array<{ action: 'forward' | 'approve' | 'reject'; label: string }> = [];
@@ -127,27 +135,27 @@ function renderDelivery(messageId: string): void {
     else if (action === 'reject') buttons.push({ action, label: 'Reject' });
     // 'forward' in the table is the failed case — sendButton shows it as Send again.
   }
-  const clickPending = pendingClicks.has(messageId);
+  const clickPending = deliveryState.pendingClicks.has(key);
   for (const spec of buttons) {
     const button = document.createElement('button');
     button.textContent = spec.label;
     button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
     button.addEventListener('click', () => {
-      pendingClicks.add(messageId);
-      sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId)
-        : spec.action === 'approve' ? approveFrame(messageId)
-        : rejectFrame(messageId));
-      console.log(`[relay-gui] ${spec.action} sent for ${messageId}`);
+      deliveryState = applyClick(deliveryState, key);
+      sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId, target)
+        : spec.action === 'approve' ? approveFrame(messageId, target)
+        : rejectFrame(messageId, target));
+      console.log(`[relay-gui] ${spec.action} sent for ${messageId} → ${target}`);
       renderDelivery(messageId); // disable immediately, until the next delivery_update
     });
     footer.actions.append(button);
   }
 }
 
-/** M2.3: "N pending" in the header — pending_approval rows only. */
+/** M2.3 + M3.1: "N pending" in the header — pending_approval rows, all targets. */
 function updatePendingBadge(): void {
   if (pendingBadge === null) return;
-  const count = pendingCount([...deliveryRows.values()]);
+  const count = pendingCount([...deliveryState.rows.values()]);
   pendingBadge.textContent = count === 0 ? '' : `${count} pending`;
 }
 
@@ -162,10 +170,11 @@ function handleFrame(frame: Frame): void {
     setPill('astra', statuses.astra ?? 'disconnected');
     setPill('codex', statuses.codex ?? 'disconnected');
     const messages = (frame.messages ?? []) as GuiMessage[];
-    for (const delivery of (frame.deliveries ?? []) as DeliveryRow[]) {
-      if (delivery.target === 'codex') deliveryRows.set(delivery.messageId, delivery);
-    }
+    // M3.1: no codex filter — every delivery row seeds the state (keyed
+    // messageId:target), and a snapshot clears every pending click (G1).
+    deliveryState = applySnapshotDeliveries(deliveryState, (frame.deliveries ?? []) as DeliveryRow[]);
     for (const message of messages) appendMessage(message);
+    for (const id of messageFooters.keys()) renderDelivery(id); // G1: re-render existing footers
     updatePendingBadge();
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
@@ -180,8 +189,9 @@ function handleFrame(frame: Frame): void {
     return;
   }
   if (type === 'delivery_update') {
-    // M2.3: the only source of truth for delivery state. Rows for messages
-    // not on screen yet are kept and apply when the message arrives later.
+    // M2.3 + M3.1: the only source of truth for delivery state. Rows for
+    // messages not on screen yet are kept and apply when the message arrives
+    // later. The keyed state clears that item's pending click (G2).
     const messageId = frame.messageId;
     if (typeof messageId !== 'string' || typeof frame.status !== 'string') return;
     const update: DeliveryRow = {
@@ -192,9 +202,8 @@ function handleFrame(frame: Frame): void {
       updatedAt: typeof frame.updatedAt === 'string' ? frame.updatedAt : '',
       ...(typeof frame.error === 'string' ? { error: frame.error } : {}),
     };
-    deliveryRows = applyDeliveryUpdate(deliveryRows, update);
-    pendingClicks.delete(messageId); // the click resolved — the item's buttons may return
-    console.log(`[relay-gui] delivery ${messageId}: ${update.status}`);
+    deliveryState = applyDeliveryUpdate(deliveryState, update);
+    console.log(`[relay-gui] delivery ${messageId} → ${update.target}: ${update.status}`);
     renderDelivery(messageId); // no-op when the message is not on screen — the row is kept
     updatePendingBadge();
     return;

@@ -55,6 +55,75 @@ export function statusToReplayAfterHello(latest: string | null): string | null {
   return latest !== null && latest !== 'idle' ? latest : null;
 }
 
+// --- M3.1: the deliver path (typing into the composer, never sending) ---
+
+/** The page facts a delivery depends on, gathered by the content script. */
+export interface DeliveryPageView {
+  composerFound: boolean;
+  streaming: boolean;
+  composerHasText: boolean;
+}
+
+/** The content script's decision for one delivery attempt. */
+export interface DeliveryPageDecision {
+  ok: boolean;
+  /** Present when ok is false — the exact text the engine stores on the row. */
+  error?: string;
+  /** A missing composer is a selector rename, not a quiet page. */
+  selectorsStale?: boolean;
+}
+
+/**
+ * The page rules, in order (D10): a missing composer fails visibly and
+ * reports stale selectors; a streaming page fails; a draft in the composer
+ * fails — the publisher's unsent text is never touched. Only an empty,
+ * idle composer is typed into.
+ */
+export function deliveryPageDecision(view: DeliveryPageView): DeliveryPageDecision {
+  if (!view.composerFound) {
+    return { ok: false, error: "ChatGPT's input box was not found (page changed?)", selectorsStale: true };
+  }
+  if (view.streaming) {
+    return { ok: false, error: 'ChatGPT is still replying — wait, then forward again' };
+  }
+  if (view.composerHasText) {
+    return { ok: false, error: "ChatGPT's input box already has text — send or clear it, then forward again" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Split the delivered text into lines for insertion. The content script
+ * inserts each line with insertText and a line break between lines (never
+ * Enter, which could submit). Blank lines and the header line are kept.
+ */
+export function linesForInsert(text: string): string[] {
+  if (text === '') return []; // nothing to type
+  return text.split('\n');
+}
+
+/** Whitespace-collapsed equality — how the typed text is verified after insertion. */
+export function textsMatch(typed: string, expected: string): boolean {
+  return typed.replace(/\s+/g, ' ').trim() === expected.replace(/\s+/g, ' ').trim();
+}
+
+/** The worker's tab choice (D10): deliver to the most recent sender tab. */
+export interface DeliveryTabDecision {
+  ok: boolean;
+  tabId?: number;
+  error?: string;
+}
+
+export function deliveryTabDecision(knownTabId: number | null): DeliveryTabDecision {
+  if (knownTabId === null) {
+    return {
+      ok: false,
+      error: 'no ChatGPT tab is known to the relay extension — open chatgpt.com and let it load',
+    };
+  }
+  return { ok: true, tabId: knownTabId };
+}
+
 /**
  * Minimal structural view of a DOM element. The real HTMLElement satisfies
  * this (the content script casts it in); tests provide a small stub.

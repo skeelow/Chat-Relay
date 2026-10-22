@@ -11,11 +11,18 @@
 // thing the content script does offscreen.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  deliveryPageDecision,
+  deliveryTabDecision,
   isRelayHeaderEcho,
+  linesForInsert,
   pageStatus,
   replyText,
   statusToReplayAfterHello,
+  textsMatch,
   type ReplyElement,
 } from '../adapters/chatgpt-ext/src/protocol.ts';
 
@@ -298,4 +305,55 @@ test('stripping never mutates the live reply element', () => {
   const before = reply.innerText;
   replyText(reply, attachMount);
   assert.equal(reply.innerText, before, 'all removals happen on the clone');
+});
+
+// --- M3.1: the deliver path (typing, never sending) ---
+
+test('deliveryPageDecision: the page rules in order — missing composer, streaming, draft, ok', () => {
+  assert.deepEqual(
+    deliveryPageDecision({ composerFound: false, streaming: false, composerHasText: false }),
+    { ok: false, error: "ChatGPT's input box was not found (page changed?)", selectorsStale: true },
+    'a missing composer is a stale-selector report, not a silent failure');
+  assert.deepEqual(
+    deliveryPageDecision({ composerFound: true, streaming: true, composerHasText: false }),
+    { ok: false, error: 'ChatGPT is still replying — wait, then forward again' });
+  assert.deepEqual(
+    deliveryPageDecision({ composerFound: true, streaming: false, composerHasText: true }),
+    { ok: false, error: "ChatGPT's input box already has text — send or clear it, then forward again" },
+    'the publisher draft is never touched');
+  assert.deepEqual(
+    deliveryPageDecision({ composerFound: true, streaming: false, composerHasText: false }),
+    { ok: true });
+});
+
+test('linesForInsert: splits on newlines, keeping blank lines and the header line', () => {
+  assert.deepEqual(linesForInsert('[Relay · from Codex · #01H · hop 1]\nfirst\n\nsecond'), [
+    '[Relay · from Codex · #01H · hop 1]', 'first', '', 'second',
+  ]);
+  assert.deepEqual(linesForInsert('single line'), ['single line']);
+  assert.deepEqual(linesForInsert(''), []);
+});
+
+test('textsMatch: whitespace-collapsed comparison, and a real mismatch fails', () => {
+  assert.equal(textsMatch('a  b\nc', 'a b c'), true, 'collapsed whitespace compares equal');
+  assert.equal(textsMatch('  [Relay · header]\nline one\n\nline two  ', '[Relay · header] line one line two'), true);
+  assert.equal(textsMatch('typed something else', 'expected text'), false);
+});
+
+test('deliveryTabDecision: the latest sender tab wins; no known tab fails at once', () => {
+  assert.deepEqual(deliveryTabDecision(42), { ok: true, tabId: 42 });
+  const none = deliveryTabDecision(null);
+  assert.equal(none.ok, false);
+  assert.ok((none.error ?? '').length > 0, 'the no-tab failure carries an actionable error');
+});
+
+test('M3.1 guard: the extension source never presses Send', () => {
+  const srcDir = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'adapters', 'chatgpt-ext', 'src');
+  for (const file of ['content.ts', 'background.ts', 'popup.ts', 'options.ts', 'protocol.ts', 'selectors.ts']) {
+    const src = readFileSync(join(srcDir, file), 'utf8');
+    assert.ok(!/sendButton[\s\S]{0,80}?\.click\(/.test(src), `${file} must not click the send button`);
+    assert.ok(!src.includes('requestSubmit'), `${file} must not submit the form`);
+    assert.ok(!/\.submit\(/.test(src), `${file} must not submit the form`);
+    assert.ok(!/new KeyboardEvent/.test(src), `${file} must not dispatch keyboard events (Enter could submit)`);
+  }
 });

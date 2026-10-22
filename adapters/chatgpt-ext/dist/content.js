@@ -29,6 +29,25 @@
     if (view.stopButtonPresent || view.anyTurnInProgress) return "streaming";
     return "idle";
   }
+  function deliveryPageDecision(view) {
+    if (!view.composerFound) {
+      return { ok: false, error: "ChatGPT's input box was not found (page changed?)", selectorsStale: true };
+    }
+    if (view.streaming) {
+      return { ok: false, error: "ChatGPT is still replying \u2014 wait, then forward again" };
+    }
+    if (view.composerHasText) {
+      return { ok: false, error: "ChatGPT's input box already has text \u2014 send or clear it, then forward again" };
+    }
+    return { ok: true };
+  }
+  function linesForInsert(text) {
+    if (text === "") return [];
+    return text.split("\n");
+  }
+  function textsMatch(typed, expected) {
+    return typed.replace(/\s+/g, " ").trim() === expected.replace(/\s+/g, " ").trim();
+  }
   function replyText(reply, mount) {
     const clone = reply.cloneNode(true);
     const headers = [];
@@ -49,7 +68,7 @@
   }
 
   // adapters/chatgpt-ext/src/content.ts
-  var BUILD_MARKER = "2026-10-19.2";
+  var BUILD_MARKER = "2026-10-20.1";
   console.log("[relay-astra] content script loaded", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -269,6 +288,10 @@
   });
   checkCompletion();
   chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "type-relay-text" && typeof msg.text === "string" && typeof msg.messageId === "string") {
+      sendResponse(typeRelayText(msg.text));
+      return;
+    }
     if (msg?.type !== "type-test-text" || typeof msg.text !== "string") return;
     debug("popup asked to type the test text");
     const composer = document.querySelector(SELECTORS.composer);
@@ -285,4 +308,50 @@
     }
     sendResponse({ ok: true, note: "typed \u2014 Send is yours to click" });
   });
+  function composerText(composer) {
+    return composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? "";
+  }
+  function clearComposer(composer) {
+    composer.focus();
+    if (composer instanceof HTMLTextAreaElement) {
+      composer.value = "";
+      composer.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      document.execCommand("selectAll");
+      document.execCommand("delete");
+    }
+  }
+  function insertRelayText(composer, text) {
+    composer.focus();
+    if (composer instanceof HTMLTextAreaElement) {
+      composer.value = text;
+      composer.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    const lines = linesForInsert(text);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) document.execCommand("insertLineBreak");
+      if (lines[i] !== "") document.execCommand("insertText", false, lines[i]);
+    }
+  }
+  function typeRelayText(text) {
+    const composer = document.querySelector(SELECTORS.composer);
+    const streaming = streamingNow() || [...document.querySelectorAll(SELECTORS.turn)].some((turn) => turn.getAttribute(SELECTORS.turnStateAttribute) === "in_progress");
+    const decision = deliveryPageDecision({
+      composerFound: composer !== null,
+      streaming,
+      composerHasText: composer !== null && composerText(composer).trim() !== ""
+    });
+    if (!decision.ok) {
+      if (decision.selectorsStale === true) reportStatus("selectors_stale");
+      return { ok: false, error: decision.error };
+    }
+    insertRelayText(composer, text);
+    if (!textsMatch(composerText(composer), text)) {
+      clearComposer(composer);
+      return { ok: false, error: "typed text did not match; input box cleared" };
+    }
+    console.log("[relay-astra] relayed text typed \u2014 Send is the user's to click");
+    return { ok: true };
+  }
 })();

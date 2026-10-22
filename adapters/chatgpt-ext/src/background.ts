@@ -20,9 +20,9 @@
 //        chrome.storage.session so a worker death cannot drop them.
 //   F4 — a 20s {"type":"ping"} keepalive; the manifest's
 //        minimum_chrome_version 116 gates the WebSocket keepalive rule.
-import { isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
+import { deliveryTabDecision, isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
 
-const BUILD_MARKER = '2026-10-19.4';
+const BUILD_MARKER = '2026-10-20.1';
 console.log('[relay-astra worker] service worker started', BUILD_MARKER);
 
 const DEBUG = false;
@@ -53,6 +53,10 @@ interface SwChrome {
         handler: (msg: unknown, sender: unknown, sendResponse: (response: unknown) => void) => boolean | void,
       ) => void;
     };
+  };
+  tabs: {
+    /** No "tabs" permission needed — messaging a known id is open to all extensions. */
+    sendMessage: (tabId: number, message: unknown) => Promise<unknown>;
   };
   storage: {
     local: { get(keys: string): Promise<Record<string, unknown>> };
@@ -173,6 +177,57 @@ async function replayStatusAfterHello(ws: WebSocket): Promise<void> {
   }
 }
 
+/** M3.1 (D10): the ChatGPT tab that most recently sent us a message. */
+let lastSenderTabId: number | null = null;
+
+/** Send a frame to the engine if the socket is open. */
+function sendEngineFrame(frame: unknown): boolean {
+  if (socket !== null && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(frame));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * M3.1: forward one deliver to the chosen tab's content script. `delivered`
+ * means TYPED into the box, waiting for the user to click Send — the
+ * extension never sends. Any failure is reported at once; never retried.
+ */
+async function deliverToChatGpt(messageId: string, text: string): Promise<void> {
+  const decision = deliveryTabDecision(lastSenderTabId);
+  if (!decision.ok) {
+    sendEngineFrame({ type: 'failed', messageId, error: decision.error });
+    return;
+  }
+  const tabId = decision.tabId as number;
+  try {
+    const response = await chromeApi.tabs.sendMessage(tabId, { type: 'type-relay-text', messageId, text }) as
+      | { ok?: boolean; error?: string };
+    if (response?.ok === true) {
+      sendEngineFrame({ type: 'delivered', messageId });
+    } else {
+      sendEngineFrame({ type: 'failed', messageId, error: response?.error ?? 'the ChatGPT page refused the text' });
+    }
+  } catch (err) {
+    sendEngineFrame({
+      type: 'failed',
+      messageId,
+      error: `could not reach the ChatGPT tab (closed or reloaded?) — reopen chatgpt.com, then forward again: ${String(err).slice(0, 120)}`,
+    });
+  }
+}
+
+/** M3.1: the engine's frames to the astra adapter — so far only `deliver`. */
+function handleEngineFrame(frame: unknown): void {
+  const record = frame as { type?: unknown; messageId?: unknown; text?: unknown };
+  if (record?.type === 'deliver') {
+    if (typeof record.messageId === 'string' && typeof record.text === 'string') {
+      void deliverToChatGpt(record.messageId, record.text);
+    }
+  }
+}
+
 function scheduleReconnect(): void {
   setTimeout(() => { void connectEngine(); }, RECONNECT_MS);
 }
@@ -211,6 +266,11 @@ async function connectEngine(): Promise<void> {
       }, PING_INTERVAL_MS);
       void replayStatusAfterHello(ws); // F2
     };
+    ws.onmessage = (event) => {
+      let frame: unknown;
+      try { frame = JSON.parse(String(event.data)); } catch { return; }
+      handleEngineFrame(frame); // M3.1: the engine's deliver frames
+    };
     ws.onclose = (event) => {
       if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
       if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
@@ -245,9 +305,14 @@ async function connectEngine(): Promise<void> {
 
 function handleMessage(
   msg: unknown,
-  _sender: unknown,
+  sender: unknown,
   sendResponse: (response: unknown) => void,
 ): boolean | void {
+  // M3.1 (D10): deliveries go to the tab that most recently messaged us —
+  // the conversation the relay is actually watching.
+  const senderTabId = (sender as { tab?: { id?: number } } | null | undefined)?.tab?.id;
+  if (typeof senderTabId === 'number') lastSenderTabId = senderTabId;
+
   const frame = msg as { type?: string; body?: unknown; sourceRef?: unknown; status?: unknown };
   if (frame?.type === 'captured') {
     if (typeof frame.body !== 'string' || typeof frame.sourceRef !== 'string') {

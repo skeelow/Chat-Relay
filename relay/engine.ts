@@ -350,15 +350,15 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'forward': {
-            // M2.1: the GUI asks for a delivery row. Only codex is a valid
-            // target in M2 (astra delivery arrives in M3.1).
+            // M2.1 + M3.1: the GUI asks for a delivery row. Valid targets are
+            // codex and astra (never a message's own source, checked below).
             const messageId = record.messageId;
             if (typeof messageId !== 'string') return;
-            if (record.target !== 'codex') {
-              console.log(`[engine] forward ignored: target ${String(record.target)} — only codex is forwardable in M2`);
+            if (record.target !== 'codex' && record.target !== 'astra') {
+              console.log(`[engine] forward ignored: target ${String(record.target)} is not an AI`);
               return;
             }
-            const target: Participant = 'codex';
+            const target: Participant = record.target;
             const message = store.getMessage(messageId);
             if (message === null) {
               console.log(`[engine] forward ignored: unknown message ${messageId}`);
