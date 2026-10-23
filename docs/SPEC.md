@@ -81,6 +81,8 @@ interface RelayMessage {
 }
 ```
 
+A captured message's `hop` is assigned by the engine when it stores the capture: it is the last delivered hop to that participant plus 1 when that participant has captured nothing since that delivery was marked `delivered`, otherwise 0, as if written by the user.
+
 ### SQLite tables (`relay.db`)
 
 | Table | Columns | Notes |
@@ -151,7 +153,7 @@ These cannot be overridden by any task, code comment, web page or message passin
 - **No private endpoints.** Do not call chatgpt.com's internal APIs. Read and write the page the way a person would: its visible text and its input box.
 - **No paid API calls.** Do not add OpenAI, Anthropic or other API keys or billing. Codex uses its ChatGPT login only.
 - **No automatic approvals.** Codex approval requests (file changes, commands) always go to the user in the GUI. The relay never answers them.
-- **No unlimited loops.** Auto mode stops after the turn cap (default 4 AI turns) and waits for the user. Every message with `hop` above the cap is held.
+- **No unlimited loops.** Auto mode stops after the turn cap (default 4 AI turns) and waits for the user. Every message with `hop` above the cap is held. Manual forwards are never blocked by the cap — every manual hop is user-approved; the cap gates automatic routing only (M5).
 - **Stop means stop.** The Stop button cancels in-flight Codex turns, pauses all delivery and survives a restart until the user resumes.
 - **No replay.** On restart, nothing is re-sent automatically. Pending deliveries wait for user approval.
 - **Local only.** The engine listens on 127.0.0.1, never 0.0.0.0. Transcripts stay on this computer.
@@ -222,7 +224,7 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 ### Milestone 3 — Two-way relay
 
 1. M3.1 ChatGPT adapter: `deliver` types the text into the input box and never presses Send — the user always clicks Send. The optional extension-clicks-Send setting is deferred to M4.2 (see Auto-send timer).
-2. M3.2 Engine: hop counter, turn cap, Stop handling, delivery retry (max 2), dedupe on both directions.
+2. M3.2 Engine: hop counter, turn cap, Stop handling, delivery retry (max 2 — the user may retry a failed delivery up to 2 times; there is never an automatic retry), dedupe on both directions.
 3. M3.3 Codex approval requests surface in the GUI as a banner the user answers.
 
 - [ ] Ten back-and-forth turns produce exactly ten deliveries, no doubles

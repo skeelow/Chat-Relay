@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { openStore, hashBody, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
+import { openStore, hashBody, isOverTurnCap, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const here = (...parts: string[]): string =>
@@ -323,5 +323,91 @@ test('getSetting/setSetting: round-trip, overwrite; a missing key returns null',
     store.setSetting('codex_thread_id', 't-456');
     assert.equal(store.getSetting('codex_thread_id'), 't-456', 'the second write overwrites');
     assert.equal(store.getSetting('something_else'), null, 'other keys are untouched');
+  } finally { done(); }
+});
+
+// --- M3.2a: hop assignment, turn cap, honest restart notes ---
+
+test('hopForCapture: 0 with nothing delivered; delivered hop + 1 once; 0 on a second capture', () => {
+  const { store, done } = freshStore('hopfor');
+  try {
+    assert.equal(store.hopForCapture('codex'), 0, 'no delivery to codex yet → hop 0');
+
+    // The user writes something (hop 0) and it is delivered to codex:
+    const userMsg = store.insertMessage({ source: 'user', targets: ['codex'], body: 'please reply', hop: 0 });
+    store.markStatus(userMsg.id, 'codex', 'queued');
+    store.markStatus(userMsg.id, 'codex', 'delivering');
+    store.markStatus(userMsg.id, 'codex', 'delivered');
+
+    assert.equal(store.hopForCapture('codex'), 1, 'the first capture after the delivery continues the chain');
+    const reply = store.insertMessage({ source: 'codex', targets: ['user'], body: 'a reply', hop: store.hopForCapture('codex') });
+    assert.equal(reply.hop, 1);
+
+    assert.equal(store.hopForCapture('codex'), 0, 'a second capture after the same delivery is hop 0 — the chain broke');
+
+    // The reply itself is delivered on: the next participant continues from its hop.
+    store.insertDelivery(reply.id, 'astra');
+    store.markStatus(reply.id, 'astra', 'queued');
+    store.markStatus(reply.id, 'astra', 'delivering');
+    store.markStatus(reply.id, 'astra', 'delivered');
+    assert.equal(store.hopForCapture('astra'), 2, 'astra continues the chain from the delivered hop 1');
+  } finally { done(); }
+});
+
+test('hopForCapture: a restart between the delivery and the capture keeps the chain', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-hoprestart-'));
+  try {
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      const userMsg = store.insertMessage({ source: 'user', targets: ['codex'], body: 'pre-restart', hop: 0 });
+      store.markStatus(userMsg.id, 'codex', 'queued');
+      store.markStatus(userMsg.id, 'codex', 'delivering');
+      store.markStatus(userMsg.id, 'codex', 'delivered');
+      store.close();
+    }
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.hopForCapture('codex'), 1, 'the delivered hop survives the restart');
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('turn_cap: defaults to 4; isOverTurnCap is hop >= cap', () => {
+  const { store, done } = freshStore('turncap');
+  try {
+    assert.equal(store.turnCap(), 4, 'the SPEC default');
+    store.setSetting('turn_cap', '2');
+    assert.equal(store.turnCap(), 2);
+    store.setSetting('turn_cap', 'not a number');
+    assert.equal(store.turnCap(), 4, 'an invalid value falls back to the default, never to zero');
+    assert.equal(isOverTurnCap(3, 4), false);
+    assert.equal(isOverTurnCap(4, 4), true, 'the cap is inclusive: hop 4 at cap 4 is over');
+    assert.equal(isOverTurnCap(5, 4), true);
+  } finally { done(); }
+});
+
+test('resetInFlightToPending: a delivering row carries the interrupted note; a queued row restarts clean', () => {
+  const { store, done } = freshStore('resetnotes');
+  try {
+    const flying = store.insertMessage({ source: 'codex', targets: ['user'], body: 'was delivering', hop: 0 });
+    store.insertDelivery(flying.id, 'astra');
+    store.markStatus(flying.id, 'astra', 'queued');
+    store.markStatus(flying.id, 'astra', 'delivering');
+    const waiting = store.insertMessage({ source: 'codex', targets: ['user'], body: 'was queued', hop: 0 });
+    store.insertDelivery(waiting.id, 'astra');
+    store.markStatus(waiting.id, 'astra', 'queued');
+
+    assert.equal(store.resetInFlightToPending(), 2);
+    const flyingRow = store.getDelivery(flying.id, 'astra');
+    const waitingRow = store.getDelivery(waiting.id, 'astra');
+    assert.equal(flyingRow?.status, 'pending_approval');
+    assert.equal(flyingRow?.error, 'interrupted by a restart — it may already have arrived');
+    assert.equal(waitingRow?.status, 'pending_approval');
+    assert.equal(waitingRow?.error, null);
+    // A second reset of settled rows is a no-op — the note is never re-applied.
+    assert.equal(store.resetInFlightToPending(), 0);
   } finally { done(); }
 });

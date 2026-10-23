@@ -25,16 +25,23 @@ export type DeliveryAction = 'forward' | 'approve' | 'reject';
  * The status → (status line, actions) table, per target. The codex labels are
  * M2.3's; the astra labels say what actually happened on the ChatGPT page:
  * delivered means TYPED, waiting for the user to click Send (D10).
+ * M3.2a: a pending row with an error shows the approval line plus the note
+ * (the restart's "may already have arrived"); a row that failed after 3
+ * attempts is final — no action, no Send again.
  */
 export function deliveryStatusView(
-  status: string,
+  delivery: DeliveryRow,
   target: string,
-  error?: string | null,
 ): { label: string; actions: DeliveryAction[] } {
   const toAstra = target === 'astra';
-  switch (status) {
+  switch (delivery.status) {
     case 'pending_approval':
-      return { label: 'Waiting for your approval', actions: ['approve', 'reject'] };
+      return {
+        label: delivery.error === undefined
+          ? 'Waiting for your approval'
+          : `Waiting for your approval — ${delivery.error}`,
+        actions: ['approve', 'reject'],
+      };
     case 'queued':
       return {
         label: toAstra ? 'Approved, waiting for the ChatGPT extension' : 'Approved, waiting for Codex adapter',
@@ -45,11 +52,14 @@ export function deliveryStatusView(
     case 'delivered':
       return { label: toAstra ? 'Typed into ChatGPT — click Send there' : 'Sent to Codex', actions: [] };
     case 'failed':
-      return { label: `Failed: ${error ?? 'unknown error'}`, actions: ['forward'] };
+      if (delivery.attempts >= 3) {
+        return { label: `Failed after 3 attempts: ${delivery.error ?? 'unknown error'}`, actions: [] };
+      }
+      return { label: `Failed: ${delivery.error ?? 'unknown error'}`, actions: ['forward'] };
     case 'cancelled':
       return { label: 'Cancelled', actions: [] };
     default:
-      return { label: status, actions: [] }; // unknown statuses show raw text — never guessed
+      return { label: delivery.status, actions: [] }; // unknown statuses show raw text — never guessed
   }
 }
 
@@ -66,7 +76,8 @@ export function targetFor(source: string): 'codex' | 'astra' | null {
 /**
  * Does this message get a send button, with what label, and for which target?
  * Only AI messages, and only with no delivery yet (Send to …) or a failed one
- * (Send again — a fresh forward resets it).
+ * (Send again — a fresh forward resets it). M3.2a: a failure after 3 attempts
+ * is final, so its Send again is gone too; the text stays copyable.
  */
 export function sendButton(
   source: string,
@@ -76,6 +87,9 @@ export function sendButton(
   if (target === null) return { show: false, label: '', target: null };
   const plain = source === 'astra' ? 'Send to Codex' : 'Send to ChatGPT';
   if (delivery === undefined) return { show: true, label: plain, target };
+  if (delivery.status === 'failed' && delivery.attempts >= 3) {
+    return { show: false, label: '', target }; // three attempts: no more retries
+  }
   if (delivery.status === 'failed') return { show: true, label: 'Send again', target };
   return { show: false, label: '', target };
 }

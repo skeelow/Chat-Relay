@@ -22,7 +22,7 @@
 //        minimum_chrome_version 116 gates the WebSocket keepalive rule.
 import { deliveryTabDecision, isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
 
-const BUILD_MARKER = '2026-10-20.1';
+const BUILD_MARKER = '2026-10-22.1';
 console.log('[relay-astra worker] service worker started', BUILD_MARKER);
 
 const DEBUG = false;
@@ -39,6 +39,7 @@ const WATCHDOG_ALARM = 'relay-astra-watchdog';
 const WATCHDOG_PERIOD_MIN = 0.5; // Chrome 120+ allows 30s alarm periods
 const STATUS_KEY = 'latestStatus';      // F2: last status from the content script
 const QUEUE_KEY = 'queuedCaptures';      // F3: captures that must survive worker death
+const SENDER_TAB_KEY = 'lastSenderTabId'; // S1 (M3.2a): the tab deliveries go to
 const DRAIN_SETTLE_MS = 500;             // F3: wait out the token-rejection window
 const PING_INTERVAL_MS = 20000;         // F4: under the ~30s MV3 idle kill
 const MAX_PERSISTED_QUEUE = 20;          // F3: keep the persisted queue small
@@ -309,9 +310,14 @@ function handleMessage(
   sendResponse: (response: unknown) => void,
 ): boolean | void {
   // M3.1 (D10): deliveries go to the tab that most recently messaged us —
-  // the conversation the relay is actually watching.
+  // the conversation the relay is actually watching. S1 (M3.2a): the id
+  // also goes to chrome.storage.session, so an MV3 worker restart between
+  // messages does not forget the tab.
   const senderTabId = (sender as { tab?: { id?: number } } | null | undefined)?.tab?.id;
-  if (typeof senderTabId === 'number') lastSenderTabId = senderTabId;
+  if (typeof senderTabId === 'number' && senderTabId !== lastSenderTabId) {
+    lastSenderTabId = senderTabId;
+    void chromeApi.storage.session.set({ [SENDER_TAB_KEY]: senderTabId });
+  }
 
   const frame = msg as { type?: string; body?: unknown; sourceRef?: unknown; status?: unknown };
   if (frame?.type === 'captured') {
@@ -387,6 +393,22 @@ chromeApi.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// Restore the persisted queue first (F3), then connect — a capture the
-// previous worker had queued must be in place before the post-hello drain.
-void restoreQueue().then(() => { void connectEngine(); });
+// Restore the persisted queue first (F3), then the remembered sender tab
+// (S1), then connect — a capture the previous worker had queued must be in
+// place before the post-hello drain, and a delivery that races the restore
+// still fails visibly (no tab known) rather than silently.
+void restoreQueue().then(() => {
+  void restoreSenderTab().then(() => { void connectEngine(); });
+});
+
+/** S1 (M3.2a): bring back the tab id the previous worker chose. A tab that
+ *  has since closed still fails visibly when messaged — storage.session
+ *  lives exactly as long as the browser session, which is the tab's life. */
+async function restoreSenderTab(): Promise<void> {
+  const bag = await chromeApi.storage.session.get(SENDER_TAB_KEY);
+  const stored = bag[SENDER_TAB_KEY];
+  if (typeof stored === 'number') {
+    lastSenderTabId = stored;
+    debug('sender tab restored from storage.session:', stored);
+  }
+}

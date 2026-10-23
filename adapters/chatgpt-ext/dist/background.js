@@ -20,7 +20,7 @@
   }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-20.1";
+  var BUILD_MARKER = "2026-10-22.1";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -35,6 +35,7 @@
   var WATCHDOG_PERIOD_MIN = 0.5;
   var STATUS_KEY = "latestStatus";
   var QUEUE_KEY = "queuedCaptures";
+  var SENDER_TAB_KEY = "lastSenderTabId";
   var DRAIN_SETTLE_MS = 500;
   var PING_INTERVAL_MS = 2e4;
   var MAX_PERSISTED_QUEUE = 20;
@@ -220,7 +221,10 @@
   }
   function handleMessage(msg, sender, sendResponse) {
     const senderTabId = sender?.tab?.id;
-    if (typeof senderTabId === "number") lastSenderTabId = senderTabId;
+    if (typeof senderTabId === "number" && senderTabId !== lastSenderTabId) {
+      lastSenderTabId = senderTabId;
+      void chromeApi.storage.session.set({ [SENDER_TAB_KEY]: senderTabId });
+    }
     const frame = msg;
     if (frame?.type === "captured") {
       if (typeof frame.body !== "string" || typeof frame.sourceRef !== "string") {
@@ -285,6 +289,16 @@
     }
   });
   void restoreQueue().then(() => {
-    void connectEngine();
+    void restoreSenderTab().then(() => {
+      void connectEngine();
+    });
   });
+  async function restoreSenderTab() {
+    const bag = await chromeApi.storage.session.get(SENDER_TAB_KEY);
+    const stored = bag[SENDER_TAB_KEY];
+    if (typeof stored === "number") {
+      lastSenderTabId = stored;
+      debug("sender tab restored from storage.session:", stored);
+    }
+  }
 })();

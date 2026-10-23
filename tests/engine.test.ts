@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket as WsRawClient } from 'ws';
 import { startEngine, type EngineHandle } from '../relay/engine.ts';
-import { hashBody } from '../relay/store.ts';
+import { hashBody, isOverTurnCap } from '../relay/store.ts';
 
 interface Frame { [key: string]: unknown; }
 
@@ -1190,4 +1190,207 @@ test('E2 for astra: a replaced extension fails its delivering rows immediately',
     assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'astra', status: 'idle' });
     assert.equal(engine.store.getDelivery(id, 'astra')?.error, 'adapter replaced before confirming');
   });
+});
+
+// --- M3.2a: routing rules — hop chain, outbound dedupe, retry limit, honest restarts ---
+
+test('ten-turn simulation: exactly ten delivers, hops 1 to 10, no doubles', async () => {
+  await withEngine('tenturn', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // astra idle
+    await gui.nextMessage(); // codex idle
+
+    const hopOf = (text: string): number => {
+      const match = /· hop (\d+)\]$/.exec(text.split('\n')[0]);
+      assert.ok(match !== null, `the deliver carries a relay header: ${text.slice(0, 60)}`);
+      return Number(match[1]);
+    };
+
+    const seen: Array<{ id: string; hop: number; target: string }> = [];
+    for (let turn = 1; turn <= 10; turn++) {
+      const fromAstra = turn % 2 === 1;
+      const body = `turn ${turn}: the relay continues`;
+      const id = fromAstra
+        ? await captureFromAstra(gui, astra, body, `m32a-turn-${turn}`)
+        : await captureFromCodex(gui, codex, body, `m32a-turn-${turn}`);
+      const target = fromAstra ? 'codex' : 'astra';
+      const receiver = fromAstra ? codex : astra;
+
+      gui.send({ type: 'forward', messageId: id, target });
+      assertDeliveryUpdate(await gui.nextMessage(), id, target, 'pending_approval', 0);
+      gui.send({ type: 'approve', messageId: id, target });
+      assertDeliveryUpdate(await gui.nextMessage(), id, target, 'queued', 0);
+      assertDeliveryUpdate(await gui.nextMessage(), id, target, 'delivering', 1);
+      const deliver = await receiver.nextMessage();
+      assert.equal(deliver.type, 'deliver');
+      assert.equal(deliver.messageId, id, `turn ${turn}: the deliver is for this message`);
+      const hop = hopOf(String(deliver.text));
+      assert.equal(hop, turn, `turn ${turn} delivers with header hop ${turn}`);
+      receiver.send({ type: 'delivered', messageId: id });
+      assertDeliveryUpdate(await gui.nextMessage(), id, target, 'delivered', 1);
+      seen.push({ id, hop, target });
+    }
+
+    assert.equal(seen.length, 10, 'exactly ten deliveries');
+    assert.deepEqual(seen.map((d) => d.hop), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'hops strictly increase 1..10');
+    assert.equal(new Set(seen.map((d) => d.id)).size, 10, 'no message is delivered twice');
+    await astra.expectSilence(400);
+    await codex.expectSilence(400);
+    // The cap exists but never blocks manual forwards — hops went to 10 at cap 4.
+    assert.equal(engine.store.turnCap(), 4);
+    assert.ok(isOverTurnCap(10, engine.store.turnCap()), 'hop 10 is over the cap, and it went through anyway');
+  });
+});
+
+test('outbound dedupe: identical text to the same target fails at approve inside 10 minutes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-outdedupe-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  let engine: EngineHandle | undefined;
+  try {
+    engine = await startEngine({ port: 0, dbPath, tokenPath });
+    let url = `ws://127.0.0.1:${engine.port}`;
+    const token = readFileSync(tokenPath, 'utf8').trim();
+    let repeatId = '';
+    {
+      const gui = await openGui(url, token);
+      const astra = await openAdapter(url, token, 'astra');
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); await gui.nextMessage(); // idle x2
+
+      const body = 'the exact same words';
+      const firstId = await captureFromAstra(gui, astra, body, 'm32a-dup-1');
+      gui.send({ type: 'forward', messageId: firstId, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), firstId, 'codex', 'pending_approval', 0);
+      gui.send({ type: 'approve', messageId: firstId, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), firstId, 'codex', 'queued', 0);
+      assertDeliveryUpdate(await gui.nextMessage(), firstId, 'codex', 'delivering', 1);
+      assert.equal((await codex.nextMessage()).type, 'deliver');
+      codex.send({ type: 'delivered', messageId: firstId });
+      assertDeliveryUpdate(await gui.nextMessage(), firstId, 'codex', 'delivered', 1);
+
+      // The user writes the identical text (the M4.1 send path, stored directly here):
+      const repeat = engine.store.insertMessage({
+        source: 'user', targets: ['user'], body, hop: 0, initialStatus: 'captured',
+      });
+      repeatId = repeat.id;
+      gui.send({ type: 'forward', messageId: repeat.id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), repeat.id, 'codex', 'pending_approval', 0);
+      gui.send({ type: 'approve', messageId: repeat.id, target: 'codex' });
+      const blocked = await gui.nextMessage();
+      assertDeliveryUpdate(blocked, repeat.id, 'codex', 'failed', 0);
+      assert.equal(blocked.error, 'identical text was already sent to codex a moment ago');
+      await codex.expectSilence(400); // nothing was sent
+      assert.equal(engine.store.getDelivery(repeat.id, 'codex')?.attempts, 0, 'no attempt was made');
+    }
+    { // 11 minutes later the same text may go again (backdate while stopped).
+      engine.stop();
+      const db = new DatabaseSync(dbPath);
+      db.prepare('UPDATE deliveries SET updated_at = ? WHERE target = ? AND status = ?')
+        .run(new Date(Date.now() - 11 * 60 * 1000).toISOString(), 'codex', 'delivered');
+      db.close();
+      engine = await startEngine({ port: 0, dbPath, tokenPath });
+      url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); // codex idle
+      const blockedRow = engine.store.getDelivery(repeatId, 'codex');
+      assert.equal(blockedRow?.status, 'failed', 'the blocked row survived the restart');
+      assert.equal(blockedRow?.attempts, 0);
+
+      gui.send({ type: 'forward', messageId: repeatId, target: 'codex' }); // failed → pending again
+      assertDeliveryUpdate(await gui.nextMessage(), repeatId, 'codex', 'pending_approval', 0);
+      gui.send({ type: 'approve', messageId: repeatId, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), repeatId, 'codex', 'queued', 0);
+      assertDeliveryUpdate(await gui.nextMessage(), repeatId, 'codex', 'delivering', 1);
+      assert.equal((await codex.nextMessage()).type, 'deliver');
+      codex.send({ type: 'delivered', messageId: repeatId });
+      assertDeliveryUpdate(await gui.nextMessage(), repeatId, 'codex', 'delivered', 1);
+    }
+  } finally {
+    engine?.stop();
+    cleanupDir(dir);
+  }
+});
+
+test('retry limit: after 3 attempts a forward on the failed row is ignored', async () => {
+  await withEngine('retrylimit', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); await gui.nextMessage(); // idle x2
+    const id = await captureFromAstra(gui, astra, 'flakey target', 'm32a-retry-1');
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      gui.send({ type: 'forward', messageId: id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', attempt - 1);
+      gui.send({ type: 'approve', messageId: id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', attempt - 1);
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', attempt);
+      assert.equal((await codex.nextMessage()).type, 'deliver');
+      codex.send({ type: 'failed', messageId: id, error: `attempt ${attempt} failed` });
+      const failed = await gui.nextMessage();
+      assertDeliveryUpdate(failed, id, 'codex', 'failed', attempt);
+    }
+
+    // The row has now failed after 3 attempts — a fourth forward changes nothing.
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    await gui.expectSilence(400);
+    const row = engine.store.getDelivery(id, 'codex');
+    assert.equal(row?.status, 'failed');
+    assert.equal(row?.attempts, 3, 'three attempts, and no fourth begins');
+  });
+});
+
+test('restart: a delivering row returns pending with the interrupted note; a queued row returns clean', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-restartnotes-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: one delivering row, one queued row carrying a stale error.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const flying = engine.store.insertMessage({ source: 'codex', targets: ['user'], body: 'mid-delivery', hop: 0, initialStatus: 'captured' });
+      engine.store.insertDelivery(flying.id, 'astra');
+      engine.store.markStatus(flying.id, 'astra', 'queued');
+      engine.store.markStatus(flying.id, 'astra', 'delivering');
+      const waiting = engine.store.insertMessage({ source: 'codex', targets: ['user'], body: 'still queued', hop: 0, initialStatus: 'captured' });
+      engine.store.insertDelivery(waiting.id, 'astra');
+      engine.store.markStatus(waiting.id, 'astra', 'queued');
+      engine.stop();
+      // A queued row should never carry an error, but if one ever does the
+      // restart must clear it — plant one to prove it:
+      const db = new DatabaseSync(dbPath);
+      db.prepare('UPDATE deliveries SET error = ? WHERE message_id = ?').run('stale error text', waiting.id);
+      db.close();
+    }
+    { // Run 2: both rows wait for approval again, with honest notes, and nothing sends.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage();
+      assert.equal(snapshot.type, 'snapshot');
+      const snapRows = (snapshot.deliveries ?? []) as Array<{ messageId?: string; error?: string | null; status?: string }>;
+      const snapFlying = snapRows.find((r) => r.messageId !== undefined &&
+        engine.store.getMessage(String(r.messageId))?.body === 'mid-delivery');
+      const snapWaiting = snapRows.find((r) => r.messageId !== undefined &&
+        engine.store.getMessage(String(r.messageId))?.body === 'still queued');
+      assert.equal(snapFlying?.status, 'pending_approval');
+      assert.equal(snapFlying?.error, 'interrupted by a restart — it may already have arrived',
+        'the GUI sees the interrupted note in its snapshot');
+      assert.equal(snapWaiting?.status, 'pending_approval');
+      assert.equal(snapWaiting?.error, null, 'the queued row restarted clean');
+
+      const astra = await openAdapter(url, token, 'astra');
+      await gui.nextMessage(); // astra idle from hello
+      await astra.expectSilence(400); // nothing is ever re-sent on hello
+      await gui.expectSilence(400);
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
 });

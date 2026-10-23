@@ -97,6 +97,12 @@ export function hashBody(body: string): string {
   return createHash('sha256').update(body.trim(), 'utf8').digest('hex');
 }
 
+/** M3.2a (D11-2): the turn cap bounds machines, never the publisher — manual
+ *  forwards pass regardless; M5's automatic routing is what checks this. */
+export function isOverTurnCap(hop: number, cap: number): boolean {
+  return hop >= cap;
+}
+
 /** SPEC relay header. Tested against the trimmed body, so leading blank
  *  lines or spaces cannot sneak copied text past the filter: a first line
  *  matching this means the relay itself injected the text. */
@@ -208,6 +214,15 @@ export interface RelayStore {
    *  codex thread id...). A missing key reads back null. */
   getSetting(key: string): string | null;
   setSetting(key: string, value: string): void;
+  /** M3.2a (D11-2): the turn_cap setting; 4 unless a positive integer is stored. */
+  turnCap(): number;
+  /** M3.2a (D11-1): the hop for a new capture from `participant` — the last
+   *  delivered hop to it + 1 when it has captured nothing since that delivery
+   *  was marked delivered, else 0 (as if written by the user). */
+  hopForCapture(participant: Participant): number;
+  /** M3.2a (D11-3): another delivery of the same content to the same target
+   *  that is delivering/delivered inside the 10-minute window, or null. */
+  recentIdenticalDelivery(contentHash: string, target: Participant, excludeMessageId: string): DeliveryView | null;
   /** Every delivery not yet settled: queued, pending_approval or delivering. */
   pendingDeliveries(): PendingDelivery[];
   /** The newest `limit` messages, oldest first (ids are ULIDs, so id order is
@@ -402,11 +417,19 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
   };
 
   const resetInFlightToPending = (): number => {
-    const result = db.prepare(
+    // M3.2a (D11-5): a queued row restarts clean — nothing had been sent. A
+    // delivering row may have partly happened on the far side, so it comes
+    // back pending with an honest note instead of a bare reset.
+    const queued = db.prepare(
       `UPDATE deliveries SET status = 'pending_approval', error = NULL
-        WHERE status IN ('queued', 'delivering')`
+        WHERE status = 'queued'`
     ).run();
-    return Number(result.changes);
+    const delivering = db.prepare(
+      `UPDATE deliveries SET status = 'pending_approval',
+          error = 'interrupted by a restart — it may already have arrived'
+        WHERE status = 'delivering'`
+    ).run();
+    return Number(queued.changes) + Number(delivering.changes);
   };
 
   const getSetting = (key: string): string | null => {
@@ -418,6 +441,45 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
   const setSetting = (key: string, value: string): void => {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, value);
+  };
+
+  const turnCap = (): number => {
+    const raw = getSetting('turn_cap');
+    const parsed = raw === null ? NaN : Number(raw);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 4; // SPEC default
+  };
+
+  const hopForCapture = (participant: Participant): number => {
+    const delivery = db.prepare(
+      `SELECT message_id, updated_at FROM deliveries
+        WHERE target = ? AND status = 'delivered'
+        ORDER BY updated_at DESC, rowid DESC LIMIT 1`
+    ).get(participant) as { message_id: string; updated_at: string } | undefined;
+    if (delivery === undefined) return 0;
+    // The chain broke if this participant said anything since that delivery:
+    const spokeSince = db.prepare(
+      'SELECT 1 FROM messages WHERE source = ? AND created_at > ? LIMIT 1'
+    ).get(participant, delivery.updated_at);
+    if (spokeSince !== undefined) return 0;
+    const message = db.prepare('SELECT hop FROM messages WHERE id = ?')
+      .get(delivery.message_id) as { hop: number } | undefined;
+    return message === undefined ? 0 : message.hop + 1;
+  };
+
+  const recentIdenticalDelivery = (
+    contentHash: string,
+    target: Participant,
+    excludeMessageId: string,
+  ): DeliveryView | null => {
+    const cutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString();
+    const row = db.prepare(
+      `SELECT d.message_id, d.target, d.status, d.attempts, d.updated_at, d.error
+         FROM deliveries d JOIN messages m ON m.id = d.message_id
+        WHERE m.content_hash = ? AND d.target = ? AND d.message_id != ?
+          AND d.status IN ('delivering', 'delivered') AND d.updated_at >= ?
+        ORDER BY d.updated_at DESC LIMIT 1`
+    ).get(contentHash, target, excludeMessageId, cutoff) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToDelivery(row);
   };
 
   const rowToPending = (row: Record<string, unknown>): PendingDelivery => ({
@@ -489,6 +551,9 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     resetInFlightToPending,
     getSetting,
     setSetting,
+    turnCap,
+    hopForCapture,
+    recentIdenticalDelivery,
     pendingDeliveries,
     recentMessages,
     isDuplicate,

@@ -124,7 +124,7 @@ function renderDelivery(messageId: string): void {
   const delivery = deliveryState.rows.get(key);
   const view = delivery === undefined
     ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
-    : deliveryStatusView(delivery.status, target, delivery.error ?? null);
+    : deliveryStatusView(delivery, target);
   footer.status.textContent = view.label; // textContent only — error text included
   footer.actions.textContent = '';
   const buttons: Array<{ action: 'forward' | 'approve' | 'reject'; label: string }> = [];

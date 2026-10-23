@@ -1,11 +1,14 @@
 "use strict";
 (() => {
   // app/src/deliveries.ts
-  function deliveryStatusView(status, target, error) {
+  function deliveryStatusView(delivery, target) {
     const toAstra = target === "astra";
-    switch (status) {
+    switch (delivery.status) {
       case "pending_approval":
-        return { label: "Waiting for your approval", actions: ["approve", "reject"] };
+        return {
+          label: delivery.error === void 0 ? "Waiting for your approval" : `Waiting for your approval \u2014 ${delivery.error}`,
+          actions: ["approve", "reject"]
+        };
       case "queued":
         return {
           label: toAstra ? "Approved, waiting for the ChatGPT extension" : "Approved, waiting for Codex adapter",
@@ -16,11 +19,14 @@
       case "delivered":
         return { label: toAstra ? "Typed into ChatGPT \u2014 click Send there" : "Sent to Codex", actions: [] };
       case "failed":
-        return { label: `Failed: ${error ?? "unknown error"}`, actions: ["forward"] };
+        if (delivery.attempts >= 3) {
+          return { label: `Failed after 3 attempts: ${delivery.error ?? "unknown error"}`, actions: [] };
+        }
+        return { label: `Failed: ${delivery.error ?? "unknown error"}`, actions: ["forward"] };
       case "cancelled":
         return { label: "Cancelled", actions: [] };
       default:
-        return { label: status, actions: [] };
+        return { label: delivery.status, actions: [] };
     }
   }
   function targetFor(source) {
@@ -33,6 +39,9 @@
     if (target === null) return { show: false, label: "", target: null };
     const plain = source === "astra" ? "Send to Codex" : "Send to ChatGPT";
     if (delivery === void 0) return { show: true, label: plain, target };
+    if (delivery.status === "failed" && delivery.attempts >= 3) {
+      return { show: false, label: "", target };
+    }
     if (delivery.status === "failed") return { show: true, label: "Send again", target };
     return { show: false, label: "", target };
   }
@@ -142,7 +151,7 @@
     if (target === null) return;
     const key = deliveryKey(messageId, target);
     const delivery = deliveryState.rows.get(key);
-    const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery.status, target, delivery.error ?? null);
+    const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
     footer.status.textContent = view.label;
     footer.actions.textContent = "";
     const buttons = [];

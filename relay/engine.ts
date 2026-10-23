@@ -336,7 +336,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 targets: ['user'],        // read-only room: the user is the only receiver
                 body,
                 sourceRef,
-                hop: 0,                   // nothing has been relayed yet in M1
+                // M3.2a (D11-1): a capture continues the relay chain when the
+                // participant's last relayed text was delivered and it has
+                // said nothing since; otherwise it counts as hop 0.
+                hop: store.hopForCapture(state.participant),
                 initialStatus: 'captured',
               });
               broadcast({ type: 'transcript_update', message });
@@ -373,6 +376,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               store.insertDelivery(messageId, target);
               broadcastDeliveryUpdate(messageId, target);
             } else if (existing.status === 'failed') {
+              // M3.2a (D11-4): the user may retry a failed delivery at most
+              // twice — three attempts and the row is final. Retries are
+              // never automatic anywhere in the relay.
+              if (existing.attempts >= 3) {
+                console.log(`[engine] forward ignored: ${messageId} → ${target} already failed after 3 attempts`);
+                return;
+              }
               // A failed delivery gets a fresh start: forward again, approve again.
               store.markStatus(messageId, target, 'pending_approval');
               broadcastDeliveryUpdate(messageId, target);
@@ -389,6 +399,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const target = record.target;
             const row = store.getDelivery(messageId, target);
             if (row === null || row.status !== 'pending_approval') return;
+            // M3.2a (D11-3): outbound dedupe — the same text must not go to
+            // the same AI twice inside the window, whatever path created the
+            // second copy (the capture-side echo filter is the first half).
+            const message = store.getMessage(messageId);
+            const twin = message === null ? null
+              : store.recentIdenticalDelivery(message.contentHash, target, messageId);
+            if (twin !== null) {
+              store.markStatus(messageId, target, 'failed',
+                `identical text was already sent to ${target} a moment ago`);
+              broadcastDeliveryUpdate(messageId, target);
+              return;
+            }
             store.markStatus(messageId, target, 'queued');
             broadcastDeliveryUpdate(messageId, target);
             const adapter = adapterSocketFor(target);
