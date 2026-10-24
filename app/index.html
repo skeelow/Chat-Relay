@@ -70,6 +70,28 @@
     #compose-send:hover:not(:disabled) { background: #26361f; }
     #compose-send:disabled, #compose-text:disabled, #compose-target:disabled
       { opacity: 0.45; cursor: default; }
+    #settings-btn { font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 999px;
+                    border: 1px solid #33373c; background: #1b1e21; color: #e6e6e6;
+                    cursor: pointer; }
+    #settings-btn:disabled { opacity: 0.45; cursor: default; }
+    #mode-label { font-size: 12px; color: #9aa0a6; }
+    #settings { padding: 12px 14px; border-bottom: 1px solid #26292d;
+                display: flex; flex-direction: column; gap: 12px; font-size: 13px; }
+    #settings[hidden] { display: none; }
+    #settings .settings-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    #settings .mode-choice { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+    #settings .mode-choice label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+    #settings .choice-help { display: block; color: #8b949e; font-size: 11px; margin-top: 2px; max-width: 240px; }
+    #settings .choice-stack { display: flex; flex-direction: column; }
+    #settings input[type="number"] { font: inherit; padding: 4px 8px; border-radius: 6px;
+                                     border: 1px solid #33373c; background: #1b1e21;
+                                     color: #e6e6e6; width: 72px; }
+    #settings input[type="checkbox"] { accent-color: #2ecc71; }
+    #settings input:disabled, #settings select:disabled { opacity: 0.45; cursor: default; }
+    #settings select { font: inherit; padding: 4px 6px; border-radius: 6px;
+                       border: 1px solid #33373c; background: #1b1e21; color: #e6e6e6; }
+    #settings-hint { color: #e3b341; font-size: 12px; }
+    #settings-hint:empty { display: none; }
     #approvals { display: flex; flex-direction: column; gap: 8px; padding: 8px 14px 0 14px; }
     #approvals:empty { display: none; }
     .approval-card { background: #2a2115; border: 1px solid #5c4a1e; border-radius: 8px;
@@ -91,12 +113,45 @@
     <span class="pill" id="pill-astra"><span class="name">Astra</span><span class="status">disconnected</span></span>
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
     <button id="stop" type="button">Stop</button>
+    <button id="settings-btn" type="button" disabled>Settings</button>
+    <span id="mode-label"></span>
     <span id="pending"></span>
     <span id="approvals-badge"></span>
     <span id="engine"><span id="dot"></span><span id="engine-label">connecting…</span></span>
   </header>
   <div id="approvals"></div>
   <div id="banner" hidden></div>
+  <div id="settings" hidden>
+    <div class="mode-choice">
+      <span class="choice-stack">
+        <label><input type="radio" name="relay-mode" id="mode-manual" disabled> Manual</label>
+        <span class="choice-help">You forward and approve each message yourself.</span>
+      </span>
+      <span class="choice-stack">
+        <label><input type="radio" name="relay-mode" id="mode-approve-each" disabled> Approve each</label>
+        <span class="choice-help">Every AI reply waits here for your Approve before it is relayed on.</span>
+      </span>
+      <span class="choice-stack">
+        <label><input type="radio" name="relay-mode" id="mode-auto" disabled> Auto</label>
+        <span class="choice-help">(available in a later update) Replies relay themselves up to the turn cap.</span>
+      </span>
+    </div>
+    <div class="settings-row">
+      <label for="turn-cap">Turn cap</label>
+      <input type="number" id="turn-cap" min="1" max="50" disabled>
+    </div>
+    <div class="settings-row">
+      <input type="checkbox" id="auto-send" disabled>
+      <label for="auto-send">Auto-send after</label>
+      <input type="number" id="auto-send-delay" min="1" disabled>
+      <select id="auto-send-unit" disabled>
+        <option value="seconds">seconds</option>
+        <option value="minutes">minutes</option>
+      </select>
+      <span class="choice-help">Takes effect with Auto mode.</span>
+    </div>
+    <div id="settings-hint"></div>
+  </div>
   <div id="transcript"></div>
   <div id="compose">
     <textarea id="compose-text" rows="2"

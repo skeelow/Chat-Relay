@@ -1986,3 +1986,165 @@ test('send: identical text to the same AI within 10 minutes fails the row with t
     assert.equal(engine.store.getDelivery(id2, 'codex')?.attempts, 0, 'no attempt was made');
   });
 });
+
+// --- M4.2: relay mode, turn cap and the auto-send settings ---
+
+test('set_mode: GUI sockets only; partial frames change only their fields; invalid frames are ignored whole', async () => {
+  await withEngine('setmode', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const stranger = await openClient(url, token); // authenticated, never greeted
+    stranger.send({ type: 'set_mode', mode: 'approve_each' });
+    await gui.expectSilence(300); // non-GUI sockets are ignored
+
+    gui.send({ type: 'set_mode', turnCap: 12 });
+    assert.deepEqual(await gui.nextMessage(), {
+      type: 'settings_update', mode: 'manual', turnCap: 12, autoSend: false, autoSendDelaySec: 10,
+    }, 'a partial frame changes only its field; the broadcast carries the whole object');
+
+    gui.send({ type: 'set_mode', mode: 'approve_each', turnCap: 99 }); // one bad field poisons all
+    gui.send({ type: 'set_mode', mode: 'auto' }); // not accepted until M5.1
+    await gui.expectSilence(300);
+
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snapshot = await late.nextMessage() as { settings?: { mode?: string; turnCap?: number; autoSend?: boolean; autoSendDelaySec?: number } };
+    assert.deepEqual(snapshot.settings, { mode: 'manual', turnCap: 12, autoSend: false, autoSendDelaySec: 10 },
+      'the rejected frames changed nothing');
+  });
+});
+
+test('set_mode: a full valid frame applies everything and the settings survive a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-settingsrestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: change all four settings.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      gui.send({ type: 'set_mode', mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300 });
+      assert.deepEqual(await gui.nextMessage(), {
+        type: 'settings_update', mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300,
+      });
+      engine.stop();
+    }
+    { // Run 2: everything persisted.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { settings?: unknown };
+      assert.deepEqual(snapshot.settings, { mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300 });
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('approve_each: a stored AI capture creates one pending row to the other AI; manual creates none', async () => {
+  await withEngine('approeach', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); await gui.nextMessage(); // idle x2
+
+    // manual (the default): a capture creates no row
+    astra.send({ type: 'captured', body: 'in manual mode', sourceRef: 'm42-manual-1' });
+    await gui.nextMessage(); // the transcript_update
+    await gui.expectSilence(300); // no delivery_update
+
+    gui.send({ type: 'set_mode', mode: 'approve_each' });
+    assert.equal((await gui.nextMessage()).type, 'settings_update');
+
+    astra.send({ type: 'captured', body: 'route me to codex', sourceRef: 'm42-ae-1' });
+    const toCodex = await gui.nextMessage() as { message?: { id?: string } };
+    assertDeliveryUpdate(await gui.nextMessage(), String(toCodex.message?.id), 'codex', 'pending_approval', 0);
+    codex.send({ type: 'captured', body: 'route me back', sourceRef: 'm42-ae-2' });
+    const toAstra = await gui.nextMessage() as { message?: { id?: string } };
+    assertDeliveryUpdate(await gui.nextMessage(), String(toAstra.message?.id), 'astra', 'pending_approval', 0);
+
+    // a duplicate capture is dropped by the store — no second row, no broadcast
+    astra.send({ type: 'captured', body: 'route me to codex', sourceRef: 'm42-ae-1' });
+    await gui.expectSilence(300);
+    assert.equal(engine.store.getDelivery(String(toCodex.message?.id), 'codex')?.status, 'pending_approval');
+  });
+});
+
+test('approve_each: Approve delivers once with the right header, and the cap never blocks it', async () => {
+  await withEngine('approeachgo', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); await gui.nextMessage(); // idle x2
+    gui.send({ type: 'set_mode', mode: 'approve_each' });
+    await gui.nextMessage(); // settings_update
+
+    // A delivered hop-8 message to astra makes the next astra capture hop 9 —
+    // over the default cap of 4, which must not matter here.
+    const planted = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'hop eight', hop: 8 });
+    engine.store.insertDelivery(planted.id, 'astra');
+    engine.store.markStatus(planted.id, 'astra', 'queued');
+    engine.store.markStatus(planted.id, 'astra', 'delivered');
+
+    astra.send({ type: 'captured', body: 'over the cap', sourceRef: 'm42-cap-1' });
+    const message = await gui.nextMessage() as { message?: { id?: string; hop?: number } };
+    assert.equal(message.message?.hop, 9, 'the capture continues the chain');
+    const id = String(message.message?.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+    // (the row is created at hop 9 although the cap is 4 — the cap never applies)
+
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.text, `[Relay · from Astra · #${id} · hop 10]\nover the cap`,
+      'the header follows the existing rule: the capture hop plus one');
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+    await codex.expectSilence(300); // exactly once
+    assert.equal(engine.store.turnCap(), 4);
+  });
+});
+
+test('approve_each: switching the mode back-fills nothing, and a restart replays nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-approeachrestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: capture in manual, then switch — no backfill; stop while approve_each.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const astra = await openAdapter(url, token, 'astra');
+      await gui.nextMessage(); // astra idle
+      astra.send({ type: 'captured', body: 'old capture', sourceRef: 'm42-old-1' });
+      await gui.nextMessage(); // transcript_update
+      await gui.expectSilence(300); // manual: no row
+      gui.send({ type: 'set_mode', mode: 'approve_each' });
+      await gui.nextMessage(); // settings_update
+      await gui.expectSilence(300); // the old capture is NOT back-filled
+      engine.stop();
+    }
+    { // Run 2: nothing is replayed; the mode persisted.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { settings?: { mode?: string }; deliveries?: unknown[] };
+      assert.equal(snapshot.settings?.mode, 'approve_each', 'the mode persisted');
+      assert.deepEqual(snapshot.deliveries, [], 'no rows were replayed for the old capture');
+      const astra = await openAdapter(url, token, 'astra');
+      await gui.nextMessage(); // astra idle from hello
+      await gui.expectSilence(400); // and nothing appears out of thin air
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});

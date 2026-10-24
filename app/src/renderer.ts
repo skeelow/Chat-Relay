@@ -46,6 +46,10 @@ import {
   type DeliveryUiState,
 } from './deliveries.ts';
 import { parseCompose } from './compose.ts';
+import {
+  delayToSeconds, isDelayValid, isTurnCapValid, modeLabel, setModeFrame, settingsControls,
+  type RelaySettings,
+} from './settings.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
 const RECONNECT_MS = 2000;
@@ -79,6 +83,16 @@ const approvalsBadge = document.getElementById('approvals-badge');
 const composeText = document.getElementById('compose-text') as HTMLTextAreaElement | null;
 const composeTarget = document.getElementById('compose-target') as HTMLSelectElement | null;
 const composeSend = document.getElementById('compose-send') as HTMLButtonElement | null;
+const settingsButton = document.getElementById('settings-btn') as HTMLButtonElement | null;
+const settingsPanel = document.getElementById('settings');
+const settingsHint = document.getElementById('settings-hint');
+const modeLabelEl = document.getElementById('mode-label');
+const modeManualInput = document.getElementById('mode-manual') as HTMLInputElement | null;
+const modeApproveInput = document.getElementById('mode-approve-each') as HTMLInputElement | null;
+const turnCapInput = document.getElementById('turn-cap') as HTMLInputElement | null;
+const autoSendInput = document.getElementById('auto-send') as HTMLInputElement | null;
+const autoSendDelayInput = document.getElementById('auto-send-delay') as HTMLInputElement | null;
+const autoSendUnitInput = document.getElementById('auto-send-unit') as HTMLSelectElement | null;
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -90,6 +104,8 @@ let paused = false;
 // M3.3: the codex approval cards — only snapshot.approvals,
 // approval_request and approval_resolved change the list.
 let approvalState = emptyApprovalsState();
+// M4.2: the relay settings — only snapshot.settings and settings_update.
+let relaySettings: RelaySettings | null = null;
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
@@ -100,6 +116,13 @@ function engineState(label: string, on: boolean): void {
   if (composeText !== null) composeText.disabled = !on; // M4.1: the compose area needs the engine
   if (composeTarget !== null) composeTarget.disabled = !on;
   if (composeSend !== null) composeSend.disabled = !on;
+  if (settingsButton !== null) settingsButton.disabled = !on; // M4.2: the settings panel too
+  if (modeManualInput !== null) modeManualInput.disabled = !on;
+  if (modeApproveInput !== null) modeApproveInput.disabled = !on;
+  if (turnCapInput !== null) turnCapInput.disabled = !on;
+  if (autoSendInput !== null) autoSendInput.disabled = !on;
+  if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
+  if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
   if (engineOnline !== on) {
     engineOnline = on;
     // Going offline disables every action button; coming back re-enables them.
@@ -125,6 +148,23 @@ function updateApprovalsBadge(): void {
   if (approvalsBadge !== null) {
     approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
   }
+}
+
+/** M4.2: apply the server's settings to the panel — the only writer of the
+ *  controls. A user's click sends a frame and waits; the update snaps the
+ *  control to the server's truth. */
+function renderSettings(): void {
+  if (relaySettings === null) return;
+  const controls = settingsControls(relaySettings);
+  if (modeManualInput !== null) modeManualInput.checked = controls.mode === 'manual';
+  if (modeApproveInput !== null) modeApproveInput.checked = controls.mode === 'approve_each';
+  if (turnCapInput !== null) turnCapInput.value = controls.turnCap;
+  if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
+  if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
+  if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
+  if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
+  if (settingsHint !== null) settingsHint.textContent = '';
+  console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
 }
 
 /** M4.1 (N4): the local Dismiss on a card the relay cannot answer. Purely
@@ -355,6 +395,9 @@ function handleFrame(frame: Frame): void {
     // M3.3: the pending approvals replace the list.
     approvalState = applySnapshotApprovals(approvalState, (frame.approvals ?? []) as ApprovalView[]);
     renderApprovals();
+    // M4.2: the settings arrive with the catch-up.
+    relaySettings = (frame.settings ?? null) as RelaySettings | null;
+    renderSettings();
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
     return;
@@ -363,6 +406,17 @@ function handleFrame(frame: Frame): void {
     // M3.2b: the only other source of the stopped state.
     paused = frame.paused === true;
     setPausedUi();
+    return;
+  }
+  if (type === 'settings_update') {
+    // M4.2: the server's settings are the panel's only truth.
+    relaySettings = {
+      mode: frame.mode === 'approve_each' ? 'approve_each' : 'manual',
+      turnCap: typeof frame.turnCap === 'number' ? frame.turnCap : 4,
+      autoSend: frame.autoSend === true,
+      autoSendDelaySec: typeof frame.autoSendDelaySec === 'number' ? frame.autoSendDelaySec : 10,
+    };
+    renderSettings();
     return;
   }
   if (type === 'approval_request') {
@@ -505,6 +559,63 @@ if (composeTarget !== null) composeTarget.disabled = true;
 if (composeSend !== null) {
   composeSend.disabled = true;
   composeSend.addEventListener('click', submitCompose);
+}
+
+// M4.2: the settings panel — server-driven controls; a change sends set_mode
+// and the panel updates only when settings_update comes back. Invalid input
+// is never sent; an inline hint explains instead.
+if (settingsButton !== null) {
+  settingsButton.disabled = true; // until the engine connects
+  settingsButton.addEventListener('click', () => {
+    if (settingsPanel !== null) settingsPanel.hidden = !settingsPanel.hidden;
+  });
+}
+if (modeManualInput !== null) {
+  modeManualInput.disabled = true;
+  modeManualInput.addEventListener('change', () => {
+    if (modeManualInput.checked) sendFrameToEngine(setModeFrame({ mode: 'manual' }));
+  });
+}
+if (modeApproveInput !== null) {
+  modeApproveInput.disabled = true;
+  modeApproveInput.addEventListener('change', () => {
+    if (modeApproveInput.checked) sendFrameToEngine(setModeFrame({ mode: 'approve_each' }));
+  });
+}
+if (turnCapInput !== null) {
+  turnCapInput.disabled = true;
+  turnCapInput.addEventListener('change', () => {
+    const value = Number(turnCapInput.value);
+    if (!isTurnCapValid(value)) {
+      if (settingsHint !== null) settingsHint.textContent = 'Turn cap must be a whole number from 1 to 50.';
+      return; // never send invalid input
+    }
+    sendFrameToEngine(setModeFrame({ turnCap: value }));
+  });
+}
+if (autoSendInput !== null) {
+  autoSendInput.disabled = true;
+  autoSendInput.addEventListener('change', () => {
+    sendFrameToEngine(setModeFrame({ autoSend: autoSendInput.checked }));
+  });
+}
+const submitDelay = (): void => {
+  if (autoSendDelayInput === null || autoSendUnitInput === null) return;
+  const value = Number(autoSendDelayInput.value);
+  const seconds = delayToSeconds(value, autoSendUnitInput.value === 'minutes' ? 'minutes' : 'seconds');
+  if (!isDelayValid(seconds)) {
+    if (settingsHint !== null) settingsHint.textContent = 'The delay must be 3 seconds to 30 minutes.';
+    return; // never send invalid input
+  }
+  sendFrameToEngine(setModeFrame({ autoSendDelaySec: seconds }));
+};
+if (autoSendDelayInput !== null) {
+  autoSendDelayInput.disabled = true;
+  autoSendDelayInput.addEventListener('change', submitDelay);
+}
+if (autoSendUnitInput !== null) {
+  autoSendUnitInput.disabled = true;
+  autoSendUnitInput.addEventListener('change', submitDelay);
 }
 
 connect();

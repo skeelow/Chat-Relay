@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { openStore, hashBody, isOverTurnCap, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
+import { openStore, hashBody, isOverTurnCap, validateModeUpdate, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const here = (...parts: string[]): string =>
@@ -455,4 +455,70 @@ test('markStatus: an informational note sticks to a pending_approval row (the St
     store.markStatus(msg.id, 'codex', 'queued');
     assert.equal(store.getDelivery(msg.id, 'codex')?.error, null);
   } finally { done(); }
+});
+
+// --- M4.2: the relay settings ---
+
+test('relay settings: defaults, accessors and persistence across a reopen', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-settings-'));
+  try {
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.relayMode(), 'manual', 'the default mode');
+      assert.equal(store.turnCap(), 4, 'the existing default cap');
+      assert.equal(store.autoSend(), false, 'absent means off');
+      assert.equal(store.autoSendDelaySec(), 10, 'the SPEC default');
+      store.setRelayMode('approve_each');
+      store.setTurnCap(7);
+      store.setAutoSend(true);
+      store.setAutoSendDelaySec(42);
+      assert.equal(store.relayMode(), 'approve_each');
+      assert.equal(store.turnCap(), 7);
+      assert.equal(store.autoSend(), true);
+      assert.equal(store.getSetting('auto_send'), '1', '"1" or absent — never another value');
+      assert.equal(store.autoSendDelaySec(), 42);
+      store.close();
+    }
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.relayMode(), 'approve_each', 'the mode survives a restart');
+      assert.equal(store.turnCap(), 7);
+      assert.equal(store.autoSend(), true);
+      assert.equal(store.autoSendDelaySec(), 42);
+      store.setAutoSend(false);
+      assert.equal(store.autoSend(), false);
+      assert.equal(store.getSetting('auto_send'), null, 'clearing removes the key entirely');
+      store.close();
+    }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); }
+    catch (err) { console.warn(`[test] could not remove temp dir ${dir}: ${String(err)}`); }
+  }
+});
+
+test('validateModeUpdate: good and bad values per field; one bad field poisons the frame', () => {
+  assert.deepEqual(validateModeUpdate({}), {}, 'an empty frame is valid — it changes nothing');
+  assert.deepEqual(validateModeUpdate({ mode: 'manual' }), { mode: 'manual' });
+  assert.deepEqual(validateModeUpdate({ mode: 'approve_each' }), { mode: 'approve_each' });
+  assert.equal(validateModeUpdate({ mode: 'auto' }), null, 'auto is not accepted until M5.1');
+  assert.equal(validateModeUpdate({ mode: 'nonsense' }), null);
+  assert.deepEqual(validateModeUpdate({ turnCap: 1 }), { turnCap: 1 });
+  assert.deepEqual(validateModeUpdate({ turnCap: 50 }), { turnCap: 50 });
+  assert.equal(validateModeUpdate({ turnCap: 0 }), null);
+  assert.equal(validateModeUpdate({ turnCap: 51 }), null);
+  assert.equal(validateModeUpdate({ turnCap: 4.5 }), null);
+  assert.equal(validateModeUpdate({ turnCap: 'x' }), null);
+  assert.deepEqual(validateModeUpdate({ autoSend: true }), { autoSend: true });
+  assert.deepEqual(validateModeUpdate({ autoSend: false }), { autoSend: false });
+  assert.equal(validateModeUpdate({ autoSend: 'yes' }), null);
+  assert.deepEqual(validateModeUpdate({ autoSendDelaySec: 3 }), { autoSendDelaySec: 3 });
+  assert.deepEqual(validateModeUpdate({ autoSendDelaySec: 1800 }), { autoSendDelaySec: 1800 });
+  assert.equal(validateModeUpdate({ autoSendDelaySec: 2 }), null);
+  assert.equal(validateModeUpdate({ autoSendDelaySec: 1801 }), null);
+  assert.equal(validateModeUpdate({ autoSendDelaySec: 'later' }), null);
+  assert.deepEqual(
+    validateModeUpdate({ mode: 'approve_each', turnCap: 2, autoSend: true, autoSendDelaySec: 300 }),
+    { mode: 'approve_each', turnCap: 2, autoSend: true, autoSendDelaySec: 300 });
+  assert.equal(validateModeUpdate({ mode: 'manual', turnCap: 99 }), null,
+    'one invalid field ignores the whole frame');
 });

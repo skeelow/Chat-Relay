@@ -32,6 +32,10 @@
 //   engine → adapter {type:'approval_answer', requestId, decision}  M3.3: forwarded to codex
 //   engine → GUI    {type:'approval_resolved', requestId, decision} M3.3: accept/decline/lost/stopped
 //   GUI → engine    {type:'send', body, targets}                   M4.1: the user writes to the room
+//   GUI → engine    {type:'set_mode', mode?, turnCap?, autoSend?,  M4.2: the relay settings
+//                    autoSendDelaySec?}
+//   engine → GUI    {type:'settings_update', mode, turnCap,        M4.2: broadcast on any change
+//                    autoSend, autoSendDelaySec}
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -41,7 +45,7 @@
 
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  openStore, StoreError,
+  openStore, StoreError, validateModeUpdate,
   type Participant, type PendingDelivery, type RelayMessage, type RelayStore,
 } from './store.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -135,6 +139,17 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   if (resetCount > 0) {
     console.log(`[engine] reset ${resetCount} in-flight delivery(ies) to pending_approval`);
   }
+  // M4.2 (D16): the relay settings, persisted in the settings table and
+  // cached here — a restart reads them back (the snapshot proves it).
+  const settings = {
+    mode: store.relayMode(),
+    turnCap: store.turnCap(),
+    autoSend: store.autoSend(),
+    autoSendDelaySec: store.autoSendDelaySec(),
+  };
+  const settingsView = (): { mode: string; turnCap: number; autoSend: boolean; autoSendDelaySec: number } =>
+    ({ ...settings });
+
   // M3.2b (D12-1): the stopped state is a persisted setting — a restarted
   // engine that was stopped stays stopped, until the user resumes.
   let paused = store.paused();
@@ -385,6 +400,17 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 initialStatus: 'captured',
               });
               broadcast({ type: 'transcript_update', message });
+              // M4.2 (D16-3): in approve_each, every stored AI capture gets one
+              // pending_approval row to the other AI — the user approves each
+              // hop, so the turn cap never applies here. No backfill on a mode
+              // change, no replay after a restart: rows are born only now.
+              if (settings.mode === 'approve_each') {
+                const other: Participant = message.source === 'astra' ? 'codex' : 'astra';
+                if (store.getDelivery(message.id, other) === null) {
+                  store.insertDelivery(message.id, other);
+                  broadcastDeliveryUpdate(message.id, other);
+                }
+              }
             } catch (err) {
               if (err instanceof StoreError &&
                   (err.code === 'duplicate' || err.code === 'relay_header' || err.code === 'echo')) {
@@ -591,6 +617,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               paused,
               // M3.3: the pending codex approvals (in memory only).
               approvals: [...approvals.values()],
+              // M4.2: the relay settings.
+              settings: settingsView(),
             }));
             return;
           }
@@ -706,9 +734,36 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             }
             return;
           }
-          case 'set_mode':
-            // Still read-only from the GUI's side until its milestone (M4.2).
+          case 'set_mode': {
+            // M4.2 (D16-2): GUI sockets only. Validate the whole frame first —
+            // one invalid field ignores everything. Otherwise apply every
+            // provided field, persist it, and broadcast on any change.
+            if (!state.isGui) {
+              console.log('[engine] set_mode from a non-GUI socket ignored');
+              return;
+            }
+            const update = validateModeUpdate({
+              mode: record.mode, turnCap: record.turnCap,
+              autoSend: record.autoSend, autoSendDelaySec: record.autoSendDelaySec,
+            });
+            if (update === null) {
+              console.log(`[engine] set_mode ignored (invalid frame): ${JSON.stringify(record)}`);
+              return;
+            }
+            const before = JSON.stringify(settingsView());
+            if (update.mode !== undefined) { settings.mode = update.mode; store.setRelayMode(update.mode); }
+            if (update.turnCap !== undefined) { settings.turnCap = update.turnCap; store.setTurnCap(update.turnCap); }
+            if (update.autoSend !== undefined) { settings.autoSend = update.autoSend; store.setAutoSend(update.autoSend); }
+            if (update.autoSendDelaySec !== undefined) {
+              settings.autoSendDelaySec = update.autoSendDelaySec;
+              store.setAutoSendDelaySec(update.autoSendDelaySec);
+            }
+            if (JSON.stringify(settingsView()) !== before) {
+              console.log(`[engine] settings changed: ${JSON.stringify(settingsView())}`);
+              broadcast({ type: 'settings_update', ...settingsView() });
+            }
             return;
+          }
           default:
             return; // unknown frame types are ignored
         }

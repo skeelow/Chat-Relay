@@ -103,6 +103,47 @@ export function isOverTurnCap(hop: number, cap: number): boolean {
   return hop >= cap;
 }
 
+// --- M4.2 (D16): the relay settings ---
+
+/** The set_mode fields after validation — only the provided ones. */
+export interface ModeUpdate {
+  mode?: 'manual' | 'approve_each';
+  turnCap?: number;
+  autoSend?: boolean;
+  autoSendDelaySec?: number;
+}
+
+/**
+ * M4.2 (D16-2): validate a set_mode frame, pure. Only provided fields are
+ * checked; any invalid value — a mode of 'auto' (not accepted until M5.1), a
+ * turn cap outside 1..50, a non-boolean autoSend, a delay outside 3..1800 —
+ * rejects the WHOLE frame (null). The engine logs and ignores it entirely.
+ */
+export function validateModeUpdate(update: {
+  mode?: unknown; turnCap?: unknown; autoSend?: unknown; autoSendDelaySec?: unknown;
+}): ModeUpdate | null {
+  const result: ModeUpdate = {};
+  if (update.mode !== undefined) {
+    if (update.mode !== 'manual' && update.mode !== 'approve_each') return null;
+    result.mode = update.mode;
+  }
+  if (update.turnCap !== undefined) {
+    if (typeof update.turnCap !== 'number' || !Number.isInteger(update.turnCap) ||
+        update.turnCap < 1 || update.turnCap > 50) return null;
+    result.turnCap = update.turnCap;
+  }
+  if (update.autoSend !== undefined) {
+    if (typeof update.autoSend !== 'boolean') return null;
+    result.autoSend = update.autoSend;
+  }
+  if (update.autoSendDelaySec !== undefined) {
+    if (typeof update.autoSendDelaySec !== 'number' || !Number.isInteger(update.autoSendDelaySec) ||
+        update.autoSendDelaySec < 3 || update.autoSendDelaySec > 1800) return null;
+    result.autoSendDelaySec = update.autoSendDelaySec;
+  }
+  return result;
+}
+
 /** SPEC relay header. Tested against the trimmed body, so leading blank
  *  lines or spaces cannot sneak copied text past the filter: a first line
  *  matching this means the relay itself injected the text. */
@@ -222,6 +263,19 @@ export interface RelayStore {
   setSetting(key: string, value: string): void;
   /** M3.2a (D11-2): the turn_cap setting; 4 unless a positive integer is stored. */
   turnCap(): number;
+  /** M4.2 (D16-1): the relay_mode setting — 'manual' (default) or
+   *  'approve_each'; anything else reads back as manual. 'auto' arrives with
+   *  M5.1 and is rejected by set_mode long before here. */
+  relayMode(): 'manual' | 'approve_each';
+  setRelayMode(mode: 'manual' | 'approve_each'): void;
+  setTurnCap(cap: number): void;
+  /** M4.2: the auto_send setting — "1" or absent (off). Stored and shown
+   *  only until M5.1 gives it an effect. */
+  autoSend(): boolean;
+  setAutoSend(value: boolean): void;
+  /** M4.2: the auto-send delay in seconds, 3 to 1800 (default 10). */
+  autoSendDelaySec(): number;
+  setAutoSendDelaySec(seconds: number): void;
   /** M3.2b (D12-1): the persisted stopped state. "1" means stopped; the key's
    *  absence (or any other value) means running. It survives restarts. */
   paused(): boolean;
@@ -464,6 +518,35 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : 4; // SPEC default
   };
 
+  const setTurnCap = (cap: number): void => {
+    setSetting('turn_cap', String(cap));
+  };
+
+  const relayMode = (): 'manual' | 'approve_each' => {
+    const raw = getSetting('relay_mode');
+    return raw === 'approve_each' ? 'approve_each' : 'manual';
+  };
+
+  const setRelayMode = (mode: 'manual' | 'approve_each'): void => {
+    setSetting('relay_mode', mode);
+  };
+
+  const autoSend = (): boolean => getSetting('auto_send') === '1';
+
+  const setAutoSend = (value: boolean): void => {
+    if (value) setSetting('auto_send', '1');
+    else db.prepare('DELETE FROM settings WHERE key = ?').run('auto_send'); // "1" or absent, never another value
+  };
+
+  const autoSendDelaySec = (): number => {
+    const parsed = Number(getSetting('auto_send_delay_sec'));
+    return Number.isInteger(parsed) && parsed >= 3 && parsed <= 1800 ? parsed : 10; // SPEC default
+  };
+
+  const setAutoSendDelaySec = (seconds: number): void => {
+    setSetting('auto_send_delay_sec', String(seconds));
+  };
+
   const paused = (): boolean => getSetting('paused') === '1';
 
   const setPaused = (value: boolean): void => {
@@ -574,6 +657,13 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     getSetting,
     setSetting,
     turnCap,
+    setTurnCap,
+    relayMode,
+    setRelayMode,
+    autoSend,
+    setAutoSend,
+    autoSendDelaySec,
+    setAutoSendDelaySec,
     paused,
     setPaused,
     hopForCapture,

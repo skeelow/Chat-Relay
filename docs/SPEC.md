@@ -124,16 +124,17 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `send` | body, targets (astra, codex, or both); GUI only. Creates a user message and its deliveries; the user's explicit send is the approval |
 | GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
-| GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |
+| GUI → engine | `set_mode` | mode (manual or approve\_each, auto in M5.1), turnCap, autoSend (bool), autoSendDelaySec — any subset; GUI only; invalid frames are ignored whole |
 | GUI → engine | `stop` | none |
 | GUI → engine | `resume` | none — clears the stopped state |
 | GUI → engine | `approval_answer` | requestId, decision (accept or decline) |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
-| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool) and `approvals` (the pending Codex approvals) — sent once, to that socket only |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool), `approvals` (the pending Codex approvals) and `settings` — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
 | engine → GUI | `delivery_update` | message id, target, status, attempts, updatedAt, error if any |
 | engine → GUI | `countdown` | message id, target, seconds left (sent when a countdown starts and when it is cancelled) |
 | engine → GUI | `pause_update` | paused (bool) — broadcast whenever the stopped state changes |
+| engine → GUI | `settings_update` | the full settings object — mode, turnCap, autoSend, autoSendDelaySec — broadcast on any change |
 | engine → GUI | `approval_request` | requestId, kind, summary, method — broadcast when a Codex approval arrives |
 | engine → GUI | `approval_resolved` | requestId, decision (accept / decline / lost / stopped) |
 

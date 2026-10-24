@@ -190,6 +190,39 @@
     return { ok: true, body: rest, targets: TARGETS_OF[choice] };
   }
 
+  // app/src/settings.ts
+  var TURN_CAP_MIN = 1;
+  var TURN_CAP_MAX = 50;
+  var DELAY_MIN_SEC = 3;
+  var DELAY_MAX_SEC = 1800;
+  function delayToSeconds(value, unit) {
+    return unit === "minutes" ? value * 60 : value;
+  }
+  function secondsToDelay(seconds) {
+    if (seconds >= 60 && seconds % 60 === 0) return { value: seconds / 60, unit: "minutes" };
+    return { value: seconds, unit: "seconds" };
+  }
+  function isDelayValid(seconds) {
+    return Number.isInteger(seconds) && seconds >= DELAY_MIN_SEC && seconds <= DELAY_MAX_SEC;
+  }
+  function isTurnCapValid(value) {
+    return Number.isInteger(value) && value >= TURN_CAP_MIN && value <= TURN_CAP_MAX;
+  }
+  function modeLabel(mode) {
+    return mode === "approve_each" ? "Approve each" : "Manual";
+  }
+  function settingsControls(server) {
+    return {
+      mode: server.mode,
+      turnCap: String(server.turnCap),
+      autoSend: server.autoSend,
+      delay: secondsToDelay(server.autoSendDelaySec)
+    };
+  }
+  function setModeFrame(update) {
+    return { type: "set_mode", ...update };
+  }
+
   // app/src/renderer.ts
   var ENGINE_URL = "ws://127.0.0.1:8787";
   var RECONNECT_MS = 2e3;
@@ -207,11 +240,22 @@
   var composeText = document.getElementById("compose-text");
   var composeTarget = document.getElementById("compose-target");
   var composeSend = document.getElementById("compose-send");
+  var settingsButton = document.getElementById("settings-btn");
+  var settingsPanel = document.getElementById("settings");
+  var settingsHint = document.getElementById("settings-hint");
+  var modeLabelEl = document.getElementById("mode-label");
+  var modeManualInput = document.getElementById("mode-manual");
+  var modeApproveInput = document.getElementById("mode-approve-each");
+  var turnCapInput = document.getElementById("turn-cap");
+  var autoSendInput = document.getElementById("auto-send");
+  var autoSendDelayInput = document.getElementById("auto-send-delay");
+  var autoSendUnitInput = document.getElementById("auto-send-unit");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
   var paused = false;
   var approvalState = emptyApprovalsState();
+  var relaySettings = null;
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
@@ -220,6 +264,13 @@
     if (composeText !== null) composeText.disabled = !on;
     if (composeTarget !== null) composeTarget.disabled = !on;
     if (composeSend !== null) composeSend.disabled = !on;
+    if (settingsButton !== null) settingsButton.disabled = !on;
+    if (modeManualInput !== null) modeManualInput.disabled = !on;
+    if (modeApproveInput !== null) modeApproveInput.disabled = !on;
+    if (turnCapInput !== null) turnCapInput.disabled = !on;
+    if (autoSendInput !== null) autoSendInput.disabled = !on;
+    if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
+    if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
     if (engineOnline !== on) {
       engineOnline = on;
       for (const id of messageFooters.keys()) renderDelivery(id);
@@ -240,6 +291,19 @@
     if (approvalsBadge !== null) {
       approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
     }
+  }
+  function renderSettings() {
+    if (relaySettings === null) return;
+    const controls = settingsControls(relaySettings);
+    if (modeManualInput !== null) modeManualInput.checked = controls.mode === "manual";
+    if (modeApproveInput !== null) modeApproveInput.checked = controls.mode === "approve_each";
+    if (turnCapInput !== null) turnCapInput.value = controls.turnCap;
+    if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
+    if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
+    if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
+    if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
+    if (settingsHint !== null) settingsHint.textContent = "";
+    console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
   }
   function appendDismissButton(actions, requestId) {
     const button = document.createElement("button");
@@ -428,6 +492,8 @@
       setPausedUi();
       approvalState = applySnapshotApprovals(approvalState, frame.approvals ?? []);
       renderApprovals();
+      relaySettings = frame.settings ?? null;
+      renderSettings();
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
       return;
@@ -435,6 +501,16 @@
     if (type === "pause_update") {
       paused = frame.paused === true;
       setPausedUi();
+      return;
+    }
+    if (type === "settings_update") {
+      relaySettings = {
+        mode: frame.mode === "approve_each" ? "approve_each" : "manual",
+        turnCap: typeof frame.turnCap === "number" ? frame.turnCap : 4,
+        autoSend: frame.autoSend === true,
+        autoSendDelaySec: typeof frame.autoSendDelaySec === "number" ? frame.autoSendDelaySec : 10
+      };
+      renderSettings();
       return;
     }
     if (type === "approval_request") {
@@ -561,6 +637,59 @@
   if (composeSend !== null) {
     composeSend.disabled = true;
     composeSend.addEventListener("click", submitCompose);
+  }
+  if (settingsButton !== null) {
+    settingsButton.disabled = true;
+    settingsButton.addEventListener("click", () => {
+      if (settingsPanel !== null) settingsPanel.hidden = !settingsPanel.hidden;
+    });
+  }
+  if (modeManualInput !== null) {
+    modeManualInput.disabled = true;
+    modeManualInput.addEventListener("change", () => {
+      if (modeManualInput.checked) sendFrameToEngine(setModeFrame({ mode: "manual" }));
+    });
+  }
+  if (modeApproveInput !== null) {
+    modeApproveInput.disabled = true;
+    modeApproveInput.addEventListener("change", () => {
+      if (modeApproveInput.checked) sendFrameToEngine(setModeFrame({ mode: "approve_each" }));
+    });
+  }
+  if (turnCapInput !== null) {
+    turnCapInput.disabled = true;
+    turnCapInput.addEventListener("change", () => {
+      const value = Number(turnCapInput.value);
+      if (!isTurnCapValid(value)) {
+        if (settingsHint !== null) settingsHint.textContent = "Turn cap must be a whole number from 1 to 50.";
+        return;
+      }
+      sendFrameToEngine(setModeFrame({ turnCap: value }));
+    });
+  }
+  if (autoSendInput !== null) {
+    autoSendInput.disabled = true;
+    autoSendInput.addEventListener("change", () => {
+      sendFrameToEngine(setModeFrame({ autoSend: autoSendInput.checked }));
+    });
+  }
+  var submitDelay = () => {
+    if (autoSendDelayInput === null || autoSendUnitInput === null) return;
+    const value = Number(autoSendDelayInput.value);
+    const seconds = delayToSeconds(value, autoSendUnitInput.value === "minutes" ? "minutes" : "seconds");
+    if (!isDelayValid(seconds)) {
+      if (settingsHint !== null) settingsHint.textContent = "The delay must be 3 seconds to 30 minutes.";
+      return;
+    }
+    sendFrameToEngine(setModeFrame({ autoSendDelaySec: seconds }));
+  };
+  if (autoSendDelayInput !== null) {
+    autoSendDelayInput.disabled = true;
+    autoSendDelayInput.addEventListener("change", submitDelay);
+  }
+  if (autoSendUnitInput !== null) {
+    autoSendUnitInput.disabled = true;
+    autoSendUnitInput.addEventListener("change", submitDelay);
   }
   connect();
 })();
