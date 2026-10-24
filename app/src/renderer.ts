@@ -11,6 +11,17 @@
 // guesses. All text (error text included) renders via textContent, never HTML.
 
 import {
+  approvalAnswerFrame,
+  approvalCard,
+  approvalsBadgeText,
+  applyApprovalClick,
+  applyApprovalRequest,
+  applyApprovalResolved,
+  applySnapshotApprovals,
+  emptyApprovalsState,
+  type ApprovalView,
+} from './approvals.ts';
+import {
   applyClick,
   applyDeliveryUpdate,
   applySnapshotDeliveries,
@@ -59,6 +70,8 @@ const engineLabel = document.getElementById('engine-label');
 const pendingBadge = document.getElementById('pending');
 const stopButton = document.getElementById('stop') as HTMLButtonElement | null;
 const pauseBanner = document.getElementById('banner');
+const approvalsArea = document.getElementById('approvals');
+const approvalsBadge = document.getElementById('approvals-badge');
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -67,6 +80,9 @@ const messageFooters = new Map<string, { source: string; status: HTMLDivElement;
 let engineOnline = false;
 // M3.2b: the stopped state — only snapshot.paused and pause_update change it.
 let paused = false;
+// M3.3: the codex approval cards — only snapshot.approvals,
+// approval_request and approval_resolved change the list.
+let approvalState = emptyApprovalsState();
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
@@ -78,6 +94,7 @@ function engineState(label: string, on: boolean): void {
     engineOnline = on;
     // Going offline disables every action button; coming back re-enables them.
     for (const id of messageFooters.keys()) renderDelivery(id);
+    renderApprovals(); // M3.3: the approval cards' buttons follow the engine link
   }
 }
 
@@ -91,6 +108,54 @@ function setPausedUi(): void {
   if (stopButton !== null) stopButton.textContent = stopButtonLabel(paused);
   for (const id of messageFooters.keys()) renderDelivery(id); // Approve follows the state
   console.log(`[relay-gui] pause state: ${paused ? 'stopped' : 'running'}`);
+}
+
+/** M3.3: the header badge — "N approvals waiting" is hard to miss. */
+function updateApprovalsBadge(): void {
+  if (approvalsBadge !== null) {
+    approvalsBadge.textContent = approvalsBadgeText(approvalState.requests.size);
+  }
+}
+
+/** M3.3: rebuild the approval banner cards from the server state (textContent only). */
+function renderApprovals(): void {
+  updateApprovalsBadge();
+  if (approvalsArea === null) return;
+  approvalsArea.textContent = '';
+  for (const view of approvalState.requests.values()) {
+    const card = approvalCard(view);
+    const box = document.createElement('div');
+    box.className = 'approval-card';
+    const title = document.createElement('div');
+    title.className = 'approval-title';
+    title.textContent = card.title;
+    box.append(title);
+    if (card.body !== '') {
+      const body = document.createElement('div');
+      body.className = 'approval-body';
+      body.textContent = card.body;
+      box.append(body);
+    }
+    if (card.actions.length > 0) {
+      const actions = document.createElement('div');
+      actions.className = 'approval-actions';
+      const clickPending = approvalState.pendingClicks.has(view.requestId);
+      for (const action of card.actions) {
+        const button = document.createElement('button');
+        button.textContent = action === 'approve_once' ? 'Approve once' : 'Decline';
+        button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
+        button.addEventListener('click', () => {
+          approvalState = applyApprovalClick(approvalState, view.requestId);
+          sendFrameToEngine(approvalAnswerFrame(view.requestId, action === 'approve_once' ? 'accept' : 'decline'));
+          console.log(`[relay-gui] approval ${view.requestId}: ${action === 'approve_once' ? 'accept' : 'decline'} sent`);
+          renderApprovals(); // disable immediately, until approval_resolved
+        });
+        actions.append(button);
+      }
+      box.append(actions);
+    }
+    approvalsArea.append(box);
+  }
 }
 
 function setPill(adapter: string, status: string): void {
@@ -211,6 +276,9 @@ function handleFrame(frame: Frame): void {
     // M3.2b: the stopped state arrives with the catch-up.
     paused = frame.paused === true;
     setPausedUi();
+    // M3.3: the pending approvals replace the list.
+    approvalState = applySnapshotApprovals(approvalState, (frame.approvals ?? []) as ApprovalView[]);
+    renderApprovals();
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
     return;
@@ -219,6 +287,30 @@ function handleFrame(frame: Frame): void {
     // M3.2b: the only other source of the stopped state.
     paused = frame.paused === true;
     setPausedUi();
+    return;
+  }
+  if (type === 'approval_request') {
+    // M3.3: one new banner card from the codex adapter, via the engine.
+    const requestId = frame.requestId;
+    if (typeof requestId !== 'string') return;
+    const view: ApprovalView = {
+      requestId,
+      kind: typeof frame.kind === 'string' ? frame.kind : 'other',
+      summary: typeof frame.summary === 'string' ? frame.summary : '',
+      method: typeof frame.method === 'string' ? frame.method : '',
+    };
+    approvalState = applyApprovalRequest(approvalState, view);
+    console.log(`[relay-gui] approval request ${requestId} (${view.kind})`);
+    renderApprovals();
+    return;
+  }
+  if (type === 'approval_resolved') {
+    // M3.3: the card is gone — answered, lost with the adapter, or Stop.
+    const requestId = frame.requestId;
+    if (typeof requestId !== 'string') return;
+    approvalState = applyApprovalResolved(approvalState, requestId);
+    console.log(`[relay-gui] approval ${requestId} resolved: ${String(frame.decision)}`);
+    renderApprovals();
     return;
   }
   if (type === 'transcript_update') {

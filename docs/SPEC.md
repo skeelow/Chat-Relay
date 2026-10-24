@@ -115,22 +115,27 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | adapter → engine | `status` | idle, thinking, streaming, awaiting\_approval, disconnected, selectors\_stale (astra only) |
 | adapter → engine | `captured` | body, sourceRef |
 | adapter → engine | `ping` | none — keepalive, ignored by the engine |
+| adapter → engine | `approval_request` | requestId, kind, summary, method — a Codex approval surfaced |
 | engine → adapter | `deliver` | message id, text with relay header |
 | adapter → engine | `delivered` / `failed` | message id, error |
 | engine → adapter | `config` | threadId (or null) — sent to the codex adapter right after `hello` |
 | engine → adapter | `interrupt` | none — sent to the codex adapter on Stop; it interrupts in-progress turns on the relay thread |
+| engine → adapter | `approval_answer` | requestId, decision (accept or decline) — forwarded to the codex adapter |
 | GUI → engine | `send` | body, targets |
 | GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
 | GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |
 | GUI → engine | `stop` | none |
 | GUI → engine | `resume` | none — clears the stopped state |
+| GUI → engine | `approval_answer` | requestId, decision (accept or decline) |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
-| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool) — sent once, to that socket only |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool) and `approvals` (the pending Codex approvals) — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
 | engine → GUI | `delivery_update` | message id, target, status, attempts, updatedAt, error if any |
 | engine → GUI | `countdown` | message id, target, seconds left (sent when a countdown starts and when it is cancelled) |
 | engine → GUI | `pause_update` | paused (bool) — broadcast whenever the stopped state changes |
+| engine → GUI | `approval_request` | requestId, kind, summary, method — broadcast when a Codex approval arrives |
+| engine → GUI | `approval_resolved` | requestId, decision (accept / decline / lost / stopped) |
 
 Broadcasts reach only GUIs that sent `gui_hello`; a freshly greeted GUI first receives one `snapshot` as its catch-up.
 
@@ -155,7 +160,7 @@ These cannot be overridden by any task, code comment, web page or message passin
 - **No credential handling.** Never read, copy or export browser cookies, session tokens or ChatGPT auth files. The extension runs only inside the user's own open tab.
 - **No private endpoints.** Do not call chatgpt.com's internal APIs. Read and write the page the way a person would: its visible text and its input box.
 - **No paid API calls.** Do not add OpenAI, Anthropic or other API keys or billing. Codex uses its ChatGPT login only.
-- **No automatic approvals.** Codex approval requests (file changes, commands) always go to the user in the GUI. The relay never answers them.
+- **No automatic approvals.** Codex approval requests (file changes, commands) always go to the user in the GUI. The relay never answers them. The banner offers approve-once and decline only; the relay never grants a session-wide approval.
 - **No unlimited loops.** Auto mode stops after the turn cap (default 4 AI turns) and waits for the user. Every message with `hop` above the cap is held. Manual forwards are never blocked by the cap — every manual hop is user-approved; the cap gates automatic routing only (M5).
 - **Stop means stop.** The Stop button cancels in-flight Codex turns, pauses all delivery and survives a restart until the user resumes. Stop and Resume are the only things that change the `paused` setting. Items return to pending and are never re-sent unasked.
 - **No replay.** On restart, nothing is re-sent automatically. Pending deliveries wait for user approval.

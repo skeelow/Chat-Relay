@@ -196,6 +196,95 @@ export function interruptTargets(turns: ObservedTurn[], threadId: string): strin
     .map((t) => t.id);
 }
 
+// --- M3.3 (D13): Codex approval requests — surfaced, never auto-answered ---
+
+/** M3.3: what a codex server request is, from the relay's point of view. */
+export type ApprovalKind = 'command' | 'file_change' | 'permissions' | 'other';
+
+/** The user's answer, or the relay's own Stop cancel. */
+export type ApprovalDecision = 'accept' | 'decline' | 'cancel';
+
+/**
+ * M3.3 (D13-1): classify a codex server request. Exactly three methods are
+ * answerable by the relay; everything else (user input, elicitation, tool
+ * calls, the legacy approvals, auth/attestation) is `other` — reported, but
+ * the relay must never answer it.
+ */
+export function classifyServerRequest(method: string): ApprovalKind {
+  if (method === 'item/commandExecution/requestApproval') return 'command';
+  if (method === 'item/fileChange/requestApproval') return 'file_change';
+  if (method === 'item/permissions/requestApproval') return 'permissions';
+  return 'other';
+}
+
+/** Plain-text summaries are capped at this length (D13-2). */
+export const APPROVAL_SUMMARY_CAP = 600;
+
+function text(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/**
+ * M3.3 (D13-1): one plain-text summary of a request for the banner. Built only
+ * from the answerable kinds' params (see the generated schema files); `other`
+ * gets none — its banner is the fixed cannot-answer text.
+ */
+export function approvalSummary(kind: ApprovalKind, params: Record<string, unknown>): string {
+  const parts: Array<string | null> = [];
+  if (kind === 'command') {
+    parts.push(
+      text(params.command) ?? '(no command text)',
+      params.cwd === undefined || params.cwd === null ? null : `in ${String(params.cwd)}`,
+      params.reason === undefined || params.reason === null ? null : `reason: ${String(params.reason)}`,
+    );
+  } else if (kind === 'file_change') {
+    parts.push(text(params.reason) ?? 'file change approval', text(params.grantRoot) === null ? null : `grant root: ${String(params.grantRoot)}`);
+  } else if (kind === 'permissions') {
+    const requested = params.permissions as { network?: unknown; fileSystem?: unknown } | null | undefined;
+    const list: string[] = [];
+    if (requested !== null && requested !== undefined) {
+      if (requested.network !== null && requested.network !== undefined) list.push('network access');
+      if (requested.fileSystem !== null && requested.fileSystem !== undefined) list.push('file-system access');
+    }
+    parts.push(text(params.reason), list.length === 0 ? null : `requests ${list.join(', ')}`);
+  } else {
+    return '';
+  }
+  const summary = parts.filter((part): part is string => part !== null).join(' — ');
+  return summary.length <= APPROVAL_SUMMARY_CAP ? summary : summary.slice(0, APPROVAL_SUMMARY_CAP);
+}
+
+/**
+ * M3.3 (D13-4): the exact response payload for a codex approval request, as a
+ * pure function of the kind, the user's decision and the original params.
+ * Hard rule: approve-once and decline only — this function can never produce a
+ * session-wide grant or a policy amendment, and `other` answers nothing
+ * (null). The relay never calls this on its own initiative; the only callers
+ * are the engine's approval_answer handler and the Stop-driven cancel.
+ */
+export function approvalResponse(
+  kind: ApprovalKind,
+  decision: ApprovalDecision,
+  params: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (kind === 'command' || kind === 'file_change') {
+    return { decision }; // accept | decline | cancel — one action, no session grant
+  }
+  if (kind === 'permissions') {
+    if (decision !== 'accept') {
+      return { permissions: {}, scope: 'turn' }; // decline/cancel: grant nothing
+    }
+    const requested = params.permissions as { network?: unknown; fileSystem?: unknown } | null | undefined;
+    const granted: Record<string, unknown> = {};
+    if (requested !== null && requested !== undefined) {
+      if (requested.network !== null && requested.network !== undefined) granted.network = requested.network;
+      if (requested.fileSystem !== null && requested.fileSystem !== undefined) granted.fileSystem = requested.fileSystem;
+    }
+    return { permissions: granted, scope: 'turn' };
+  }
+  return null; // other: the relay must not answer
+}
+
 // --- minimal codex app-server client (NDJSON JSON-RPC over stdio, M0.1-proven) ---
 
 interface Pending { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; }
@@ -243,9 +332,16 @@ export class RequestTracker {
 class CodexClient {
   private readonly child: ChildProcess;
   private readonly tracker: RequestTracker;
+  /** M3.3: codex server requests (approvals above all) are handed to the engine
+   *  connection layer — the client itself never answers one. */
+  private readonly onServerRequest: ((frame: Record<string, unknown>) => void) | null;
 
-  constructor(timeoutMs: number = REQUEST_TIMEOUT_MS) {
+  constructor(
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+    onServerRequest?: (frame: Record<string, unknown>) => void,
+  ) {
     this.tracker = new RequestTracker(timeoutMs);
+    this.onServerRequest = onServerRequest ?? null;
     this.child = spawn('codex', ['app-server'], {
       shell: process.platform === 'win32', // npm's codex shim is a .cmd on Windows
       stdio: ['pipe', 'pipe', 'inherit'],
@@ -265,8 +361,10 @@ class CodexClient {
     try { frame = JSON.parse(line) as Record<string, unknown>; } catch { return; }
     if (frame.method !== undefined) {
       if (frame.id !== undefined && frame.id !== null) {
-        // A request FROM codex (approval, user input). Hard rule: never auto-answer.
-        console.error(`[codex-adapter] server request (not answered): ${String(frame.method)}`);
+        // A request FROM codex (an approval, user input, ...). Hard rule: never
+        // auto-answer — it is surfaced to the engine, and only a GUI
+        // approval_answer (via the engine) or a Stop cancel ever responds.
+        this.onServerRequest?.(frame);
         return;
       }
       if (frame.method === 'error') {
@@ -281,6 +379,15 @@ class CodexClient {
 
   send(frame: unknown): void {
     this.child.stdin!.write(JSON.stringify(frame) + '\n');
+  }
+
+  /**
+   * M3.3: answer a codex server request. The ONLY writer of server-request
+   * responses — the source-guard test pins its call sites to the GUI-answer
+   * path and the Stop cancel.
+   */
+  respond(id: string | number, result: unknown): void {
+    this.send({ id, result });
   }
 
   request<T>(method: string, params: unknown): Promise<T> {
@@ -354,6 +461,17 @@ let deliveryChain: Promise<void> = Promise.resolve();
 /** M3.2b: the turn id returned by our most recent turn/start — the relay's
  *  own live turn; null before the first delivery or after an adapter restart. */
 let lastStartedTurnId: string | null = null;
+/** M3.3 (D13-2): codex approval requests awaiting a GUI answer, keyed by the
+ *  requestId sent to the engine. The raw codex id rides in the entry. */
+const pendingApprovals = new Map<string, {
+  method: string;
+  id: string | number;
+  kind: ApprovalKind;
+  params: Record<string, unknown>;
+}>();
+/** M3.3: does an ANSWERABLE request wait? `other` cards never block the status. */
+const hasPendingAnswerable = (): boolean =>
+  [...pendingApprovals.values()].some((entry) => entry.kind !== 'other');
 /** The poll interval from the CLI, used by the single watch loop. */
 let pollMsGlobal = 1000;
 /** The read side starts once, on the thread this adapter settled on. */
@@ -399,9 +517,15 @@ function connectEngine(url: string, tokenPath: string): void {
   socket.onerror = () => { /* onclose follows; retry handled there */ };
 }
 
-/** M2.2: the engine sends config (right after hello) and deliver (approved rows). */
+/**
+ * The engine sends config (right after hello), interrupt and deliver (approved
+ * rows), plus approval_answer (a GUI decision, M3.3).
+ */
 function handleEngineFrame(frame: unknown): void {
-  const record = frame as { type?: unknown; threadId?: unknown; messageId?: unknown; text?: unknown };
+  const record = frame as {
+    type?: unknown; threadId?: unknown; messageId?: unknown; text?: unknown;
+    requestId?: unknown; decision?: unknown;
+  };
   if (record?.type === 'config') {
     // The CLI arg overrides the stored id; otherwise settle the thread now.
     // A1: every config is a fresh chance to resolve — clear a stale failure.
@@ -415,10 +539,23 @@ function handleEngineFrame(frame: unknown): void {
     return;
   }
   if (record?.type === 'interrupt') {
-    // M3.2b (D12-4): the engine's Stop. Chained after any in-flight delivery
-    // so a turn/start that is still resolving settles first (the fresh turn id
-    // is then known) — and it never blocks the engine's synchronous Stop.
-    deliveryChain = deliveryChain.then(() => performInterrupt());
+    // M3.2b (D12-4): the engine's Stop. Pending approvals are cancelled first
+    // (D13-5), then the in-progress turns — all chained after any in-flight
+    // delivery, and never blocking the engine's synchronous Stop.
+    deliveryChain = deliveryChain.then(() => {
+      cancelPendingApprovals();
+      return performInterrupt();
+    });
+    return;
+  }
+  if (record?.type === 'approval_answer') {
+    // M3.3 (D13-4): the ONLY path that answers a codex approval — a GUI
+    // decision forwarded by the engine. The adapter never answers on its own
+    // initiative (hard rule; source-guard tested).
+    if (typeof record.requestId === 'string' &&
+        (record.decision === 'accept' || record.decision === 'decline')) {
+      answerApproval(record.requestId, record.decision);
+    }
     return;
   }
   if (record?.type === 'deliver') {
@@ -573,6 +710,85 @@ async function performInterrupt(): Promise<void> {
   }
 }
 
+// --- M3.3 (D13): approvals surfaced to the engine, answered only by the user ---
+
+/**
+ * M3.3 (D13-2): a codex server request arrived. It is classified, summarised
+ * and reported to the engine as approval_request; the raw frame is kept so a
+ * later GUI decision can answer it. Answerable requests flip the status to
+ * awaiting_approval until answered.
+ */
+function handleServerRequest(frame: Record<string, unknown>): void {
+  const method = typeof frame.method === 'string' ? frame.method : String(frame.method);
+  const requestId = String(frame.id);
+  const kind = classifyServerRequest(method);
+  const params = (frame.params ?? {}) as Record<string, unknown>;
+  const summary = approvalSummary(kind, params);
+  pendingApprovals.set(requestId, { method, id: frame.id as string | number, kind, params });
+  if (sendFrame({ type: 'approval_request', requestId, kind, summary, method })) {
+    console.log(`[codex-adapter] approval request ${requestId} (${kind}): ${summary === '' ? method : summary}`);
+  } else {
+    console.error(`[codex-adapter] approval request ${requestId} (${kind}) — engine link down, the GUI will not see it`);
+  }
+  if (kind !== 'other' && lastEngineStatus !== 'awaiting_approval') {
+    if (sendFrame({ type: 'status', status: 'awaiting_approval' })) {
+      lastEngineStatus = 'awaiting_approval';
+    }
+  }
+}
+
+/**
+ * M3.3 (D13-4): answer one codex approval with the user's decision, exactly
+ * once. The ONLY caller is the engine's approval_answer handler — the adapter
+ * never answers on its own initiative (hard rule; source-guard tested).
+ */
+function answerApproval(requestId: string, decision: 'accept' | 'decline'): void {
+  const entry = pendingApprovals.get(requestId);
+  if (entry === undefined) {
+    console.log(`[codex-adapter] approval_answer for unknown ${requestId} ignored`);
+    return;
+  }
+  pendingApprovals.delete(requestId);
+  const codex = codexClient;
+  if (codex === null) return; // the app-server is gone; the request died with it
+  const response = approvalResponse(entry.kind, decision, entry.params);
+  if (response === null) {
+    console.log(`[codex-adapter] approval ${requestId} is not answerable by the relay — nothing sent`);
+    return;
+  }
+  try {
+    codex.respond(entry.id, response);
+    console.log(`[codex-adapter] approval ${requestId} answered: ${decision}`);
+  } catch (err) {
+    console.error(`[codex-adapter] could not answer approval ${requestId}: ${String(err)}`);
+  }
+}
+
+/**
+ * M3.3 (D13-5): on the engine's Stop, answer every pending answerable request
+ * with cancel (best effort, logged) and clear the map — `other` cards go
+ * unanswered; their remedy is the Codex app. The ONLY caller is the
+ * interrupt branch of handleEngineFrame.
+ */
+function cancelPendingApprovals(): void {
+  const codex = codexClient;
+  for (const [requestId, entry] of [...pendingApprovals]) {
+    pendingApprovals.delete(requestId);
+    if (codex === null) continue; // nothing left to answer
+    const response = approvalResponse(entry.kind, 'cancel', entry.params);
+    if (response === null) {
+      console.log(`[codex-adapter] unanswerable request ${requestId} dropped on Stop (${entry.method})`);
+      continue;
+    }
+    try {
+      codex.respond(entry.id, response);
+      console.log(`[codex-adapter] approval ${requestId} cancelled on Stop`);
+    } catch (err) {
+      console.error(`[codex-adapter] could not cancel approval ${requestId}: ${String(err)}`);
+    }
+  }
+}
+
 /** The M1.3 read side: readability check + poll loop, started once the thread is known. */
 function startWatching(threadId: string): void {
   if (watching) return;
@@ -628,9 +844,12 @@ async function watchLoop(threadId: string): Promise<void> {
         reported.add(capture.sourceRef); // only mark seen after a successful send
       }
       for (const id of plan.seenWithoutCapture) reported.add(id);
-      if (plan.adapterStatus !== lastEngineStatus) {
-        if (sendFrame({ type: 'status', status: plan.adapterStatus })) {
-          lastEngineStatus = plan.adapterStatus;
+      // M3.3 (D13-2): while an answerable approval waits, awaiting_approval
+      // outranks the poll's status; the next tick restores the normal one.
+      const effectiveStatus = hasPendingAnswerable() ? 'awaiting_approval' : plan.adapterStatus;
+      if (effectiveStatus !== lastEngineStatus) {
+        if (sendFrame({ type: 'status', status: effectiveStatus })) {
+          lastEngineStatus = effectiveStatus;
         }
       }
     } catch (err) {
@@ -660,7 +879,7 @@ async function main(): Promise<void> {
   // fresh dedicated thread. The token file is re-read per connection attempt.
   pollMsGlobal = pollMs;
 
-  const codex = new CodexClient();
+  const codex = new CodexClient(REQUEST_TIMEOUT_MS, handleServerRequest); // M3.3: approvals surface to the engine
   codexClient = codex;
   process.on('SIGINT', () => shutdown(codex));
   process.on('SIGTERM', () => shutdown(codex));

@@ -51,6 +51,21 @@
     .msg .delivery button:disabled { opacity: 0.45; cursor: default; }
     #pending { font-size: 12px; color: #e3b341; }
     #pending:empty { display: none; }
+    #approvals-badge { font-size: 12px; color: #e3b341; font-weight: 600; }
+    #approvals-badge:empty { display: none; }
+    #approvals { display: flex; flex-direction: column; gap: 8px; padding: 8px 14px 0 14px; }
+    #approvals:empty { display: none; }
+    .approval-card { background: #2a2115; border: 1px solid #5c4a1e; border-radius: 8px;
+                     padding: 8px 12px; }
+    .approval-card .approval-title { font-weight: 600; color: #e3b341; }
+    .approval-card .approval-body { margin-top: 4px; color: #d8c9a8;
+                                    white-space: pre-wrap; word-break: break-word; }
+    .approval-card .approval-actions { margin-top: 8px; display: flex; gap: 8px; }
+    .approval-card button { font: inherit; font-size: 12px; padding: 2px 10px;
+                            border-radius: 999px; border: 1px solid #5c4a1e;
+                            background: #2a2115; color: #e6e6e6; cursor: pointer; }
+    .approval-card button:hover:not(:disabled) { background: #3a2d1a; }
+    .approval-card button:disabled { opacity: 0.45; cursor: default; }
   </style>
 </head>
 <body>
@@ -60,8 +75,10 @@
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
     <button id="stop" type="button">Stop</button>
     <span id="pending"></span>
+    <span id="approvals-badge"></span>
     <span id="engine"><span id="dot"></span><span id="engine-label">connecting…</span></span>
   </header>
+  <div id="approvals"></div>
   <div id="banner" hidden></div>
   <div id="transcript"></div>
   <script src="dist/renderer.js"></script>

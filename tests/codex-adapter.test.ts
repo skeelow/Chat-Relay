@@ -8,8 +8,14 @@
 // capture drops, and splitting the body off a delivered text.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import {
+  approvalResponse,
+  approvalSummary,
   chooseThread,
+  classifyServerRequest,
   deliverFailureText,
   deliveredBodyOf,
   interruptTargets,
@@ -238,4 +244,125 @@ test('interruptTargets: in-progress turns on the relay thread only, inputs never
     'in-progress turns on the relay thread; untagged turns are the relay-thread query results');
   assert.equal(JSON.stringify(turns), snapshot, 'the helper never mutates its input');
   assert.deepEqual(interruptTargets([], relay), []);
+});
+
+// --- M3.3: Codex approval requests (surface, never auto-answer) ---
+
+test('classifyServerRequest: three answerable methods; everything else is other', () => {
+  assert.equal(classifyServerRequest('item/commandExecution/requestApproval'), 'command');
+  assert.equal(classifyServerRequest('item/fileChange/requestApproval'), 'file_change');
+  assert.equal(classifyServerRequest('item/permissions/requestApproval'), 'permissions');
+  for (const other of ['item/tool/requestUserInput', 'mcpServer/elicitation/request', 'item/tool/call',
+    'applyPatchApproval', 'execCommandApproval', 'account/chatgptAuthTokens/refresh', 'attestation/generate',
+    'item/somethingInventedLater']) {
+    assert.equal(classifyServerRequest(other), 'other', other);
+  }
+});
+
+test('approvalSummary: command, file_change and permissions summaries; other is empty', () => {
+  assert.equal(approvalSummary('command', { command: 'git status', cwd: 'C:/repo', reason: 'check state' }),
+    'git status — in C:/repo — reason: check state');
+  assert.equal(approvalSummary('command', { command: 'ls' }), 'ls');
+  assert.equal(approvalSummary('file_change', { reason: 'write the file', grantRoot: 'C:/repo/docs' }),
+    'write the file — grant root: C:/repo/docs');
+  assert.equal(approvalSummary('file_change', { reason: null }),
+    'file change approval', 'no reason still reads sensibly');
+  assert.equal(approvalSummary('permissions', {
+    reason: 'network needed',
+    permissions: { network: { enabled: true }, fileSystem: { read: ['C:/x'], write: null } },
+  }), 'network needed — requests network access, file-system access');
+  assert.equal(approvalSummary('other', {}), '');
+});
+
+test('approvalSummary: capped at 600 characters', () => {
+  const summary = approvalSummary('command', { command: 'x'.repeat(700), reason: 'y'.repeat(50) });
+  assert.equal(summary.length, 600, 'a 750-character raw summary is truncated to 600');
+});
+
+test('approvalResponse: command and file_change echo the decision, nothing more', () => {
+  assert.deepEqual(approvalResponse('command', 'accept', {}), { decision: 'accept' });
+  assert.deepEqual(approvalResponse('command', 'decline', {}), { decision: 'decline' });
+  assert.deepEqual(approvalResponse('command', 'cancel', {}), { decision: 'cancel' });
+  assert.deepEqual(approvalResponse('file_change', 'accept', {}), { decision: 'accept' });
+  assert.deepEqual(approvalResponse('file_change', 'decline', {}), { decision: 'decline' });
+});
+
+test('approvalResponse: permissions decline grants nothing; accept grants the non-null parts, scope turn only', () => {
+  const params = { permissions: { network: { enabled: true }, fileSystem: null } };
+  assert.deepEqual(approvalResponse('permissions', 'decline', params), { permissions: {}, scope: 'turn' });
+  assert.deepEqual(approvalResponse('permissions', 'cancel', params), { permissions: {}, scope: 'turn' });
+  assert.deepEqual(approvalResponse('permissions', 'accept', params),
+    { permissions: { network: { enabled: true } }, scope: 'turn' });
+  assert.deepEqual(approvalResponse('permissions', 'accept', {
+    permissions: { network: null, fileSystem: { read: null, write: ['C:/tmp'] } },
+  }), { permissions: { fileSystem: { read: null, write: ['C:/tmp'] } }, scope: 'turn' });
+  assert.deepEqual(approvalResponse('permissions', 'accept', {}),
+    { permissions: {}, scope: 'turn' }, 'nothing requested, nothing granted');
+  assert.equal(approvalResponse('other', 'accept', {}), null, 'the relay never answers an unanswerable request');
+});
+
+/** Strip // and /* comments, keeping string and template literals (test-only). */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  let mode: 'code' | 'line' | 'block' | 'quote' = 'code';
+  let quote = '';
+  while (i < src.length) {
+    const c = src[i] ?? '';
+    const n = src[i + 1] ?? '';
+    if (mode === 'code') {
+      if (c === '/' && n === '/') { mode = 'line'; i += 2; continue; }
+      if (c === '/' && n === '*') { mode = 'block'; i += 2; continue; }
+      if (c === "'" || c === '"' || c === '`') { mode = 'quote'; quote = c; out += c; i++; continue; }
+      out += c; i++;
+    } else if (mode === 'line') {
+      if (c === '\n') { mode = 'code'; out += c; }
+      i++;
+    } else if (mode === 'block') {
+      if (c === '*' && n === '/') { mode = 'code'; i += 2; } else { if (c === '\n') out += c; i++; }
+    } else {
+      out += c;
+      if (c === '\\') { out += n; i += 2; continue; }
+      if (c === quote) mode = 'code';
+      i++;
+    }
+  }
+  return out;
+}
+
+const adapterSource = (): string =>
+  readFileSync(join(fileURLToPath(new URL('.', import.meta.url)), '..', 'adapters', 'codex', 'adapter.ts'), 'utf8');
+
+test('source guard: no session-wide grants anywhere in the adapter outside comments', () => {
+  const src = stripComments(adapterSource());
+  for (const banned of ['acceptForSession', 'acceptWithExecpolicyAmendment', 'applyNetworkPolicyAmendment']) {
+    assert.ok(!src.includes(banned), `${banned} must never appear in the adapter (outside comments)`);
+  }
+  assert.ok(!/['"]session['"]/.test(src), "the adapter never grants session scope — only 'turn'");
+});
+
+test('source guard: codex is answered only from the engine approval_answer handler and the Stop cancel', () => {
+  const src = stripComments(adapterSource());
+  // The one function that answers a GUI decision — its only call site must be
+  // the engine approval_answer handler, before its own definition.
+  const answerSites = [...src.matchAll(/\banswerApproval\(/g)].map((m) => m.index ?? -1);
+  assert.equal(answerSites.length, 2, 'answerApproval: exactly one definition and one call site');
+  const answerBranch = src.indexOf("record?.type === 'approval_answer'");
+  const answerDefinition = src.indexOf('function answerApproval');
+  assert.ok(answerBranch !== -1, 'the engine approval_answer handler exists');
+  const answerCall = answerSites.find((index) => index !== answerDefinition) ?? -1;
+  assert.ok(answerCall > answerBranch && answerCall < answerDefinition,
+    'the only answerApproval call lives inside the approval_answer handler');
+  // The raw response writer: definition + the answer + the Stop cancel, nothing else.
+  const respondSites = [...src.matchAll(/\brespond\(/g)].map((m) => m.index ?? -1);
+  assert.equal(respondSites.length, 3, 'respond: one definition, the answer call, the Stop-cancel call');
+  // The Stop cancel itself runs only on the engine interrupt frame.
+  const cancelSites = [...src.matchAll(/\bcancelPendingApprovals\(/g)].map((m) => m.index ?? -1);
+  assert.equal(cancelSites.length, 2, 'cancelPendingApprovals: one definition and one call site');
+  const interruptBranch = src.indexOf("record?.type === 'interrupt'");
+  const cancelDefinition = src.indexOf('function cancelPendingApprovals');
+  assert.ok(interruptBranch !== -1, 'the engine interrupt handler exists');
+  const cancelCall = cancelSites.find((index) => index !== cancelDefinition) ?? -1;
+  assert.ok(cancelCall > interruptBranch && cancelCall < src.indexOf('function unresolvedDeliveryError'),
+    'the Stop cancel is chained only from the interrupt handler');
 });

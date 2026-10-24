@@ -1611,3 +1611,153 @@ test('stop twice and resume while not stopped are both idempotent', async () => 
     assert.equal(engine.store.getSetting('paused'), null);
   });
 });
+
+// --- M3.3: Codex approval requests surface in the GUI ---
+
+test('approvals: a codex request is broadcast to GUIs and appears in a fresh snapshot; astra reports nothing', async () => {
+  await withEngine('apprbcast', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+
+    astra.send({ type: 'approval_request', requestId: 'req-x', kind: 'command', summary: 'x', method: 'item/commandExecution/requestApproval' });
+    await gui.expectSilence(300); // only the codex socket may report approvals
+
+    codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'command', summary: 'git status', method: 'item/commandExecution/requestApproval' });
+    assert.deepEqual(await gui.nextMessage(), {
+      type: 'approval_request', requestId: 'req-1', kind: 'command',
+      summary: 'git status', method: 'item/commandExecution/requestApproval',
+    });
+
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snapshot = await late.nextMessage() as {
+      type?: string;
+      approvals?: Array<{ requestId?: string; kind?: string; summary?: string; method?: string }>;
+    };
+    assert.equal(snapshot.type, 'snapshot');
+    assert.deepEqual(snapshot.approvals, [{
+      requestId: 'req-1', kind: 'command', summary: 'git status', method: 'item/commandExecution/requestApproval',
+    }], 'the fresh GUI sees the pending approval in its catch-up');
+  });
+});
+
+test('approvals: an answer is forwarded to the codex adapter and resolved; unknown, duplicate and malformed answers are ignored', async () => {
+  await withEngine('appranswer', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'file_change', summary: 'write it', method: 'item/fileChange/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+
+    gui.send({ type: 'approval_answer', requestId: 'req-1', decision: 'accept' });
+    assert.deepEqual(await codex.nextMessage(), { type: 'approval_answer', requestId: 'req-1', decision: 'accept' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'approval_resolved', requestId: 'req-1', decision: 'accept' });
+
+    gui.send({ type: 'approval_answer', requestId: 'req-1', decision: 'decline' }); // already answered
+    gui.send({ type: 'approval_answer', requestId: 'req-nope', decision: 'accept' }); // unknown
+    gui.send({ type: 'approval_answer', requestId: 'req-1', decision: 'maybe' }); // bad decision
+    await gui.expectSilence(300);
+    await codex.expectSilence(300);
+  });
+});
+
+test('approvals: an answer from a non-GUI socket is ignored; the GUI can still answer after', async () => {
+  await withEngine('apprnongui', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'command', summary: 'ls', method: 'item/commandExecution/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+
+    const stranger = await openClient(url, token); // authenticated, never greeted
+    stranger.send({ type: 'approval_answer', requestId: 'req-1', decision: 'accept' });
+    await gui.expectSilence(300);
+    await codex.expectSilence(300); // nothing was forwarded
+
+    gui.send({ type: 'approval_answer', requestId: 'req-1', decision: 'decline' });
+    assert.deepEqual(await codex.nextMessage(), { type: 'approval_answer', requestId: 'req-1', decision: 'decline' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'approval_resolved', requestId: 'req-1', decision: 'decline' });
+  });
+});
+
+test('approvals: a codex disconnect resolves all approvals as lost; so does a replaced adapter', async () => {
+  await withEngine('apprlost', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'command', summary: 'one', method: 'item/commandExecution/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+    codex.send({ type: 'approval_request', requestId: 'req-2', kind: 'permissions', summary: 'two', method: 'item/permissions/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+
+    codex.close();
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'disconnected' });
+    const lost1 = await gui.nextMessage();
+    const lost2 = await gui.nextMessage();
+    assert.deepEqual([lost1.requestId, lost2.requestId].sort(), ['req-1', 'req-2']);
+    assert.ok(lost1.decision === 'lost' && lost2.decision === 'lost', 'each pending approval resolves as lost');
+
+    // A replaced adapter's approvals die with it too:
+    const codex2 = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    codex2.send({ type: 'approval_request', requestId: 'req-3', kind: 'command', summary: 'three', method: 'item/commandExecution/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+    const codex3 = await openAdapter(url, token, 'codex'); // replaces codex2
+    assert.deepEqual(await gui.nextMessage(), { type: 'approval_resolved', requestId: 'req-3', decision: 'lost' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+  });
+});
+
+test('approvals: Stop resolves pending approvals as stopped and still interrupts codex', async () => {
+  await withEngine('apprstop', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'command', summary: 'long one', method: 'item/commandExecution/requestApproval' });
+    assert.equal((await gui.nextMessage()).type, 'approval_request');
+
+    gui.send({ type: 'stop' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'approval_resolved', requestId: 'req-1', decision: 'stopped' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+
+    gui.send({ type: 'approval_answer', requestId: 'req-1', decision: 'accept' }); // gone
+    await gui.expectSilence(300);
+    await codex.expectSilence(300);
+  });
+});
+
+test('approvals: a restart has none — they are memory only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-apprrestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: a pending request exists when the engine stops.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); // codex idle
+      codex.send({ type: 'approval_request', requestId: 'req-1', kind: 'command', summary: 'gone with the process', method: 'item/commandExecution/requestApproval' });
+      assert.equal((await gui.nextMessage()).type, 'approval_request');
+      engine.stop();
+    }
+    { // Run 2: nothing to answer — the codex request died with its connection.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { type?: string; approvals?: unknown[] };
+      assert.equal(snapshot.type, 'snapshot');
+      assert.deepEqual(snapshot.approvals, [], 'approvals are never persisted');
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});

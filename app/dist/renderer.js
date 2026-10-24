@@ -1,5 +1,62 @@
 "use strict";
 (() => {
+  // app/src/approvals.ts
+  var ANSWERABLE_KINDS = /* @__PURE__ */ new Set(["command", "file_change", "permissions"]);
+  var KIND_LABELS = {
+    command: "Command",
+    file_change: "File change",
+    permissions: "Permissions"
+  };
+  function isAnswerable(kind) {
+    return ANSWERABLE_KINDS.has(kind);
+  }
+  function approvalCard(view) {
+    if (!isAnswerable(view.kind)) {
+      return {
+        title: `Codex asked for something the relay cannot answer (${view.method}). Answer it in the Codex app, or press Stop.`,
+        body: view.summary,
+        actions: []
+      };
+    }
+    return {
+      title: `Codex wants approval: ${KIND_LABELS[view.kind] ?? view.kind}`,
+      body: view.summary,
+      actions: ["approve_once", "decline"]
+    };
+  }
+  function approvalsBadgeText(count) {
+    if (count === 0) return "";
+    return `${count} ${count === 1 ? "approval" : "approvals"} waiting`;
+  }
+  function emptyApprovalsState() {
+    return { requests: /* @__PURE__ */ new Map(), pendingClicks: /* @__PURE__ */ new Set() };
+  }
+  function applyApprovalRequest(state, view) {
+    const requests = new Map(state.requests);
+    requests.set(view.requestId, view);
+    return { requests, pendingClicks: state.pendingClicks };
+  }
+  function applyApprovalResolved(state, requestId) {
+    const requests = new Map(state.requests);
+    requests.delete(requestId);
+    const pendingClicks = new Set(state.pendingClicks);
+    pendingClicks.delete(requestId);
+    return { requests, pendingClicks };
+  }
+  function applySnapshotApprovals(state, views) {
+    const requests = /* @__PURE__ */ new Map();
+    for (const view of views) requests.set(view.requestId, view);
+    return { requests, pendingClicks: /* @__PURE__ */ new Set() };
+  }
+  function applyApprovalClick(state, requestId) {
+    const pendingClicks = new Set(state.pendingClicks);
+    pendingClicks.add(requestId);
+    return { requests: state.requests, pendingClicks };
+  }
+  function approvalAnswerFrame(requestId, decision) {
+    return { type: "approval_answer", requestId, decision };
+  }
+
   // app/src/deliveries.ts
   function deliveryStatusView(delivery, target) {
     const toAstra = target === "astra";
@@ -111,10 +168,13 @@
   var pendingBadge = document.getElementById("pending");
   var stopButton = document.getElementById("stop");
   var pauseBanner = document.getElementById("banner");
+  var approvalsArea = document.getElementById("approvals");
+  var approvalsBadge = document.getElementById("approvals-badge");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
   var paused = false;
+  var approvalState = emptyApprovalsState();
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
@@ -123,6 +183,7 @@
     if (engineOnline !== on) {
       engineOnline = on;
       for (const id of messageFooters.keys()) renderDelivery(id);
+      renderApprovals();
     }
   }
   function setPausedUi() {
@@ -134,6 +195,50 @@
     if (stopButton !== null) stopButton.textContent = stopButtonLabel(paused);
     for (const id of messageFooters.keys()) renderDelivery(id);
     console.log(`[relay-gui] pause state: ${paused ? "stopped" : "running"}`);
+  }
+  function updateApprovalsBadge() {
+    if (approvalsBadge !== null) {
+      approvalsBadge.textContent = approvalsBadgeText(approvalState.requests.size);
+    }
+  }
+  function renderApprovals() {
+    updateApprovalsBadge();
+    if (approvalsArea === null) return;
+    approvalsArea.textContent = "";
+    for (const view of approvalState.requests.values()) {
+      const card = approvalCard(view);
+      const box = document.createElement("div");
+      box.className = "approval-card";
+      const title = document.createElement("div");
+      title.className = "approval-title";
+      title.textContent = card.title;
+      box.append(title);
+      if (card.body !== "") {
+        const body = document.createElement("div");
+        body.className = "approval-body";
+        body.textContent = card.body;
+        box.append(body);
+      }
+      if (card.actions.length > 0) {
+        const actions = document.createElement("div");
+        actions.className = "approval-actions";
+        const clickPending = approvalState.pendingClicks.has(view.requestId);
+        for (const action of card.actions) {
+          const button = document.createElement("button");
+          button.textContent = action === "approve_once" ? "Approve once" : "Decline";
+          button.disabled = clickPending || !engineOnline;
+          button.addEventListener("click", () => {
+            approvalState = applyApprovalClick(approvalState, view.requestId);
+            sendFrameToEngine(approvalAnswerFrame(view.requestId, action === "approve_once" ? "accept" : "decline"));
+            console.log(`[relay-gui] approval ${view.requestId}: ${action === "approve_once" ? "accept" : "decline"} sent`);
+            renderApprovals();
+          });
+          actions.append(button);
+        }
+        box.append(actions);
+      }
+      approvalsArea.append(box);
+    }
   }
   function setPill(adapter, status) {
     const pill = document.getElementById(`pill-${adapter}`);
@@ -234,6 +339,8 @@
       updatePendingBadge();
       paused = frame.paused === true;
       setPausedUi();
+      approvalState = applySnapshotApprovals(approvalState, frame.approvals ?? []);
+      renderApprovals();
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
       return;
@@ -241,6 +348,28 @@
     if (type === "pause_update") {
       paused = frame.paused === true;
       setPausedUi();
+      return;
+    }
+    if (type === "approval_request") {
+      const requestId = frame.requestId;
+      if (typeof requestId !== "string") return;
+      const view = {
+        requestId,
+        kind: typeof frame.kind === "string" ? frame.kind : "other",
+        summary: typeof frame.summary === "string" ? frame.summary : "",
+        method: typeof frame.method === "string" ? frame.method : ""
+      };
+      approvalState = applyApprovalRequest(approvalState, view);
+      console.log(`[relay-gui] approval request ${requestId} (${view.kind})`);
+      renderApprovals();
+      return;
+    }
+    if (type === "approval_resolved") {
+      const requestId = frame.requestId;
+      if (typeof requestId !== "string") return;
+      approvalState = applyApprovalResolved(approvalState, requestId);
+      console.log(`[relay-gui] approval ${requestId} resolved: ${String(frame.decision)}`);
+      renderApprovals();
       return;
     }
     if (type === "transcript_update") {

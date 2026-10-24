@@ -26,6 +26,11 @@
 //   GUI → engine    {type:'resume'}                              M3.2b: Resume clears the stopped state
 //   engine → GUI    {type:'pause_update', paused}                M3.2b: broadcast on every change
 //   engine → adapter {type:'interrupt'}                          M3.2b: to codex on Stop (best effort)
+//   adapter → engine {type:'approval_request', requestId, kind, summary, method}   M3.3: a codex approval
+//   engine → GUI    {type:'approval_request', ...}               M3.3: broadcast banner card
+//   GUI → engine    {type:'approval_answer', requestId, decision}   M3.3: accept or decline, once
+//   engine → adapter {type:'approval_answer', requestId, decision}  M3.3: forwarded to codex
+//   engine → GUI    {type:'approval_resolved', requestId, decision} M3.3: accept/decline/lost/stopped
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -182,6 +187,24 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   /** One ack timer per in-flight delivery, keyed `${messageId}:${target}`. */
   const ackTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  // --- M3.3 (D13-3): in-memory Codex approvals — no database, no persistence.
+  // A codex request dies with its connection, so after a restart there is
+  // nothing to answer; the GUI list is rebuilt from the live frames. ---
+  interface PendingApproval { requestId: string; kind: string; summary: string; method: string; }
+  const approvals = new Map<string, PendingApproval>();
+
+  const broadcastApprovalResolved = (requestId: string, decision: string): void => {
+    broadcast({ type: 'approval_resolved', requestId, decision });
+  };
+
+  /** Resolve every pending approval at once (a codex disconnect, a Stop). */
+  const resolveAllApprovals = (decision: string): void => {
+    for (const requestId of [...approvals.keys()]) {
+      approvals.delete(requestId);
+      broadcastApprovalResolved(requestId, decision);
+    }
+  };
+
   const clearAckTimer = (messageId: string, target: Participant): void => {
     const key = `${messageId}:${target}`;
     const timer = ackTimers.get(key);
@@ -258,6 +281,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
         }
         adapterStatuses[state.participant] = 'disconnected';
         broadcastAdapterStatus(state.participant, 'disconnected');
+        // M3.3 (D13-5): a codex request dies with its connection — the
+        // approvals resolve as lost; a late answer is then simply unknown.
+        if (state.participant === 'codex') resolveAllApprovals('lost');
       }
     });
 
@@ -310,6 +336,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 other.close(4400, 'replaced by a new connection');
               }
             }
+            // M3.3: a replaced codex adapter's approvals died with it too.
+            if (name === 'codex' && approvals.size > 0) resolveAllApprovals('lost');
             state.participant = name;
             state.status = 'idle';
             adapterStatuses[name] = 'idle';
@@ -451,6 +479,35 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             broadcastDeliveryUpdate(messageId, target);
             return;
           }
+          case 'approval_answer': {
+            // M3.3 (D13-4): only a GUI socket may answer, and only accept or
+            // decline. The relay never answers on its own initiative — this
+            // frame is the single path from a user's click to codex.
+            if (!state.isGui) {
+              console.log('[engine] approval_answer from a non-GUI socket ignored');
+              return;
+            }
+            const requestId = record.requestId;
+            const decision = record.decision;
+            if (typeof requestId !== 'string' || (decision !== 'accept' && decision !== 'decline')) {
+              console.log('[engine] approval_answer ignored: malformed frame');
+              return;
+            }
+            const approval = approvals.get(requestId);
+            if (approval === undefined) {
+              console.log(`[engine] approval_answer ignored: unknown or already-answered ${requestId}`);
+              return;
+            }
+            approvals.delete(requestId);
+            const adapter = adapterSocketFor('codex');
+            if (adapter !== null) {
+              adapter.send(JSON.stringify({ type: 'approval_answer', requestId, decision }));
+            } else {
+              console.log(`[engine] approval_answer for ${requestId}: the codex adapter is gone; the request died with it`);
+            }
+            broadcastApprovalResolved(requestId, decision);
+            return;
+          }
           case 'thread': {
             // M2.2: only the codex adapter may report the relay thread; the
             // engine persists it for the next adapter launch (and restarts).
@@ -459,6 +516,25 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (typeof threadId !== 'string' || threadId === '') return;
             store.setSetting('codex_thread_id', threadId);
             console.log(`[engine] codex relay thread recorded: ${threadId}`);
+            return;
+          }
+          case 'approval_request': {
+            // M3.3 (D13-2/3): only the codex adapter reports approvals. They
+            // are held in memory only and broadcast to the GUIs at once.
+            if (state.participant !== 'codex') return;
+            const requestId = record.requestId;
+            const kind = record.kind;
+            const method = record.method;
+            if (typeof requestId !== 'string' || requestId === '' ||
+                typeof kind !== 'string' || typeof method !== 'string') return;
+            const approval: PendingApproval = {
+              requestId,
+              kind,
+              summary: typeof record.summary === 'string' ? record.summary : '',
+              method,
+            };
+            approvals.set(requestId, approval); // a re-sent id replaces its card
+            broadcast({ type: 'approval_request', ...approval });
             return;
           }
           case 'delivered':
@@ -512,6 +588,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               // M3.2b: the stopped state rides along, so a joining GUI knows
               // to show the banner and keep Approve disabled.
               paused,
+              // M3.3: the pending codex approvals (in memory only).
+              approvals: [...approvals.values()],
             }));
             return;
           }
@@ -535,6 +613,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               clearAckTimer(pending.messageId, pending.target); // Stop cancels the ack wait too
               broadcastDeliveryUpdate(pending.messageId, pending.target);
             }
+            resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
             broadcast({ type: 'pause_update', paused: true });
             const codex = adapterSocketFor('codex');
             if (codex !== null) codex.send(JSON.stringify({ type: 'interrupt' }));
