@@ -27,6 +27,13 @@
     #dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
     #dot.on { background: #2ecc71; }
     #dot.off { background: #e74c3c; }
+    #stop { font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 999px;
+            border: 1px solid #6e3535; background: #241616; color: #eb9c9c; cursor: pointer; }
+    #stop:hover { background: #2e1a1a; }
+    #stop:disabled { opacity: 0.45; cursor: default; }
+    #banner { padding: 8px 14px; background: #2a1515; color: #f0a9a9;
+              border-bottom: 1px solid #442424; font-size: 13px; }
+    #banner[hidden] { display: none; }
     #transcript { flex: 1; overflow-y: auto; padding: 14px;
                   display: flex; flex-direction: column; gap: 10px; }
     .msg { max-width: 78%; padding: 8px 12px; border-radius: 10px;
@@ -51,9 +58,11 @@
     <span class="title">Relay Chat</span>
     <span class="pill" id="pill-astra"><span class="name">Astra</span><span class="status">disconnected</span></span>
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
+    <button id="stop" type="button">Stop</button>
     <span id="pending"></span>
     <span id="engine"><span id="dot"></span><span id="engine-label">connecting…</span></span>
   </header>
+  <div id="banner" hidden></div>
   <div id="transcript"></div>
   <script src="dist/renderer.js"></script>
 </body>

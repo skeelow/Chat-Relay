@@ -190,7 +190,8 @@ export interface RelayStore {
    *  StoreError('invalid_targets') when targets is empty. */
   insertMessage(input: InsertInput): RelayMessage;
   /** Update one delivery row. Attempts increment each time status becomes 'delivering'.
-   *  `error` is stored for 'failed' and cleared for every other status.
+   *  `error` is stored for 'failed' and as an informational note on 'pending_approval'
+   *  (the M3.2b stop notes, like the restart notes); it is cleared for every other status.
    *  Delivered and cancelled are final — any further change is rejected. */
   markStatus(messageId: string, target: Participant, status: Status, error?: string | null): void;
   /** One delivery row by key, or null. */
@@ -216,6 +217,11 @@ export interface RelayStore {
   setSetting(key: string, value: string): void;
   /** M3.2a (D11-2): the turn_cap setting; 4 unless a positive integer is stored. */
   turnCap(): number;
+  /** M3.2b (D12-1): the persisted stopped state. "1" means stopped; the key's
+   *  absence (or any other value) means running. It survives restarts. */
+  paused(): boolean;
+  /** M3.2b: set the stopped state — stored as "1", removed entirely when cleared. */
+  setPaused(value: boolean): void;
   /** M3.2a (D11-1): the hop for a new capture from `participant` — the last
    *  delivered hop to it + 1 when it has captured nothing since that delivery
    *  was marked delivered, else 0 (as if written by the user). */
@@ -335,14 +341,18 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
   const markStatus = (messageId: string, target: Participant, status: Status, error: string | null = null): void => {
     // Delivered and cancelled are final: a finished delivery must never go
     // back to pending, or the message could be sent twice. The error column
-    // holds the failure text only while the row is failed.
+    // holds the failure text while the row is failed, and an informational
+    // note while it is pending_approval (M3.2b: the stop notes — the same
+    // shape resetInFlightToPending's restart notes already give pending rows).
+    // Every other status clears it.
+    const keepError = status === 'failed' || status === 'pending_approval';
     const result = db.prepare(
       `UPDATE deliveries
          SET status = ?, updated_at = ?, attempts = attempts + ?, error = ?
        WHERE message_id = ? AND target = ?
          AND status NOT IN ('delivered', 'cancelled')`
     ).run(status, now(), status === 'delivering' ? 1 : 0,
-          status === 'failed' ? error : null, messageId, target);
+          keepError ? error : null, messageId, target);
     if (result.changes === 0) {
       const row = db.prepare('SELECT status FROM deliveries WHERE message_id = ? AND target = ?')
         .get(messageId, target);
@@ -449,6 +459,13 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : 4; // SPEC default
   };
 
+  const paused = (): boolean => getSetting('paused') === '1';
+
+  const setPaused = (value: boolean): void => {
+    if (value) setSetting('paused', '1');
+    else db.prepare('DELETE FROM settings WHERE key = ?').run('paused'); // "1" or absent, never another value
+  };
+
   const hopForCapture = (participant: Participant): number => {
     const delivery = db.prepare(
       `SELECT message_id, updated_at FROM deliveries
@@ -552,6 +569,8 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     getSetting,
     setSetting,
     turnCap,
+    paused,
+    setPaused,
     hopForCapture,
     recentIdenticalDelivery,
     pendingDeliveries,

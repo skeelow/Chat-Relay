@@ -15,9 +15,14 @@ import {
   deliveryStatusView,
   emptyDeliveryState,
   forwardFrame,
+  pauseBannerText,
   pendingCount,
   rejectFrame,
+  resumeFrame,
   sendButton,
+  stopButtonLabel,
+  stopFrame,
+  approveDisabledTitle,
   targetFor,
   type DeliveryRow,
 } from '../app/src/deliveries.ts';
@@ -157,4 +162,22 @@ test('frame builders are target-aware with exact JSON', () => {
   assert.equal(JSON.stringify(approveFrame('m1', 'astra')), '{"type":"approve","messageId":"m1","target":"astra"}');
   assert.deepEqual(rejectFrame('m2', 'codex'), { type: 'reject', messageId: 'm2', target: 'codex' });
   assert.equal(JSON.stringify(rejectFrame('m2', 'codex')), '{"type":"reject","messageId":"m2","target":"codex"}');
+});
+
+// --- M3.2b: Stop and Resume views ---
+
+test('M3.2b: the pause banner text, the Stop/Resume label and the disabled-Approve title', () => {
+  assert.equal(pauseBannerText(false), null, 'no banner while running');
+  assert.equal(pauseBannerText(true), 'Stopped — nothing will be delivered until you resume');
+  assert.equal(stopButtonLabel(false), 'Stop');
+  assert.equal(stopButtonLabel(true), 'Resume');
+  assert.equal(approveDisabledTitle(false), null);
+  assert.equal(approveDisabledTitle(true), 'Approve is disabled while stopped — press Resume first');
+});
+
+test('M3.2b: the GUI sends the exact stop and resume frames', () => {
+  assert.deepEqual(stopFrame(), { type: 'stop' });
+  assert.equal(JSON.stringify(stopFrame()), '{"type":"stop"}');
+  assert.deepEqual(resumeFrame(), { type: 'resume' });
+  assert.equal(JSON.stringify(resumeFrame()), '{"type":"resume"}');
 });

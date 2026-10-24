@@ -160,3 +160,33 @@ export function approveFrame(messageId: string, target: 'codex' | 'astra'): { ty
 export function rejectFrame(messageId: string, target: 'codex' | 'astra'): { type: 'reject'; messageId: string; target: 'codex' | 'astra' } {
   return { type: 'reject', messageId, target };
 }
+
+// --- M3.2b: Stop and Resume (the state comes only from snapshot.paused / pause_update) ---
+
+/** The banner under the header while stopped (exact packet text). */
+export const PAUSE_BANNER = 'Stopped — nothing will be delivered until you resume';
+/** The title that explains a disabled Approve while stopped. */
+export const APPROVE_PAUSED_TITLE = 'Approve is disabled while stopped — press Resume first';
+
+/** The banner text while stopped; null while running. */
+export function pauseBannerText(paused: boolean): string | null {
+  return paused ? PAUSE_BANNER : null;
+}
+
+/** The header button's label: Stop while running, Resume while stopped. */
+export function stopButtonLabel(paused: boolean): 'Stop' | 'Resume' {
+  return paused ? 'Resume' : 'Stop';
+}
+
+/** The title explaining a disabled Approve while stopped; null otherwise. */
+export function approveDisabledTitle(paused: boolean): string | null {
+  return paused ? APPROVE_PAUSED_TITLE : null;
+}
+
+export function stopFrame(): { type: 'stop' } {
+  return { type: 'stop' };
+}
+
+export function resumeFrame(): { type: 'resume' } {
+  return { type: 'resume' };
+}

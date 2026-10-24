@@ -98,6 +98,10 @@ export interface DeliveredBody {
 export interface ObservedTurn {
   id: string;
   status: string;                          // TurnStatus values, kept loose for resilience
+  /** M3.2b: current turns/list payloads carry no threadId (the query is
+   *  already thread-scoped); when a turn ever carries one, only the relay
+   *  thread's turns may be interrupted. */
+  threadId?: string | null;
   startedAt: number | null;               // unix seconds
   completedAt: number | null;             // unix seconds — null while a foreign turn is live
   items: Array<{ type: string; text?: string }>;
@@ -176,6 +180,20 @@ export function planPoll(
     }
   }
   return { captures, seenWithoutCapture, adapterStatus };
+}
+
+/**
+ * M3.2b (D12-4): the turns Stop should interrupt — in-progress turns on the
+ * relay thread only. turns/list is queried with the relay threadId, so its
+ * turns are that thread's; a turn that ever carries a different threadId is
+ * excluded defensively. "In progress" is the streaming shape: `inProgress`,
+ * or `interrupted` with completedAt null (live observation, m1.3).
+ */
+export function interruptTargets(turns: ObservedTurn[], threadId: string): string[] {
+  return turns
+    .filter((t) => t.threadId === undefined || t.threadId === null || t.threadId === threadId)
+    .filter((t) => t.status === 'inProgress' || (t.status === 'interrupted' && t.completedAt === null))
+    .map((t) => t.id);
 }
 
 // --- minimal codex app-server client (NDJSON JSON-RPC over stdio, M0.1-proven) ---
@@ -333,6 +351,9 @@ let resumedForWriting = false;
 const recentDelivered = new Map<string, number>(); // bodyHash -> delivered-at ms
 /** Deliveries run one at a time — a thread has a single writer. */
 let deliveryChain: Promise<void> = Promise.resolve();
+/** M3.2b: the turn id returned by our most recent turn/start — the relay's
+ *  own live turn; null before the first delivery or after an adapter restart. */
+let lastStartedTurnId: string | null = null;
 /** The poll interval from the CLI, used by the single watch loop. */
 let pollMsGlobal = 1000;
 /** The read side starts once, on the thread this adapter settled on. */
@@ -391,6 +412,13 @@ function handleEngineFrame(frame: unknown): void {
         : null;
       void resolveThread(configThreadId);
     }
+    return;
+  }
+  if (record?.type === 'interrupt') {
+    // M3.2b (D12-4): the engine's Stop. Chained after any in-flight delivery
+    // so a turn/start that is still resolving settles first (the fresh turn id
+    // is then known) — and it never blocks the engine's synchronous Stop.
+    deliveryChain = deliveryChain.then(() => performInterrupt());
     return;
   }
   if (record?.type === 'deliver') {
@@ -477,9 +505,13 @@ async function performDelivery(request: { messageId: string; text: string }): Pr
       resumedForWriting = true;
       console.log(`[codex-adapter] took the writer on ${threadId} (held until the adapter exits)`);
     }
-    await codex.request('turn/start', {
+    await codex.request<{ turn: { id: string } }>('turn/start', {
       threadId,
       input: [{ type: 'text', text: request.text, text_elements: [] }],
+    }).then((started) => {
+      // M3.2b: remember the turn this delivery started — Stop's interrupt
+      // targets it while it runs.
+      lastStartedTurnId = started.turn.id;
     });
     const body = deliveredBodyOf(request.text);
     if (body !== '') {
@@ -497,6 +529,46 @@ async function performDelivery(request: { messageId: string; text: string }): Pr
       console.error(`[codex-adapter] delivery ${request.messageId} failed (engine link down): ${error}`);
     } else {
       console.error(`[codex-adapter] delivery ${request.messageId} failed: ${error}`);
+    }
+  }
+}
+
+/**
+ * M3.2b (D12-4): interrupt the in-progress turns on the relay thread, best
+ * effort — the engine's Stop never waits for this. The adapter knows the turn
+ * it started (lastStartedTurnId); with none (fresh adapter, restart) it finds
+ * in-progress turns through turns/list. It must not touch any other thread.
+ */
+async function performInterrupt(): Promise<void> {
+  const codex = codexClient;
+  const threadId = activeThread;
+  if (codex === null || threadId === null) {
+    console.log('[codex-adapter] interrupt: no relay thread — nothing to interrupt');
+    return;
+  }
+  let turnIds: string[];
+  if (lastStartedTurnId !== null) {
+    turnIds = [lastStartedTurnId]; // the relay's own turn, still running
+  } else {
+    try {
+      const resp = await codex.request<ThreadTurnsListResponse>('thread/turns/list',
+        { threadId, limit: 10, itemsView: 'full' });
+      turnIds = interruptTargets(resp.data as ObservedTurn[], threadId);
+    } catch (err) {
+      console.error(`[codex-adapter] interrupt: could not list turns: ${deliverFailureText(err)}`);
+      return;
+    }
+  }
+  if (turnIds.length === 0) {
+    console.log('[codex-adapter] interrupt: no in-progress turns on the relay thread');
+    return;
+  }
+  for (const turnId of turnIds) {
+    try {
+      await codex.request('turn/interrupt', { threadId, turnId });
+      console.log(`[codex-adapter] interrupted turn ${turnId} on the relay thread`);
+    } catch (err) {
+      console.error(`[codex-adapter] interrupt of turn ${turnId} failed: ${deliverFailureText(err)}`);
     }
   }
 }

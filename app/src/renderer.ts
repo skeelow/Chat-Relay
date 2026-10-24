@@ -14,14 +14,19 @@ import {
   applyClick,
   applyDeliveryUpdate,
   applySnapshotDeliveries,
+  approveDisabledTitle,
   approveFrame,
   deliveryKey,
   deliveryStatusView,
   emptyDeliveryState,
   forwardFrame,
+  pauseBannerText,
   pendingCount,
   rejectFrame,
+  resumeFrame,
   sendButton,
+  stopButtonLabel,
+  stopFrame,
   targetFor,
   type DeliveryRow,
   type DeliveryUiState,
@@ -52,23 +57,40 @@ const transcript = document.getElementById('transcript');
 const dot = document.getElementById('dot');
 const engineLabel = document.getElementById('engine-label');
 const pendingBadge = document.getElementById('pending');
+const stopButton = document.getElementById('stop') as HTMLButtonElement | null;
+const pauseBanner = document.getElementById('banner');
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
 let deliveryState: DeliveryUiState = emptyDeliveryState();
 const messageFooters = new Map<string, { source: string; status: HTMLDivElement; actions: HTMLDivElement }>();
 let engineOnline = false;
+// M3.2b: the stopped state — only snapshot.paused and pause_update change it.
+let paused = false;
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
 function engineState(label: string, on: boolean): void {
   if (engineLabel !== null) engineLabel.textContent = label;
   if (dot !== null) dot.className = on ? 'on' : 'off';
+  if (stopButton !== null) stopButton.disabled = !on; // M3.2b: Stop/Resume needs the engine
   if (engineOnline !== on) {
     engineOnline = on;
     // Going offline disables every action button; coming back re-enables them.
     for (const id of messageFooters.keys()) renderDelivery(id);
   }
+}
+
+/** M3.2b: banner, Stop/Resume label and Approve enable/disable from the server state. */
+function setPausedUi(): void {
+  const bannerText = pauseBannerText(paused);
+  if (pauseBanner !== null) {
+    pauseBanner.textContent = bannerText ?? '';
+    pauseBanner.hidden = bannerText === null;
+  }
+  if (stopButton !== null) stopButton.textContent = stopButtonLabel(paused);
+  for (const id of messageFooters.keys()) renderDelivery(id); // Approve follows the state
+  console.log(`[relay-gui] pause state: ${paused ? 'stopped' : 'running'}`);
 }
 
 function setPill(adapter: string, status: string): void {
@@ -136,10 +158,20 @@ function renderDelivery(messageId: string): void {
     // 'forward' in the table is the failed case — sendButton shows it as Send again.
   }
   const clickPending = deliveryState.pendingClicks.has(key);
+  // M3.2b: while stopped, Approve is disabled with a title explaining why.
+  // Forward and Reject still work — creating or cancelling a pending item is
+  // not a delivery.
+  const approveTitle = approveDisabledTitle(paused);
   for (const spec of buttons) {
     const button = document.createElement('button');
     button.textContent = spec.label;
-    button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
+    if (spec.action === 'approve' && approveTitle !== null) {
+      button.disabled = true;
+      button.title = approveTitle;
+    } else {
+      button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
+      button.removeAttribute('title');
+    }
     button.addEventListener('click', () => {
       deliveryState = applyClick(deliveryState, key);
       sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId, target)
@@ -176,8 +208,17 @@ function handleFrame(frame: Frame): void {
     for (const message of messages) appendMessage(message);
     for (const id of messageFooters.keys()) renderDelivery(id); // G1: re-render existing footers
     updatePendingBadge();
+    // M3.2b: the stopped state arrives with the catch-up.
+    paused = frame.paused === true;
+    setPausedUi();
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
+    return;
+  }
+  if (type === 'pause_update') {
+    // M3.2b: the only other source of the stopped state.
+    paused = frame.paused === true;
+    setPausedUi();
     return;
   }
   if (type === 'transcript_update') {
@@ -249,6 +290,18 @@ function connect(): void {
       setTimeout(() => connect(), RECONNECT_MS);
     };
     ws.onerror = () => { /* onclose follows; retry handled there */ };
+  });
+}
+
+// M3.2b: the Stop/Resume button sends the frame; the label and banner follow
+// the server's pause_update only. Both frames are idempotent engine-side, so
+// a double-click while a round-trip is in flight is harmless.
+if (stopButton !== null) {
+  stopButton.textContent = stopButtonLabel(paused);
+  stopButton.disabled = true; // until the engine connects
+  stopButton.addEventListener('click', () => {
+    sendFrameToEngine(paused ? resumeFrame() : stopFrame());
+    console.log(`[relay-gui] ${paused ? 'resume' : 'stop'} sent`);
   });
 }
 

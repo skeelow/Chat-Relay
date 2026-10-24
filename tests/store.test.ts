@@ -411,3 +411,48 @@ test('resetInFlightToPending: a delivering row carries the interrupted note; a q
     assert.equal(store.resetInFlightToPending(), 0);
   } finally { done(); }
 });
+
+// --- M3.2b: the persisted stopped state ---
+
+test('paused accessors: absent reads false, "1" survives a reopen, clearing removes the key', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-paused-'));
+  try {
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.paused(), false, 'absent means running');
+      store.setPaused(true);
+      assert.equal(store.paused(), true);
+      assert.equal(store.getSetting('paused'), '1', '"1" or absent — never "0"');
+      store.close();
+    }
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.paused(), true, 'the stopped state survives a restart');
+      store.setPaused(false);
+      assert.equal(store.paused(), false);
+      assert.equal(store.getSetting('paused'), null, 'clearing removes the key entirely');
+      store.close();
+    }
+  } finally {
+    // Windows can EPERM on a just-released SQLite handle — best-effort retries.
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); }
+    catch (err) { console.warn(`[test] could not remove temp dir ${dir}: ${String(err)}`); }
+  }
+});
+
+test('markStatus: an informational note sticks to a pending_approval row (the Stop notes)', () => {
+  const { store, done } = freshStore('pendingnote');
+  try {
+    const msg = store.insertMessage({ source: 'astra', targets: ['codex'], body: 'note carrier', hop: 0 });
+    store.markStatus(msg.id, 'codex', 'queued');
+    store.markStatus(msg.id, 'codex', 'delivering');
+    store.markStatus(msg.id, 'codex', 'pending_approval', 'stopped — approve again after you resume');
+    const row = store.getDelivery(msg.id, 'codex');
+    assert.equal(row?.status, 'pending_approval');
+    assert.equal(row?.error, 'stopped — approve again after you resume',
+      'the stop note rides on the row, like the restart notes do');
+    // Any ordinary transition clears it again — notes never linger stale:
+    store.markStatus(msg.id, 'codex', 'queued');
+    assert.equal(store.getDelivery(msg.id, 'codex')?.error, null);
+  } finally { done(); }
+});

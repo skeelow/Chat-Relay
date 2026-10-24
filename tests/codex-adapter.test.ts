@@ -12,6 +12,7 @@ import {
   chooseThread,
   deliverFailureText,
   deliveredBodyOf,
+  interruptTargets,
   planPoll,
   RequestTracker,
   unresolvedDeliveryError,
@@ -219,4 +220,22 @@ test('A1: the unresolved-thread failure text carries the resolve error', () => {
   assert.equal(
     unresolvedDeliveryError('codex request timed out: thread/start'),
     'relay thread not resolved: codex request timed out: thread/start');
+});
+
+// --- M3.2b: Stop's interrupt targets ---
+
+test('interruptTargets: in-progress turns on the relay thread only, inputs never mutated', () => {
+  const relay = 'thread-relay';
+  const inProgress = { id: 'own-live', status: 'inProgress', startedAt: fresh(5), completedAt: null, items: [] };
+  const taggedRelay = { id: 'relay-tagged', status: 'inProgress', threadId: relay, startedAt: fresh(4), completedAt: null, items: [] };
+  const taggedForeign = { id: 'foreign-live', status: 'inProgress', threadId: 'thread-other', startedAt: fresh(3), completedAt: null, items: [] };
+  const liveForeignShape = { id: 'streaming', status: 'interrupted', startedAt: fresh(2), completedAt: null, items: [] };
+  const completed = { id: 'done', status: 'completed', startedAt: fresh(60), completedAt: fresh(10), items: [] };
+  const alreadyInterrupted = { id: 'stopped', status: 'interrupted', startedAt: fresh(50), completedAt: fresh(40), items: [] };
+  const turns = [completed, taggedForeign, inProgress, taggedRelay, alreadyInterrupted, liveForeignShape];
+  const snapshot = JSON.stringify(turns);
+  assert.deepEqual(interruptTargets(turns, relay), ['own-live', 'relay-tagged', 'streaming'],
+    'in-progress turns on the relay thread; untagged turns are the relay-thread query results');
+  assert.equal(JSON.stringify(turns), snapshot, 'the helper never mutates its input');
+  assert.deepEqual(interruptTargets([], relay), []);
 });

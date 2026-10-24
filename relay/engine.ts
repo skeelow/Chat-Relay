@@ -22,6 +22,10 @@
 //   engine → GUI     {type:'transcript_update', message}
 //   engine → GUI     {type:'status_update', adapter, status}
 //   engine → GUI     {type:'delivery_update', messageId, target, status, attempts, updatedAt, error?} (M2.1)
+//   GUI → engine    {type:'stop'}                                M3.2b: Stop halts everything
+//   GUI → engine    {type:'resume'}                              M3.2b: Resume clears the stopped state
+//   engine → GUI    {type:'pause_update', paused}                M3.2b: broadcast on every change
+//   engine → adapter {type:'interrupt'}                          M3.2b: to codex on Stop (best effort)
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -124,6 +128,12 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const resetCount = store.resetInFlightToPending();
   if (resetCount > 0) {
     console.log(`[engine] reset ${resetCount} in-flight delivery(ies) to pending_approval`);
+  }
+  // M3.2b (D12-1): the stopped state is a persisted setting — a restarted
+  // engine that was stopped stays stopped, until the user resumes.
+  let paused = store.paused();
+  if (paused) {
+    console.log('[engine] starting stopped — nothing delivers until the user resumes');
   }
 
   const server = new WebSocketServer({ host, port: options.port ?? 8787 });
@@ -311,8 +321,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             }
             // M2.1: approved items waiting for this adapter go out now,
             // oldest first, each exactly once (each leaves 'queued').
-            for (const pending of store.deliveriesForTarget(name, 'queued')) {
-              deliverTo(ws, pending);
+            // M3.2b (D12-3): while stopped, a hello flushes nothing.
+            if (!paused) {
+              for (const pending of store.deliveriesForTarget(name, 'queued')) {
+                deliverTo(ws, pending);
+              }
             }
             return;
           }
@@ -391,6 +404,12 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'approve': {
+            // M3.2b (D12-3): while stopped, approve is ignored and logged —
+            // nothing may move until the user resumes.
+            if (paused) {
+              console.log('[engine] approve ignored while stopped — resume first');
+              return;
+            }
             // M2.1: only a pending_approval row can be approved. It queues,
             // and goes out immediately when the target adapter is connected
             // (otherwise its hello sends it) — approving twice sends once.
@@ -490,12 +509,51 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               messages,
               // M2.1: every non-user delivery row of those messages.
               deliveries: store.deliveriesOf(messages.map((m) => m.id)),
+              // M3.2b: the stopped state rides along, so a joining GUI knows
+              // to show the banner and keep Approve disabled.
+              paused,
             }));
+            return;
+          }
+          case 'stop': {
+            // M3.2b (D12-2): Stop means stop. One synchronous pass, nothing
+            // awaited on adapters: set the persisted state, return every
+            // in-flight row to the user with an honest note, broadcast each
+            // change, broadcast the new state, then tell the codex adapter
+            // to interrupt its in-progress turns. Stop twice is the same as
+            // once — a second frame changes nothing.
+            if (paused) return;
+            paused = true;
+            store.setPaused(true);
+            const inFlight = store.pendingDeliveries()
+              .filter((p) => p.status === 'queued' || p.status === 'delivering');
+            for (const pending of inFlight) {
+              const note = pending.status === 'queued'
+                ? 'stopped — approve again after you resume'
+                : 'stopped before confirmation — it may already have arrived';
+              store.markStatus(pending.messageId, pending.target, 'pending_approval', note);
+              clearAckTimer(pending.messageId, pending.target); // Stop cancels the ack wait too
+              broadcastDeliveryUpdate(pending.messageId, pending.target);
+            }
+            broadcast({ type: 'pause_update', paused: true });
+            const codex = adapterSocketFor('codex');
+            if (codex !== null) codex.send(JSON.stringify({ type: 'interrupt' }));
+            console.log(`[engine] stopped: paused until resume; ${inFlight.length} in-flight row(s) returned to pending_approval`);
+            return;
+          }
+          case 'resume': {
+            // M3.2b (D12-6): Resume clears the state and delivers NOTHING —
+            // every item waits for a fresh approval. Resume while running is
+            // a harmless no-op.
+            if (!paused) return;
+            paused = false;
+            store.setPaused(false);
+            broadcast({ type: 'pause_update', paused: false });
+            console.log('[engine] resumed');
             return;
           }
           case 'send':
           case 'set_mode':
-          case 'stop':
             // Still read-only from the GUI's side until their milestones
             // (M2.1 delivered only what the user explicitly approved).
             return;

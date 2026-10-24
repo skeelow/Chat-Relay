@@ -81,6 +81,23 @@
   function rejectFrame(messageId, target) {
     return { type: "reject", messageId, target };
   }
+  var PAUSE_BANNER = "Stopped \u2014 nothing will be delivered until you resume";
+  var APPROVE_PAUSED_TITLE = "Approve is disabled while stopped \u2014 press Resume first";
+  function pauseBannerText(paused2) {
+    return paused2 ? PAUSE_BANNER : null;
+  }
+  function stopButtonLabel(paused2) {
+    return paused2 ? "Resume" : "Stop";
+  }
+  function approveDisabledTitle(paused2) {
+    return paused2 ? APPROVE_PAUSED_TITLE : null;
+  }
+  function stopFrame() {
+    return { type: "stop" };
+  }
+  function resumeFrame() {
+    return { type: "resume" };
+  }
 
   // app/src/renderer.ts
   var ENGINE_URL = "ws://127.0.0.1:8787";
@@ -92,17 +109,31 @@
   var dot = document.getElementById("dot");
   var engineLabel = document.getElementById("engine-label");
   var pendingBadge = document.getElementById("pending");
+  var stopButton = document.getElementById("stop");
+  var pauseBanner = document.getElementById("banner");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
+  var paused = false;
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
     if (dot !== null) dot.className = on ? "on" : "off";
+    if (stopButton !== null) stopButton.disabled = !on;
     if (engineOnline !== on) {
       engineOnline = on;
       for (const id of messageFooters.keys()) renderDelivery(id);
     }
+  }
+  function setPausedUi() {
+    const bannerText = pauseBannerText(paused);
+    if (pauseBanner !== null) {
+      pauseBanner.textContent = bannerText ?? "";
+      pauseBanner.hidden = bannerText === null;
+    }
+    if (stopButton !== null) stopButton.textContent = stopButtonLabel(paused);
+    for (const id of messageFooters.keys()) renderDelivery(id);
+    console.log(`[relay-gui] pause state: ${paused ? "stopped" : "running"}`);
   }
   function setPill(adapter, status) {
     const pill = document.getElementById(`pill-${adapter}`);
@@ -162,10 +193,17 @@
       else if (action === "reject") buttons.push({ action, label: "Reject" });
     }
     const clickPending = deliveryState.pendingClicks.has(key);
+    const approveTitle = approveDisabledTitle(paused);
     for (const spec of buttons) {
       const button = document.createElement("button");
       button.textContent = spec.label;
-      button.disabled = clickPending || !engineOnline;
+      if (spec.action === "approve" && approveTitle !== null) {
+        button.disabled = true;
+        button.title = approveTitle;
+      } else {
+        button.disabled = clickPending || !engineOnline;
+        button.removeAttribute("title");
+      }
       button.addEventListener("click", () => {
         deliveryState = applyClick(deliveryState, key);
         sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId, target) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target));
@@ -194,8 +232,15 @@
       for (const message of messages) appendMessage(message);
       for (const id of messageFooters.keys()) renderDelivery(id);
       updatePendingBadge();
+      paused = frame.paused === true;
+      setPausedUi();
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
+      return;
+    }
+    if (type === "pause_update") {
+      paused = frame.paused === true;
+      setPausedUi();
       return;
     }
     if (type === "transcript_update") {
@@ -262,6 +307,14 @@
       };
       ws.onerror = () => {
       };
+    });
+  }
+  if (stopButton !== null) {
+    stopButton.textContent = stopButtonLabel(paused);
+    stopButton.disabled = true;
+    stopButton.addEventListener("click", () => {
+      sendFrameToEngine(paused ? resumeFrame() : stopFrame());
+      console.log(`[relay-gui] ${paused ? "resume" : "stop"} sent`);
     });
   }
   connect();

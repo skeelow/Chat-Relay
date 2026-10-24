@@ -145,12 +145,14 @@ function cleanupDir(dir: string): void {
 async function withEngine(
   label: string,
   run: (engine: EngineHandle, url: string, token: string, dir: string) => Promise<void>,
+  options: { deliverAckTimeoutMs?: number } = {}, // M3.2b: tests may shorten the ack window
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), `relay-engine-${label}-`));
   const engine = await startEngine({
     port: 0,
     dbPath: join(dir, 'relay.db'),
     tokenPath: join(dir, 'token'),
+    ...options,
   });
   const token = readFileSync(join(dir, 'token'), 'utf8').trim(); // the file adapters read; value never printed
   const url = `ws://127.0.0.1:${engine.port}`;
@@ -1393,4 +1395,219 @@ test('restart: a delivering row returns pending with the interrupted note; a que
   } finally {
     cleanupDir(dir);
   }
+});
+
+// --- M3.2b: Stop and Resume ---
+
+test('stop: in-flight rows return to pending with the right notes within 1s, and codex receives interrupt', async () => {
+  await withEngine('stoprows', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+
+    // A delivering row through the real flow: the adapter never acks, so the
+    // row sits in flight with its ack timer armed (shortened below).
+    const flyingId = await captureFromAstra(gui, astra, 'in flight when stopped', 'm32b-fly-1');
+    gui.send({ type: 'forward', messageId: flyingId, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'pending_approval', 0);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle from hello
+    gui.send({ type: 'approve', messageId: flyingId, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+
+    // A queued row planted through the store (a codex hello would flush a
+    // queued row, so it is planted after the adapter is connected).
+    const waiting = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'queued when stopped', hop: 0 });
+    engine.store.insertDelivery(waiting.id, 'codex');
+    engine.store.markStatus(waiting.id, 'codex', 'queued');
+
+    const t0 = Date.now();
+    gui.send({ type: 'stop' });
+    const flyingUpdate = await gui.nextMessage();
+    const waitingUpdate = await gui.nextMessage();
+    const pauseFrame = await gui.nextMessage();
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 1000, `the stop broadcast must arrive within 1 second, took ${elapsed}ms`);
+    assertDeliveryUpdate(flyingUpdate, flyingId, 'codex', 'pending_approval', 1);
+    assert.equal(flyingUpdate.error, 'stopped before confirmation — it may already have arrived');
+    assertDeliveryUpdate(waitingUpdate, waiting.id, 'codex', 'pending_approval', 0);
+    assert.equal(waitingUpdate.error, 'stopped — approve again after you resume');
+    assert.deepEqual(pauseFrame, { type: 'pause_update', paused: true });
+    // The interrupt goes to the connected codex adapter only:
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+    await astra.expectSilence(300);
+    // The store agrees, and the stopped state persists:
+    assert.equal(engine.store.getDelivery(flyingId, 'codex')?.error,
+      'stopped before confirmation — it may already have arrived');
+    assert.equal(engine.store.getDelivery(waiting.id, 'codex')?.error,
+      'stopped — approve again after you resume');
+    assert.equal(engine.store.getSetting('paused'), '1');
+    // The reset rows' ack timers are gone: no late failure ever arrives.
+    await gui.expectSilence(400);
+  }, { deliverAckTimeoutMs: 120 });
+});
+
+test('while stopped: approve is ignored, a late delivered is ignored, captures still store, hello flushes nothing', async () => {
+  await withEngine('stoprules', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    await gui.nextMessage(); // astra idle
+    const flyingId = await captureFromAstra(gui, astra, 'never confirmed', 'm32b-late-1');
+    gui.send({ type: 'forward', messageId: flyingId, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'pending_approval', 0);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    gui.send({ type: 'approve', messageId: flyingId, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+    const heldId = await captureFromAstra(gui, astra, 'waiting when stopped', 'm32b-late-2');
+    gui.send({ type: 'forward', messageId: heldId, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), heldId, 'codex', 'pending_approval', 0);
+
+    gui.send({ type: 'stop' });
+    // Only the delivering row changed; the already-pending row gets no update.
+    assertDeliveryUpdate(await gui.nextMessage(), flyingId, 'codex', 'pending_approval', 1);
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+
+    // Approve while stopped: ignored and logged — nothing queues.
+    gui.send({ type: 'approve', messageId: heldId, target: 'codex' });
+    await gui.expectSilence(300);
+    assert.equal(engine.store.getDelivery(heldId, 'codex')?.status, 'pending_approval');
+
+    // A late delivered for the reset row: ignored, so the stopped note stays.
+    codex.send({ type: 'delivered', messageId: flyingId });
+    await gui.expectSilence(300);
+    assert.equal(engine.store.getDelivery(flyingId, 'codex')?.status, 'pending_approval');
+    assert.equal(engine.store.getDelivery(flyingId, 'codex')?.error,
+      'stopped before confirmation — it may already have arrived');
+
+    // Stop pauses delivery, not reading: captures from both adapters still store.
+    astra.send({ type: 'captured', body: 'astra captured while stopped', sourceRef: 'm32b-late-3' });
+    const storedAstra = await gui.nextMessage() as { type?: string; message?: { body?: string } };
+    assert.equal(storedAstra.type, 'transcript_update');
+    assert.equal(storedAstra.message?.body, 'astra captured while stopped');
+    codex.send({ type: 'captured', body: 'codex captured while stopped', sourceRef: 'm32b-late-4' });
+    const storedCodex = await gui.nextMessage() as { type?: string; message?: { body?: string } };
+    assert.equal(storedCodex.type, 'transcript_update');
+    assert.equal(storedCodex.message?.body, 'codex captured while stopped');
+
+    // A hello while stopped flushes nothing.
+    codex.close();
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'disconnected' });
+    const codex2 = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+    await codex2.expectSilence(400); // hello delivered nothing
+    assert.equal(engine.store.pendingDeliveries().filter((p) => p.status !== 'pending_approval').length, 0,
+      'nothing is queued or delivering while stopped');
+  });
+});
+
+test('restart while stopped: the new engine reports paused: true and a flush on hello delivers nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-stoprestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: one pending row; stop with nothing in flight (harmless).
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const astra = await openAdapter(url, token, 'astra');
+      await gui.nextMessage(); // astra idle
+      const id = await captureFromAstra(gui, astra, 'survives the restart', 'm32b-restart-1');
+      gui.send({ type: 'forward', messageId: id, target: 'codex' });
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+      gui.send({ type: 'stop' });
+      assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+      engine.stop();
+    }
+    { // Run 2: the stopped state survived; hello delivers nothing.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as {
+        type?: string; paused?: boolean;
+        deliveries?: Array<{ status?: string; error?: string | null }>;
+      };
+      assert.equal(snapshot.type, 'snapshot');
+      assert.equal(snapshot.paused, true, 'a restarted engine that was stopped stays stopped');
+      assert.equal((snapshot.deliveries ?? [])[0]?.status, 'pending_approval');
+      const codex = await openAdapter(url, token, 'codex');
+      assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+      await codex.expectSilence(400); // a flush on hello delivers nothing
+      await gui.expectSilence(400);
+      assert.equal(engine.store.getSetting('paused'), '1');
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('resume: clears the state and delivers nothing; a fresh approve then delivers normally', async () => {
+  await withEngine('resume', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); await gui.nextMessage(); // idle x2
+    const id = await captureFromAstra(gui, astra, 'approve me after the resume', 'm32b-resume-1');
+    gui.send({ type: 'forward', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'pending_approval', 0);
+
+    gui.send({ type: 'stop' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+
+    gui.send({ type: 'resume' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: false });
+    await codex.expectSilence(300); // resume delivers nothing
+    assert.equal(engine.store.getDelivery(id, 'codex')?.status, 'pending_approval',
+      'the item still waits for a fresh approval');
+    assert.equal(engine.store.getSetting('paused'), null);
+
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.messageId, id);
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+
+    // A GUI that joins after the resume sees paused: false in its snapshot.
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snap = await late.nextMessage() as { paused?: boolean };
+    assert.equal(snap.paused, false);
+  });
+});
+
+test('stop twice and resume while not stopped are both idempotent', async () => {
+  await withEngine('stopidem', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+
+    gui.send({ type: 'stop' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+
+    gui.send({ type: 'stop' }); // twice is once: no second broadcast, no second interrupt
+    await gui.expectSilence(300);
+    await codex.expectSilence(300);
+    assert.equal(engine.store.getSetting('paused'), '1');
+
+    gui.send({ type: 'resume' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: false });
+    gui.send({ type: 'resume' }); // resume while running: a no-op
+    await gui.expectSilence(300);
+    await codex.expectSilence(300);
+    assert.equal(engine.store.getSetting('paused'), null);
+  });
 });
