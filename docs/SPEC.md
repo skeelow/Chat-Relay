@@ -121,7 +121,7 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | engine → adapter | `config` | threadId (or null) — sent to the codex adapter right after `hello` |
 | engine → adapter | `interrupt` | none — sent to the codex adapter on Stop; it interrupts in-progress turns on the relay thread |
 | engine → adapter | `approval_answer` | requestId, decision (accept or decline) — forwarded to the codex adapter |
-| GUI → engine | `send` | body, targets |
+| GUI → engine | `send` | body, targets (astra, codex, or both); GUI only. Creates a user message and its deliveries; the user's explicit send is the approval |
 | GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
 | GUI → engine | `set_mode` | manual, approve\_each, auto + turn cap + autoSend (bool) + autoSendDelaySec |

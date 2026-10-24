@@ -29,29 +29,41 @@
     return `${count} ${count === 1 ? "approval" : "approvals"} waiting`;
   }
   function emptyApprovalsState() {
-    return { requests: /* @__PURE__ */ new Map(), pendingClicks: /* @__PURE__ */ new Set() };
+    return { requests: /* @__PURE__ */ new Map(), pendingClicks: /* @__PURE__ */ new Set(), dismissed: /* @__PURE__ */ new Set() };
+  }
+  function visibleApprovals(state) {
+    return [...state.requests.values()].filter((view) => !state.dismissed.has(view.requestId));
   }
   function applyApprovalRequest(state, view) {
     const requests = new Map(state.requests);
     requests.set(view.requestId, view);
-    return { requests, pendingClicks: state.pendingClicks };
+    const dismissed = new Set(state.dismissed);
+    dismissed.delete(view.requestId);
+    return { requests, pendingClicks: state.pendingClicks, dismissed };
+  }
+  function applyApprovalDismiss(state, requestId) {
+    const dismissed = new Set(state.dismissed);
+    dismissed.add(requestId);
+    return { requests: state.requests, pendingClicks: state.pendingClicks, dismissed };
   }
   function applyApprovalResolved(state, requestId) {
     const requests = new Map(state.requests);
     requests.delete(requestId);
     const pendingClicks = new Set(state.pendingClicks);
     pendingClicks.delete(requestId);
-    return { requests, pendingClicks };
+    const dismissed = new Set(state.dismissed);
+    dismissed.delete(requestId);
+    return { requests, pendingClicks, dismissed };
   }
   function applySnapshotApprovals(state, views) {
     const requests = /* @__PURE__ */ new Map();
     for (const view of views) requests.set(view.requestId, view);
-    return { requests, pendingClicks: /* @__PURE__ */ new Set() };
+    return { requests, pendingClicks: /* @__PURE__ */ new Set(), dismissed: /* @__PURE__ */ new Set() };
   }
   function applyApprovalClick(state, requestId) {
     const pendingClicks = new Set(state.pendingClicks);
     pendingClicks.add(requestId);
-    return { requests: state.requests, pendingClicks };
+    return { requests: state.requests, pendingClicks, dismissed: state.dismissed };
   }
   function approvalAnswerFrame(requestId, decision) {
     return { type: "approval_answer", requestId, decision };
@@ -105,6 +117,10 @@
   function pendingCount(rows) {
     return rows.filter((row) => row.status === "pending_approval").length;
   }
+  function userFooterTargets(messageId, rows) {
+    const order = ["astra", "codex"];
+    return order.filter((target) => rows.some((row) => row.messageId === messageId && row.target === target));
+  }
   function deliveryKey(messageId, target) {
     return `${messageId}:${target}`;
   }
@@ -156,6 +172,24 @@
     return { type: "resume" };
   }
 
+  // app/src/compose.ts
+  var COMPOSE_BODY_CAP = 2e4;
+  var PREFIX = /^\s*@(?<tag>astra|codex|both)\b[,;:\s]*/i;
+  var TARGETS_OF = {
+    astra: ["astra"],
+    codex: ["codex"],
+    both: ["astra", "codex"]
+  };
+  function parseCompose(text, selector) {
+    const match = PREFIX.exec(text);
+    const tag = match?.groups?.tag.toLowerCase();
+    const rest = tag === void 0 ? text.trim() : text.slice((match?.index ?? 0) + (match?.[0]?.length ?? 0)).trim();
+    if (rest === "") return { ok: false, reason: "empty" };
+    if (rest.length > COMPOSE_BODY_CAP) return { ok: false, reason: "too-long" };
+    const choice = tag ?? (selector in TARGETS_OF ? selector : "both");
+    return { ok: true, body: rest, targets: TARGETS_OF[choice] };
+  }
+
   // app/src/renderer.ts
   var ENGINE_URL = "ws://127.0.0.1:8787";
   var RECONNECT_MS = 2e3;
@@ -170,6 +204,9 @@
   var pauseBanner = document.getElementById("banner");
   var approvalsArea = document.getElementById("approvals");
   var approvalsBadge = document.getElementById("approvals-badge");
+  var composeText = document.getElementById("compose-text");
+  var composeTarget = document.getElementById("compose-target");
+  var composeSend = document.getElementById("compose-send");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
@@ -180,6 +217,9 @@
     if (engineLabel !== null) engineLabel.textContent = label;
     if (dot !== null) dot.className = on ? "on" : "off";
     if (stopButton !== null) stopButton.disabled = !on;
+    if (composeText !== null) composeText.disabled = !on;
+    if (composeTarget !== null) composeTarget.disabled = !on;
+    if (composeSend !== null) composeSend.disabled = !on;
     if (engineOnline !== on) {
       engineOnline = on;
       for (const id of messageFooters.keys()) renderDelivery(id);
@@ -198,14 +238,25 @@
   }
   function updateApprovalsBadge() {
     if (approvalsBadge !== null) {
-      approvalsBadge.textContent = approvalsBadgeText(approvalState.requests.size);
+      approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
     }
+  }
+  function appendDismissButton(actions, requestId) {
+    const button = document.createElement("button");
+    button.textContent = "Dismiss";
+    button.addEventListener("click", () => {
+      approvalState = applyApprovalDismiss(approvalState, requestId);
+      console.log(`[relay-gui] approval card ${requestId} dismissed locally`);
+      renderApprovals();
+    });
+    actions.append(button);
   }
   function renderApprovals() {
     updateApprovalsBadge();
     if (approvalsArea === null) return;
     approvalsArea.textContent = "";
-    for (const view of approvalState.requests.values()) {
+    const visible = visibleApprovals(approvalState);
+    for (const view of visible) {
       const card = approvalCard(view);
       const box = document.createElement("div");
       box.className = "approval-card";
@@ -236,6 +287,11 @@
           actions.append(button);
         }
         box.append(actions);
+      } else {
+        const actions = document.createElement("div");
+        actions.className = "approval-actions";
+        appendDismissButton(actions, view.requestId);
+        box.append(actions);
       }
       approvalsArea.append(box);
     }
@@ -264,7 +320,7 @@
     body.className = "body";
     body.textContent = message.body;
     row.append(sender, body);
-    if (targetFor(message.source) !== null) {
+    if (targetFor(message.source) !== null || message.source === "user") {
       const footer = document.createElement("div");
       footer.className = "delivery";
       const status = document.createElement("div");
@@ -280,16 +336,62 @@
     console.log(`[relay-gui] appended ${message.id} (${message.source})`);
     transcript.scrollTop = transcript.scrollHeight;
   }
+  function appendActionButton(container, spec, messageId, target) {
+    const key = deliveryKey(messageId, target);
+    const clickPending = deliveryState.pendingClicks.has(key);
+    const approveTitle = spec.action === "approve" ? approveDisabledTitle(paused) : null;
+    const button = document.createElement("button");
+    button.textContent = spec.label;
+    if (approveTitle !== null) {
+      button.disabled = true;
+      button.title = approveTitle;
+    } else {
+      button.disabled = clickPending || !engineOnline;
+      button.removeAttribute("title");
+    }
+    button.addEventListener("click", () => {
+      deliveryState = applyClick(deliveryState, key);
+      sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId, target) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target));
+      console.log(`[relay-gui] ${spec.action} sent for ${messageId} \u2192 ${target}`);
+      renderDelivery(messageId);
+    });
+    container.append(button);
+  }
   function renderDelivery(messageId) {
     const footer = messageFooters.get(messageId);
     if (footer === void 0) return;
+    footer.status.textContent = "";
+    footer.actions.textContent = "";
+    if (footer.source === "user") {
+      for (const target2 of userFooterTargets(messageId, [...deliveryState.rows.values()])) {
+        const delivery2 = deliveryState.rows.get(deliveryKey(messageId, target2));
+        if (delivery2 === void 0) continue;
+        const view2 = deliveryStatusView(delivery2, target2);
+        const line = document.createElement("div");
+        line.className = "delivery-line";
+        const status = document.createElement("span");
+        status.className = "line-status";
+        status.textContent = view2.label;
+        line.append(status);
+        const actions = document.createElement("span");
+        actions.className = "line-actions";
+        line.append(actions);
+        footer.actions.append(line);
+        for (const action of view2.actions) {
+          appendActionButton(actions, {
+            action,
+            label: action === "approve" ? "Approve" : action === "reject" ? "Reject" : "Send again"
+          }, messageId, target2);
+        }
+      }
+      return;
+    }
     const target = targetFor(footer.source);
     if (target === null) return;
     const key = deliveryKey(messageId, target);
     const delivery = deliveryState.rows.get(key);
     const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
     footer.status.textContent = view.label;
-    footer.actions.textContent = "";
     const buttons = [];
     const send = sendButton(footer.source, delivery);
     if (send.show) buttons.push({ action: "forward", label: send.label });
@@ -297,26 +399,7 @@
       if (action === "approve") buttons.push({ action, label: "Approve" });
       else if (action === "reject") buttons.push({ action, label: "Reject" });
     }
-    const clickPending = deliveryState.pendingClicks.has(key);
-    const approveTitle = approveDisabledTitle(paused);
-    for (const spec of buttons) {
-      const button = document.createElement("button");
-      button.textContent = spec.label;
-      if (spec.action === "approve" && approveTitle !== null) {
-        button.disabled = true;
-        button.title = approveTitle;
-      } else {
-        button.disabled = clickPending || !engineOnline;
-        button.removeAttribute("title");
-      }
-      button.addEventListener("click", () => {
-        deliveryState = applyClick(deliveryState, key);
-        sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId, target) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target));
-        console.log(`[relay-gui] ${spec.action} sent for ${messageId} \u2192 ${target}`);
-        renderDelivery(messageId);
-      });
-      footer.actions.append(button);
-    }
+    for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
   }
   function updatePendingBadge() {
     if (pendingBadge === null) return;
@@ -324,7 +407,11 @@
     pendingBadge.textContent = count === 0 ? "" : `${count} pending`;
   }
   function sendFrameToEngine(frame) {
-    if (socket !== null && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+    if (socket !== null && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(frame));
+      return true;
+    }
+    return false;
   }
   function handleFrame(frame) {
     const type = frame.type;
@@ -445,6 +532,35 @@
       sendFrameToEngine(paused ? resumeFrame() : stopFrame());
       console.log(`[relay-gui] ${paused ? "resume" : "stop"} sent`);
     });
+  }
+  function submitCompose() {
+    if (composeText === null || composeTarget === null) return;
+    const parsed = parseCompose(composeText.value, composeTarget.value);
+    if (!parsed.ok) {
+      console.log(`[relay-gui] compose refused: ${parsed.reason} \u2014 text kept`);
+      return;
+    }
+    const wentOut = sendFrameToEngine({ type: "send", body: parsed.body, targets: parsed.targets });
+    if (wentOut) {
+      composeText.value = "";
+      console.log(`[relay-gui] sent to ${parsed.targets.join(" + ")}: ${parsed.body.slice(0, 60)}`);
+    } else {
+      console.log("[relay-gui] send could not go out \u2014 engine link down, text kept");
+    }
+  }
+  if (composeText !== null) {
+    composeText.disabled = true;
+    composeText.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        submitCompose();
+      }
+    });
+  }
+  if (composeTarget !== null) composeTarget.disabled = true;
+  if (composeSend !== null) {
+    composeSend.disabled = true;
+    composeSend.addEventListener("click", submitCompose);
   }
   connect();
 })();

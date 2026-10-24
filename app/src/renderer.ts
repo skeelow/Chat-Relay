@@ -15,10 +15,12 @@ import {
   approvalCard,
   approvalsBadgeText,
   applyApprovalClick,
+  applyApprovalDismiss,
   applyApprovalRequest,
   applyApprovalResolved,
   applySnapshotApprovals,
   emptyApprovalsState,
+  visibleApprovals,
   type ApprovalView,
 } from './approvals.ts';
 import {
@@ -39,9 +41,11 @@ import {
   stopButtonLabel,
   stopFrame,
   targetFor,
+  userFooterTargets,
   type DeliveryRow,
   type DeliveryUiState,
 } from './deliveries.ts';
+import { parseCompose } from './compose.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
 const RECONNECT_MS = 2000;
@@ -72,6 +76,9 @@ const stopButton = document.getElementById('stop') as HTMLButtonElement | null;
 const pauseBanner = document.getElementById('banner');
 const approvalsArea = document.getElementById('approvals');
 const approvalsBadge = document.getElementById('approvals-badge');
+const composeText = document.getElementById('compose-text') as HTMLTextAreaElement | null;
+const composeTarget = document.getElementById('compose-target') as HTMLSelectElement | null;
+const composeSend = document.getElementById('compose-send') as HTMLButtonElement | null;
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -90,6 +97,9 @@ function engineState(label: string, on: boolean): void {
   if (engineLabel !== null) engineLabel.textContent = label;
   if (dot !== null) dot.className = on ? 'on' : 'off';
   if (stopButton !== null) stopButton.disabled = !on; // M3.2b: Stop/Resume needs the engine
+  if (composeText !== null) composeText.disabled = !on; // M4.1: the compose area needs the engine
+  if (composeTarget !== null) composeTarget.disabled = !on;
+  if (composeSend !== null) composeSend.disabled = !on;
   if (engineOnline !== on) {
     engineOnline = on;
     // Going offline disables every action button; coming back re-enables them.
@@ -113,8 +123,21 @@ function setPausedUi(): void {
 /** M3.3: the header badge — "N approvals waiting" is hard to miss. */
 function updateApprovalsBadge(): void {
   if (approvalsBadge !== null) {
-    approvalsBadge.textContent = approvalsBadgeText(approvalState.requests.size);
+    approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
   }
+}
+
+/** M4.1 (N4): the local Dismiss on a card the relay cannot answer. Purely
+ *  GUI-side — it never talks to the engine, so it stays clickable. */
+function appendDismissButton(actions: HTMLElement, requestId: string): void {
+  const button = document.createElement('button');
+  button.textContent = 'Dismiss';
+  button.addEventListener('click', () => {
+    approvalState = applyApprovalDismiss(approvalState, requestId);
+    console.log(`[relay-gui] approval card ${requestId} dismissed locally`);
+    renderApprovals();
+  });
+  actions.append(button);
 }
 
 /** M3.3: rebuild the approval banner cards from the server state (textContent only). */
@@ -122,7 +145,8 @@ function renderApprovals(): void {
   updateApprovalsBadge();
   if (approvalsArea === null) return;
   approvalsArea.textContent = '';
-  for (const view of approvalState.requests.values()) {
+  const visible = visibleApprovals(approvalState);
+  for (const view of visible) {
     const card = approvalCard(view);
     const box = document.createElement('div');
     box.className = 'approval-card';
@@ -152,6 +176,12 @@ function renderApprovals(): void {
         });
         actions.append(button);
       }
+      box.append(actions);
+    } else {
+      // M4.1 (N4): a card the relay cannot answer can at least be hidden.
+      const actions = document.createElement('div');
+      actions.className = 'approval-actions';
+      appendDismissButton(actions, view.requestId);
       box.append(actions);
     }
     approvalsArea.append(box);
@@ -183,8 +213,9 @@ function appendMessage(message: GuiMessage): void {
   body.className = 'body';
   body.textContent = message.body; // relayed text is data, never HTML
   row.append(sender, body);
-  if (targetFor(message.source) !== null) {
-    // M2.3 + M3.1: every AI message carries its delivery status and actions.
+  // M2.3 + M3.1: every AI message carries its delivery status and actions.
+  // M4.1: user messages carry a footer too — one line per target.
+  if (targetFor(message.source) !== null || message.source === 'user') {
     const footer = document.createElement('div');
     footer.className = 'delivery';
     const status = document.createElement('div');
@@ -201,10 +232,74 @@ function appendMessage(message: GuiMessage): void {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-/** M2.3 + M3.1: render one AI message's delivery footer from the keyed rows. */
+/** One action button: the pending-click lock, the offline lock, and the
+ *  Approve-while-stopped title. Shared by the AI and user footers. */
+function appendActionButton(
+  container: HTMLElement,
+  spec: { action: 'forward' | 'approve' | 'reject'; label: string },
+  messageId: string,
+  target: 'codex' | 'astra',
+): void {
+  const key = deliveryKey(messageId, target);
+  const clickPending = deliveryState.pendingClicks.has(key);
+  // M3.2b: while stopped, Approve is disabled with a title explaining why.
+  // Forward and Reject still work — creating or cancelling a pending item is
+  // not a delivery.
+  const approveTitle = spec.action === 'approve' ? approveDisabledTitle(paused) : null;
+  const button = document.createElement('button');
+  button.textContent = spec.label;
+  if (approveTitle !== null) {
+    button.disabled = true;
+    button.title = approveTitle;
+  } else {
+    button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
+    button.removeAttribute('title');
+  }
+  button.addEventListener('click', () => {
+    deliveryState = applyClick(deliveryState, key);
+    sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId, target)
+      : spec.action === 'approve' ? approveFrame(messageId, target)
+      : rejectFrame(messageId, target));
+    console.log(`[relay-gui] ${spec.action} sent for ${messageId} → ${target}`);
+    renderDelivery(messageId); // disable immediately, until the next delivery_update
+  });
+  container.append(button);
+}
+
+/** M2.3 + M3.1 + M4.1: render one message's delivery footer. AI messages keep
+ *  their single footer; a user message shows one line per target. */
 function renderDelivery(messageId: string): void {
   const footer = messageFooters.get(messageId);
   if (footer === undefined) return;
+  footer.status.textContent = '';
+  footer.actions.textContent = '';
+  if (footer.source === 'user') {
+    // M4.1: one footer line per target the message has rows for, with the
+    // existing status labels — Approve/Reject while pending, Send again on
+    // failure (the existing forward flow).
+    for (const target of userFooterTargets(messageId, [...deliveryState.rows.values()])) {
+      const delivery = deliveryState.rows.get(deliveryKey(messageId, target));
+      if (delivery === undefined) continue;
+      const view = deliveryStatusView(delivery, target);
+      const line = document.createElement('div');
+      line.className = 'delivery-line';
+      const status = document.createElement('span');
+      status.className = 'line-status';
+      status.textContent = view.label; // textContent only — error text included
+      line.append(status);
+      const actions = document.createElement('span');
+      actions.className = 'line-actions';
+      line.append(actions);
+      footer.actions.append(line);
+      for (const action of view.actions) {
+        appendActionButton(actions, {
+          action,
+          label: action === 'approve' ? 'Approve' : action === 'reject' ? 'Reject' : 'Send again',
+        }, messageId, target);
+      }
+    }
+    return;
+  }
   const target = targetFor(footer.source);
   if (target === null) return;
   const key = deliveryKey(messageId, target);
@@ -213,7 +308,6 @@ function renderDelivery(messageId: string): void {
     ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
     : deliveryStatusView(delivery, target);
   footer.status.textContent = view.label; // textContent only — error text included
-  footer.actions.textContent = '';
   const buttons: Array<{ action: 'forward' | 'approve' | 'reject'; label: string }> = [];
   const send = sendButton(footer.source, delivery);
   if (send.show) buttons.push({ action: 'forward', label: send.label });
@@ -222,31 +316,7 @@ function renderDelivery(messageId: string): void {
     else if (action === 'reject') buttons.push({ action, label: 'Reject' });
     // 'forward' in the table is the failed case — sendButton shows it as Send again.
   }
-  const clickPending = deliveryState.pendingClicks.has(key);
-  // M3.2b: while stopped, Approve is disabled with a title explaining why.
-  // Forward and Reject still work — creating or cancelling a pending item is
-  // not a delivery.
-  const approveTitle = approveDisabledTitle(paused);
-  for (const spec of buttons) {
-    const button = document.createElement('button');
-    button.textContent = spec.label;
-    if (spec.action === 'approve' && approveTitle !== null) {
-      button.disabled = true;
-      button.title = approveTitle;
-    } else {
-      button.disabled = clickPending || !engineOnline; // one frame per click; none while offline
-      button.removeAttribute('title');
-    }
-    button.addEventListener('click', () => {
-      deliveryState = applyClick(deliveryState, key);
-      sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId, target)
-        : spec.action === 'approve' ? approveFrame(messageId, target)
-        : rejectFrame(messageId, target));
-      console.log(`[relay-gui] ${spec.action} sent for ${messageId} → ${target}`);
-      renderDelivery(messageId); // disable immediately, until the next delivery_update
-    });
-    footer.actions.append(button);
-  }
+  for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
 }
 
 /** M2.3 + M3.1: "N pending" in the header — pending_approval rows, all targets. */
@@ -256,8 +326,14 @@ function updatePendingBadge(): void {
   pendingBadge.textContent = count === 0 ? '' : `${count} pending`;
 }
 
-function sendFrameToEngine(frame: unknown): void {
-  if (socket !== null && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+/** Send one frame if the engine link is up; report whether it went out (M4.1:
+ *  the compose box clears only when it did). */
+function sendFrameToEngine(frame: unknown): boolean {
+  if (socket !== null && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(frame));
+    return true;
+  }
+  return false;
 }
 
 function handleFrame(frame: Frame): void {
@@ -395,6 +471,40 @@ if (stopButton !== null) {
     sendFrameToEngine(paused ? resumeFrame() : stopFrame());
     console.log(`[relay-gui] ${paused ? 'resume' : 'stop'} sent`);
   });
+}
+
+// M4.1: the compose area — parseCompose decides the target (@-prefix wins)
+// and the trimmed body; Enter sends, Shift+Enter is a newline. The text is
+// kept whenever the frame could not go out.
+function submitCompose(): void {
+  if (composeText === null || composeTarget === null) return;
+  const parsed = parseCompose(composeText.value, composeTarget.value);
+  if (!parsed.ok) {
+    console.log(`[relay-gui] compose refused: ${parsed.reason} — text kept`);
+    return;
+  }
+  const wentOut = sendFrameToEngine({ type: 'send', body: parsed.body, targets: parsed.targets });
+  if (wentOut) {
+    composeText.value = '';
+    console.log(`[relay-gui] sent to ${parsed.targets.join(' + ')}: ${parsed.body.slice(0, 60)}`);
+  } else {
+    console.log('[relay-gui] send could not go out — engine link down, text kept');
+  }
+}
+
+if (composeText !== null) {
+  composeText.disabled = true; // until the engine connects
+  composeText.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault(); // Enter sends; Shift+Enter keeps the newline
+      submitCompose();
+    }
+  });
+}
+if (composeTarget !== null) composeTarget.disabled = true;
+if (composeSend !== null) {
+  composeSend.disabled = true;
+  composeSend.addEventListener('click', submitCompose);
 }
 
 connect();

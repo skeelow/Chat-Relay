@@ -99,6 +99,15 @@ export function pendingCount(rows: DeliveryRow[]): number {
   return rows.filter((row) => row.status === 'pending_approval').length;
 }
 
+/**
+ * M4.1: the targets a user message has delivery rows for, in a stable order
+ * (astra first) — one footer line per target. Empty until the rows arrive.
+ */
+export function userFooterTargets(messageId: string, rows: DeliveryRow[]): Array<'astra' | 'codex'> {
+  const order: Array<'astra' | 'codex'> = ['astra', 'codex'];
+  return order.filter((target) => rows.some((row) => row.messageId === messageId && row.target === target));
+}
+
 /** G2: the row key — one message may carry a delivery per AI. */
 export function deliveryKey(messageId: string, target: string): string {
   return `${messageId}:${target}`;

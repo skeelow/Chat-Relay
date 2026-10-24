@@ -24,6 +24,7 @@ import {
   stopFrame,
   approveDisabledTitle,
   targetFor,
+  userFooterTargets,
   type DeliveryRow,
 } from '../app/src/deliveries.ts';
 
@@ -180,4 +181,18 @@ test('M3.2b: the GUI sends the exact stop and resume frames', () => {
   assert.equal(JSON.stringify(stopFrame()), '{"type":"stop"}');
   assert.deepEqual(resumeFrame(), { type: 'resume' });
   assert.equal(JSON.stringify(resumeFrame()), '{"type":"resume"}');
+});
+
+// --- M4.1: user messages and their multi-target footers ---
+
+test('M4.1 userFooterTargets: one line per target row, astra first, stable order', () => {
+  const rows = [
+    row('m1', 'codex', 'queued'),
+    row('m1', 'astra', 'delivered'),
+    row('m2', 'codex', 'queued'),
+  ];
+  assert.deepEqual(userFooterTargets('m1', rows), ['astra', 'codex']);
+  assert.deepEqual(userFooterTargets('m2', rows), ['codex']);
+  assert.deepEqual(userFooterTargets('m3', rows), [], 'no rows yet — no lines');
+  assert.deepEqual(userFooterTargets('m1', []), []);
 });

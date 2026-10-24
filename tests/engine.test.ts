@@ -1761,3 +1761,228 @@ test('approvals: a restart has none — they are memory only', async () => {
     cleanupDir(dir);
   }
 });
+
+// --- M4.1: the GUI send — the user writes to the room ---
+
+test('send: a GUI send to codex stores a user message and delivers it with the from You header', async () => {
+  await withEngine('sendone', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+
+    gui.send({ type: 'send', body: '  hello codex  ', targets: ['codex'] });
+    const update = await gui.nextMessage() as { type?: string; message?: Record<string, unknown> };
+    assert.equal(update.type, 'transcript_update');
+    const message = update.message as Record<string, unknown>;
+    assert.equal(message.source, 'user');
+    assert.equal(message.body, 'hello codex', 'the body is trimmed');
+    assert.equal(message.hop, 0);
+    assert.deepEqual(message.targets, ['codex']);
+    const id = String(message.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.text, `[Relay · from You · #${id} · hop 1]\nhello codex`);
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+
+    // D14-4: the chain reads sensibly — the hop-0 user message went out with
+    // header hop 1, so codex's reply captures as hop 1.
+    codex.send({ type: 'captured', body: 'PONG from codex', sourceRef: 'm41-turn-1' });
+    const reply = await gui.nextMessage() as { message?: { source?: string; hop?: number } };
+    assert.equal(reply.message?.source, 'codex');
+    assert.equal(reply.message?.hop, 1, 'the reply continues the chain from the delivered user message');
+  });
+});
+
+test('send to both: one deliver to each AI, once each, duplicates removed', async () => {
+  await withEngine('sendboth', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); await gui.nextMessage(); // idle x2
+
+    gui.send({ type: 'send', body: 'hi everyone', targets: ['astra', 'codex', 'codex'] });
+    const update = await gui.nextMessage() as { message?: { id?: string; targets?: string[] } };
+    assert.deepEqual(update.message?.targets, ['astra', 'codex'], 'duplicates are removed, order kept');
+    const id = String(update.message?.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'astra', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'astra', 'delivering', 1);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    const toAstra = await astra.nextMessage();
+    const toCodex = await codex.nextMessage();
+    assert.equal(toAstra.messageId, id);
+    assert.equal(toCodex.messageId, id);
+    assert.ok(String(toAstra.text).startsWith(`[Relay · from You · #${id} · hop 1]`));
+    astra.send({ type: 'delivered', messageId: id });
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'astra', 'delivered', 1);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+    await astra.expectSilence(300);
+    await codex.expectSilence(300); // exactly once each
+  });
+});
+
+test('send: only GUI sockets may send; bad targets, empty bodies and the cap are ignored', async () => {
+  await withEngine('sendguard', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    const stranger = await openClient(url, token); // authenticated, never greeted
+
+    stranger.send({ type: 'send', body: 'not from a GUI', targets: ['codex'] });
+    gui.send({ type: 'send', body: '', targets: ['codex'] });
+    gui.send({ type: 'send', body: '   ', targets: ['codex'] });
+    gui.send({ type: 'send', body: 'to nobody', targets: [] });
+    gui.send({ type: 'send', body: 'to user', targets: ['user'] });
+    gui.send({ type: 'send', body: 'mixed bag', targets: ['codex', 'nonsense'] });
+    gui.send({ type: 'send', body: 'x'.repeat(20001), targets: ['codex'] });
+    await gui.expectSilence(400);
+    await codex.expectSilence(400);
+    for (const body of ['not from a GUI', 'to user', 'mixed bag']) {
+      assert.equal(engine.store.isDuplicate('user', hashBody(body)), false, `${body} was never stored`);
+    }
+  });
+});
+
+test('send while stopped: rows wait as pending_approval with the note; resume plus approve delivers', async () => {
+  await withEngine('sendstopped', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    gui.send({ type: 'stop' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: true });
+    assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+
+    gui.send({ type: 'send', body: 'hold this', targets: ['codex'] });
+    const update = await gui.nextMessage() as { type?: string; message?: { id?: string } };
+    assert.equal(update.type, 'transcript_update', 'the message is stored even while stopped');
+    const id = String(update.message?.id);
+    const row = await gui.nextMessage();
+    assertDeliveryUpdate(row, id, 'codex', 'pending_approval', 0);
+    assert.equal(row.error, 'the relay is stopped — approve after you resume');
+    await codex.expectSilence(400); // nothing delivers while stopped
+
+    gui.send({ type: 'resume' });
+    assert.deepEqual(await gui.nextMessage(), { type: 'pause_update', paused: false });
+    gui.send({ type: 'approve', messageId: id, target: 'codex' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+  });
+});
+
+test('send with the adapter absent: queued, then flushed exactly once on hello', async () => {
+  await withEngine('sendqueued', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    gui.send({ type: 'send', body: 'when you come back', targets: ['codex'] });
+    const update = await gui.nextMessage() as { message?: { id?: string } };
+    const id = String(update.message?.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    await gui.expectSilence(200);
+
+    const codex = await openAdapter(url, token, 'codex');
+    assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'codex', status: 'idle' });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    const deliver = await codex.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.messageId, id);
+    await codex.expectSilence(300); // exactly once
+  });
+});
+
+test('restart: a delivering user row returns to pending and nothing is re-sent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-sendrestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: a user send in flight (the adapter never acks).
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); // codex idle
+      gui.send({ type: 'send', body: 'mid flight user row', targets: ['codex'] });
+      const update = await gui.nextMessage() as { message?: { id?: string } };
+      const id = String(update.message?.id);
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+      assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+      assert.equal((await codex.nextMessage()).type, 'deliver');
+      engine.stop();
+    }
+    { // Run 2: the row waits again; a hello delivers nothing.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as {
+        type?: string; deliveries?: Array<{ status?: string; error?: string | null; source?: unknown }>;
+        messages?: Array<{ body?: string }>;
+      };
+      assert.equal(snapshot.type, 'snapshot');
+      assert.deepEqual(snapshot.messages?.map((m) => m.body), ['mid flight user row']);
+      const row = (snapshot.deliveries ?? [])[0];
+      assert.equal(row?.status, 'pending_approval');
+      assert.equal(row?.error, 'interrupted by a restart — it may already have arrived');
+      const codex = await openAdapter(url, token, 'codex');
+      await gui.nextMessage(); // codex idle
+      await codex.expectSilence(400); // nothing is ever re-sent on hello
+      await gui.expectSilence(400);
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('an echo of a user message is dropped by the capture-side filter', async () => {
+  await withEngine('sendecho', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    gui.send({ type: 'send', body: 'say PONG please', targets: ['codex'] });
+    const update = await gui.nextMessage() as { message?: { id?: string } };
+    const id = String(update.message?.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+    codex.send({ type: 'delivered', messageId: id });
+    assertDeliveryUpdate(await gui.nextMessage(), id, 'codex', 'delivered', 1);
+
+    codex.send({ type: 'captured', body: 'say PONG please', sourceRef: 'm41-echo-1' });
+    await gui.expectSilence(400); // the echo is never stored or re-broadcast
+    assert.equal(engine.store.isDuplicate('codex', hashBody('say PONG please')), false, 'the echo was dropped');
+  });
+});
+
+test('send: identical text to the same AI within 10 minutes fails the row with the dedupe error', async () => {
+  await withEngine('senddedupe', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await gui.nextMessage(); // codex idle
+    gui.send({ type: 'send', body: 'repeat me twice', targets: ['codex'] });
+    const first = await gui.nextMessage() as { message?: { id?: string } };
+    const id1 = String(first.message?.id);
+    assertDeliveryUpdate(await gui.nextMessage(), id1, 'codex', 'queued', 0);
+    assertDeliveryUpdate(await gui.nextMessage(), id1, 'codex', 'delivering', 1);
+    assert.equal((await codex.nextMessage()).type, 'deliver');
+    codex.send({ type: 'delivered', messageId: id1 });
+    assertDeliveryUpdate(await gui.nextMessage(), id1, 'codex', 'delivered', 1);
+
+    gui.send({ type: 'send', body: 'repeat me twice', targets: ['codex'] });
+    const second = await gui.nextMessage() as { message?: { id?: string } };
+    assert.equal((second.message?.id ?? '') !== id1, true, 'the deliberate resend is a new message, still shown');
+    const id2 = String(second.message?.id);
+    const failed = await gui.nextMessage();
+    assertDeliveryUpdate(failed, id2, 'codex', 'failed', 0);
+    assert.equal(failed.error, 'identical text was already sent to codex a moment ago');
+    await codex.expectSilence(400); // nothing was sent a second time
+    assert.equal(engine.store.getDelivery(id2, 'codex')?.attempts, 0, 'no attempt was made');
+  });
+});

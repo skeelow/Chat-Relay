@@ -126,6 +126,11 @@ export interface InsertInput {
   /** Starting status for each delivery row. Defaults to 'pending_approval':
    *  nothing is ever sent unless something deliberately asks for it. */
   initialStatus?: Status;
+  /** M4.1: the user's deliberate resend is stored even when the 10-minute
+   *  duplicate rule would reject it — the outbound dedupe then fails the
+   *  delivery row instead ("identical text was already sent…"). Adapter
+   *  captures never set this; the duplicate rule still guards them. */
+  allowDuplicate?: boolean;
 }
 
 export interface PendingDelivery {
@@ -300,7 +305,7 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
       throw new StoreError('echo',
         'capture matches a message delivered to this adapter within the echo window');
     }
-    if (isDuplicate(input.source, contentHash, input.sourceRef)) {
+    if (!input.allowDuplicate && isDuplicate(input.source, contentHash, input.sourceRef)) {
       throw new StoreError('duplicate',
         'same source and content_hash within 10 minutes, or a source_ref already stored');
     }

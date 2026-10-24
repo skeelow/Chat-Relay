@@ -10,10 +10,12 @@ import {
   approvalCard,
   approvalsBadgeText,
   applyApprovalClick,
+  applyApprovalDismiss,
   applyApprovalRequest,
   applyApprovalResolved,
   applySnapshotApprovals,
   emptyApprovalsState,
+  visibleApprovals,
   type ApprovalView,
 } from '../app/src/approvals.ts';
 
@@ -83,4 +85,41 @@ test('approvalAnswerFrame is the exact protocol frame', () => {
     { type: 'approval_answer', requestId: 'r1', decision: 'accept' });
   assert.equal(JSON.stringify(approvalAnswerFrame('r1', 'decline')),
     '{"type":"approval_answer","requestId":"r1","decision":"decline"}');
+});
+
+// --- M4.1 (N4): the local Dismiss on an `other` card ---
+
+test('M4.1 N4: Dismiss hides a card locally; the same id arriving again shows it once more', () => {
+  let state = emptyApprovalsState();
+  state = applyApprovalRequest(state, view('r9', 'other', '', 'item/tool/requestUserInput'));
+  state = applyApprovalRequest(state, view('r1', 'command', 'x'));
+  assert.deepEqual(visibleApprovals(state).map((v) => v.requestId), ['r9', 'r1']);
+
+  state = applyApprovalDismiss(state, 'r9');
+  assert.deepEqual(visibleApprovals(state).map((v) => v.requestId), ['r1'],
+    'the dismissed card is hidden in the GUI only');
+  assert.ok(state.requests.has('r9'), 'the engine truth is untouched');
+
+  // A fresh request with the same id clears the dismissal:
+  state = applyApprovalRequest(state, view('r9', 'other', '', 'item/tool/requestUserInput'));
+  assert.deepEqual(visibleApprovals(state).map((v) => v.requestId), ['r9', 'r1'],
+    'the same id arriving again shows the card');
+
+  // A new snapshot shows everything:
+  state = applyApprovalDismiss(state, 'r9');
+  state = applySnapshotApprovals(state, [view('r9', 'other', '', 'item/tool/requestUserInput')]);
+  assert.deepEqual(visibleApprovals(state).map((v) => v.requestId), ['r9'],
+    'a snapshot replaces the list and shows it again');
+});
+
+test('M4.1 N4: a dismissed card leaves the visible count', () => {
+  let state = emptyApprovalsState();
+  state = applyApprovalRequest(state, view('r9', 'other', '', 'item/tool/requestUserInput'));
+  state = applyApprovalRequest(state, view('r2', 'other', '', 'mcpServer/elicitation/request'));
+  state = applyApprovalDismiss(state, 'r9');
+  assert.equal(visibleApprovals(state).length, 1);
+  assert.equal(approvalsBadgeText(visibleApprovals(state).length), '1 approval waiting');
+  // resolving a dismissed card is still a safe no-op:
+  state = applyApprovalResolved(state, 'r9');
+  assert.deepEqual(visibleApprovals(state).map((v) => v.requestId), ['r2']);
 });

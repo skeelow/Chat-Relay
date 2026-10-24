@@ -64,16 +64,34 @@ export interface ApprovalsUiState {
   requests: Map<string, ApprovalView>;
   /** Clicked requestIds waiting for their approval_resolved (double-click guard). */
   pendingClicks: Set<string>;
+  /** M4.1 (N4): locally dismissed `other` cards — hidden from view until the
+   *  same id arrives again or a snapshot replaces the list. The engine's
+   *  truth (requests) is untouched. */
+  dismissed: Set<string>;
 }
 
 export function emptyApprovalsState(): ApprovalsUiState {
-  return { requests: new Map(), pendingClicks: new Set() };
+  return { requests: new Map(), pendingClicks: new Set(), dismissed: new Set() };
+}
+
+/** The cards the GUI shows: everything not locally dismissed, in arrival order. */
+export function visibleApprovals(state: ApprovalsUiState): ApprovalView[] {
+  return [...state.requests.values()].filter((view) => !state.dismissed.has(view.requestId));
 }
 
 export function applyApprovalRequest(state: ApprovalsUiState, view: ApprovalView): ApprovalsUiState {
   const requests = new Map(state.requests);
   requests.set(view.requestId, view);
-  return { requests, pendingClicks: state.pendingClicks };
+  const dismissed = new Set(state.dismissed);
+  dismissed.delete(view.requestId); // the same id arriving again shows the card
+  return { requests, pendingClicks: state.pendingClicks, dismissed };
+}
+
+/** M4.1 (N4): hide one card locally — GUI-only, no protocol change. */
+export function applyApprovalDismiss(state: ApprovalsUiState, requestId: string): ApprovalsUiState {
+  const dismissed = new Set(state.dismissed);
+  dismissed.add(requestId);
+  return { requests: state.requests, pendingClicks: state.pendingClicks, dismissed };
 }
 
 export function applyApprovalResolved(state: ApprovalsUiState, requestId: string): ApprovalsUiState {
@@ -81,21 +99,23 @@ export function applyApprovalResolved(state: ApprovalsUiState, requestId: string
   requests.delete(requestId);
   const pendingClicks = new Set(state.pendingClicks);
   pendingClicks.delete(requestId);
-  return { requests, pendingClicks };
+  const dismissed = new Set(state.dismissed);
+  dismissed.delete(requestId);
+  return { requests, pendingClicks, dismissed };
 }
 
-/** A snapshot replaces the list and clears every click lock. */
+/** A snapshot replaces the list and clears every click lock and dismissal. */
 export function applySnapshotApprovals(state: ApprovalsUiState, views: ApprovalView[]): ApprovalsUiState {
   const requests = new Map<string, ApprovalView>();
   for (const view of views) requests.set(view.requestId, view);
-  return { requests, pendingClicks: new Set() };
+  return { requests, pendingClicks: new Set(), dismissed: new Set() };
 }
 
 /** A click locks that card's buttons until its approval_resolved arrives. */
 export function applyApprovalClick(state: ApprovalsUiState, requestId: string): ApprovalsUiState {
   const pendingClicks = new Set(state.pendingClicks);
   pendingClicks.add(requestId);
-  return { requests: state.requests, pendingClicks };
+  return { requests: state.requests, pendingClicks, dismissed: state.dismissed };
 }
 
 /** The exact frame the GUI sends (SPEC protocol table). */

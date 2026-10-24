@@ -31,6 +31,7 @@
 //   GUI → engine    {type:'approval_answer', requestId, decision}   M3.3: accept or decline, once
 //   engine → adapter {type:'approval_answer', requestId, decision}  M3.3: forwarded to codex
 //   engine → GUI    {type:'approval_resolved', requestId, decision} M3.3: accept/decline/lost/stopped
+//   GUI → engine    {type:'send', body, targets}                   M4.1: the user writes to the room
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -631,10 +632,82 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             console.log('[engine] resumed');
             return;
           }
-          case 'send':
+          case 'send': {
+            // M4.1 (D14-2): the user's explicit send is its own approval. A
+            // GUI-only frame: the message is stored as the user's (hop 0) and
+            // each target's delivery row goes straight to queued — or waits
+            // as pending_approval while the relay is stopped.
+            if (!state.isGui) {
+              console.log('[engine] send from a non-GUI socket ignored');
+              return;
+            }
+            const body = typeof record.body === 'string' ? record.body.trim() : '';
+            if (body === '') {
+              console.log('[engine] send ignored: empty body');
+              return;
+            }
+            if (body.length > 20000) {
+              console.log(`[engine] send ignored: ${body.length} characters (cap 20000)`);
+              return;
+            }
+            if (!Array.isArray(record.targets) || record.targets.length === 0) {
+              console.log('[engine] send ignored: no targets');
+              return;
+            }
+            const targets = [...new Set(record.targets)] as unknown[];
+            if (targets.some((t) => t !== 'astra' && t !== 'codex')) {
+              console.log(`[engine] send ignored: bad targets ${JSON.stringify(record.targets)}`);
+              return;
+            }
+            let message: RelayMessage;
+            try {
+              // allowDuplicate: a deliberate resend is still stored — the
+              // outbound dedupe below fails its row instead of swallowing it.
+              message = store.insertMessage({
+                source: 'user',
+                targets: targets as Participant[],
+                body,
+                hop: 0,
+                allowDuplicate: true,
+              });
+            } catch (err) {
+              if (err instanceof StoreError && (err.code === 'relay_header' || err.code === 'echo')) {
+                console.log(`[engine] send ignored: ${err.code}`);
+                return;
+              }
+              throw err;
+            }
+            broadcast({ type: 'transcript_update', message });
+            for (const target of targets as Participant[]) {
+              // M3.2a (D11-3) applies to the user's messages too: the same
+              // text must not go to the same AI twice inside the window.
+              const twin = store.recentIdenticalDelivery(message.contentHash, target, message.id);
+              if (twin !== null) {
+                store.markStatus(message.id, target, 'failed',
+                  `identical text was already sent to ${target} a moment ago`);
+                broadcastDeliveryUpdate(message.id, target);
+                continue;
+              }
+              if (paused) {
+                // D14-2: while stopped the row waits, with an honest note.
+                store.markStatus(message.id, target, 'pending_approval',
+                  'the relay is stopped — approve after you resume');
+                broadcastDeliveryUpdate(message.id, target);
+                continue;
+              }
+              store.markStatus(message.id, target, 'queued');
+              broadcastDeliveryUpdate(message.id, target);
+              const adapter = adapterSocketFor(target);
+              if (adapter !== null) {
+                const pending = store.deliveriesForTarget(target, 'queued')
+                  .find((p) => p.messageId === message.id);
+                if (pending !== undefined) deliverTo(adapter, pending);
+              }
+            }
+            return;
+          }
           case 'set_mode':
-            // Still read-only from the GUI's side until their milestones
-            // (M2.1 delivered only what the user explicitly approved).
+            // Still read-only from the GUI's side until its milestone (M4.2).
             return;
           default:
             return; // unknown frame types are ignored
