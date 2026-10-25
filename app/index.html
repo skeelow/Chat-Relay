@@ -99,6 +99,8 @@
     #export-note { font-size: 12px; color: #9aa0a6; max-width: 200px; overflow: hidden;
                    text-overflow: ellipsis; white-space: nowrap; }
     #export-note:empty { display: none; }
+    #countdown-count { font-size: 12px; color: #e3b341; }
+    #countdown-count:empty { display: none; }
     #search { position: fixed; top: 52px; right: 10px; width: 360px; max-height: 68%;
                overflow-y: auto; z-index: 30; background: #1b1e21; border: 1px solid #33373c;
                border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px;
@@ -146,6 +148,7 @@
     <button id="search-btn" type="button" disabled>Search</button>
     <button id="export-btn" type="button" disabled>Export</button>
     <span id="export-note"></span>
+    <span id="countdown-count"></span>
     <span id="mode-label"></span>
     <span id="pending"></span>
     <span id="approvals-badge"></span>
@@ -172,8 +175,8 @@
         <span class="choice-help">Every AI reply waits here for your Approve before it is relayed on.</span>
       </span>
       <span class="choice-stack">
-        <label><input type="radio" name="relay-mode" id="mode-auto" disabled> Auto</label>
-        <span class="choice-help">(available in a later update) Replies relay themselves up to the turn cap.</span>
+        <label><input type="radio" name="relay-mode" id="mode-auto"> Auto</label>
+        <span class="choice-help">Replies are forwarded between the AIs automatically, up to the turn cap, then it stops and waits for you. ChatGPT text is typed into its box; you click Send there. Codex approvals always wait for you.</span>
       </span>
     </div>
     <div class="settings-row">
@@ -188,7 +191,6 @@
         <option value="seconds">seconds</option>
         <option value="minutes">minutes</option>
       </select>
-      <span class="choice-help">Takes effect with Auto mode.</span>
     </div>
     <div id="settings-hint"></div>
   </div>

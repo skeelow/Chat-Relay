@@ -255,7 +255,9 @@
     return Number.isInteger(value) && value >= TURN_CAP_MIN && value <= TURN_CAP_MAX;
   }
   function modeLabel(mode) {
-    return mode === "approve_each" ? "Approve each" : "Manual";
+    if (mode === "approve_each") return "Approve each";
+    if (mode === "auto") return "Auto";
+    return "Manual";
   }
   function settingsControls(server) {
     return {
@@ -267,6 +269,55 @@
   }
   function setModeFrame(update) {
     return { type: "set_mode", ...update };
+  }
+
+  // app/src/countdown.ts
+  function emptyCountdownState() {
+    return { secondsLeft: {} };
+  }
+  function applyCountdownFrame(state, frame) {
+    if (typeof frame.messageId !== "string" || frame.target !== "astra" && frame.target !== "codex") {
+      return state;
+    }
+    const key = `${frame.messageId}:${frame.target}`;
+    const next = { secondsLeft: { ...state.secondsLeft } };
+    if (frame.seconds === null) {
+      delete next.secondsLeft[key];
+      return next;
+    }
+    if (typeof frame.seconds === "number" && Number.isFinite(frame.seconds) && frame.seconds >= 0) {
+      next.secondsLeft[key] = Math.floor(frame.seconds);
+    }
+    return next;
+  }
+  function tickCountdowns(state) {
+    const secondsLeft = {};
+    for (const [key, seconds] of Object.entries(state.secondsLeft)) {
+      secondsLeft[key] = Math.max(0, seconds - 1);
+    }
+    return { secondsLeft };
+  }
+  function countdownRowText(secondsLeft) {
+    return `Sending in ${Math.max(0, Math.floor(secondsLeft))}s`;
+  }
+  function countdownHeaderText(count) {
+    if (count <= 0) return "";
+    return `${count} countdown${count === 1 ? "" : "s"} running`;
+  }
+  function heldNotice(cap, otherAi) {
+    return `Turn cap reached (${cap}) \u2014 not forwarded automatically. Use Send to ${otherAi} to continue by hand.`;
+  }
+  function heldNoticeHelp() {
+    return "A new user message resets the chain \u2014 it starts from hop 0 again.";
+  }
+  function autoSendControlsEnabled(mode) {
+    return mode === "auto";
+  }
+  function pendingDecision(hasCountdown, secondsLeft) {
+    if (hasCountdown) {
+      return { label: countdownRowText(secondsLeft), approveLabel: "Send now", rejectLabel: "Cancel" };
+    }
+    return { label: "Waiting for your approval", approveLabel: "Approve", rejectLabel: "Reject" };
   }
 
   // app/src/renderer.ts
@@ -292,6 +343,7 @@
   var modeLabelEl = document.getElementById("mode-label");
   var modeManualInput = document.getElementById("mode-manual");
   var modeApproveInput = document.getElementById("mode-approve-each");
+  var modeAutoInput = document.getElementById("mode-auto");
   var turnCapInput = document.getElementById("turn-cap");
   var autoSendInput = document.getElementById("auto-send");
   var autoSendDelayInput = document.getElementById("auto-send-delay");
@@ -303,6 +355,7 @@
   var searchTotal = document.getElementById("search-total");
   var exportButton = document.getElementById("export-btn");
   var exportNote = document.getElementById("export-note");
+  var countdownCountEl = document.getElementById("countdown-count");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
@@ -311,6 +364,8 @@
   var relaySettings = null;
   var searchState = emptySearchState();
   var pendingExport = null;
+  var countdownState = emptyCountdownState();
+  var heldNotices = /* @__PURE__ */ new Map();
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
@@ -325,6 +380,7 @@
     if (exportButton !== null) exportButton.disabled = !on;
     if (modeManualInput !== null) modeManualInput.disabled = !on;
     if (modeApproveInput !== null) modeApproveInput.disabled = !on;
+    if (modeAutoInput !== null) modeAutoInput.disabled = !on;
     if (turnCapInput !== null) turnCapInput.disabled = !on;
     if (autoSendInput !== null) autoSendInput.disabled = !on;
     if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
@@ -356,7 +412,12 @@
     const controls = settingsControls(relaySettings);
     if (modeManualInput !== null) modeManualInput.checked = controls.mode === "manual";
     if (modeApproveInput !== null) modeApproveInput.checked = controls.mode === "approve_each";
+    if (modeAutoInput !== null) modeAutoInput.checked = controls.mode === "auto";
     if (turnCapInput !== null) turnCapInput.value = controls.turnCap;
+    const autoUsable = autoSendControlsEnabled(relaySettings.mode) && engineOnline;
+    if (autoSendInput !== null) autoSendInput.disabled = !autoUsable;
+    if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !autoUsable;
+    if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !autoUsable;
     if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
     if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
     if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
@@ -408,6 +469,18 @@
     const pending = pendingCount([...deliveryState.rows.values()]);
     const approvals = visibleApprovals(approvalState).length;
     preload?.reportTrayCounts(pending, approvals);
+  }
+  function updateCountdownHeader() {
+    if (countdownCountEl === null) return;
+    const running = Object.keys(countdownState.secondsLeft).length;
+    countdownCountEl.textContent = countdownHeaderText(running);
+  }
+  function renderCountdownFooters() {
+    for (const key of Object.keys(countdownState.secondsLeft)) {
+      const messageId = key.slice(0, key.lastIndexOf(":"));
+      renderDelivery(messageId);
+    }
+    updateCountdownHeader();
   }
   function appendDismissButton(actions, requestId) {
     const button = document.createElement("button");
@@ -560,13 +633,28 @@
     const key = deliveryKey(messageId, target);
     const delivery = deliveryState.rows.get(key);
     const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
-    footer.status.textContent = view.label;
+    const held = heldNotices.get(messageId);
+    if (held !== void 0) {
+      footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+    } else {
+      footer.status.textContent = view.label;
+    }
     const buttons = [];
     const send = sendButton(footer.source, delivery);
     if (send.show) buttons.push({ action: "forward", label: send.label });
+    const countdownSeconds = countdownState.secondsLeft[key];
+    const decision = pendingDecision(
+      countdownSeconds !== void 0 && view.actions.includes("approve"),
+      countdownSeconds ?? 0
+    );
+    if (held !== void 0 && view.label === "") {
+      footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+    } else if (countdownSeconds !== void 0 && view.actions.includes("approve")) {
+      footer.status.textContent = decision.label;
+    }
     for (const action of view.actions) {
-      if (action === "approve") buttons.push({ action, label: "Approve" });
-      else if (action === "reject") buttons.push({ action, label: "Reject" });
+      if (action === "approve") buttons.push({ action, label: decision.approveLabel });
+      else if (action === "reject") buttons.push({ action, label: decision.rejectLabel });
     }
     for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
   }
@@ -600,6 +688,29 @@
       renderApprovals();
       relaySettings = frame.settings ?? null;
       renderSettings();
+      if (Array.isArray(frame.countdowns)) {
+        countdownState = emptyCountdownState();
+        for (const entry of frame.countdowns) {
+          countdownState = applyCountdownFrame(countdownState, {
+            messageId: entry.messageId,
+            target: entry.target,
+            seconds: entry.secondsLeft
+          });
+        }
+      }
+      if (Array.isArray(frame.held)) {
+        heldNotices.clear();
+        for (const entry of frame.held) {
+          if (typeof entry.messageId === "string") {
+            heldNotices.set(entry.messageId, {
+              hop: typeof entry.hop === "number" ? entry.hop : 0,
+              cap: typeof entry.cap === "number" ? entry.cap : 0
+            });
+          }
+        }
+      }
+      renderCountdownFooters();
+      for (const messageId of heldNotices.keys()) renderDelivery(messageId);
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
       return;
@@ -611,7 +722,7 @@
     }
     if (type === "settings_update") {
       relaySettings = {
-        mode: frame.mode === "approve_each" ? "approve_each" : "manual",
+        mode: frame.mode === "approve_each" ? "approve_each" : frame.mode === "auto" ? "auto" : "manual",
         turnCap: typeof frame.turnCap === "number" ? frame.turnCap : 4,
         autoSend: frame.autoSend === true,
         autoSendDelaySec: typeof frame.autoSendDelaySec === "number" ? frame.autoSendDelaySec : 10
@@ -640,6 +751,24 @@
           console.log(`[relay-gui] export ${path === null || path === void 0 ? "cancelled" : `saved to ${path}`}`);
         });
       }
+      return;
+    }
+    if (type === "countdown") {
+      countdownState = applyCountdownFrame(countdownState, frame);
+      renderDelivery(String(frame.messageId ?? ""));
+      renderCountdownFooters();
+      console.log(`[relay-gui] countdown: ${JSON.stringify(frame)}`);
+      return;
+    }
+    if (type === "routing_held") {
+      if (typeof frame.messageId === "string") {
+        heldNotices.set(frame.messageId, {
+          hop: typeof frame.hop === "number" ? frame.hop : 0,
+          cap: typeof frame.cap === "number" ? frame.cap : 0
+        });
+        renderDelivery(frame.messageId);
+      }
+      console.log(`[relay-gui] routing held: ${JSON.stringify(frame)}`);
       return;
     }
     if (type === "approval_request") {
@@ -785,6 +914,12 @@
       if (modeApproveInput.checked) sendFrameToEngine(setModeFrame({ mode: "approve_each" }));
     });
   }
+  if (modeAutoInput !== null) {
+    modeAutoInput.disabled = true;
+    modeAutoInput.addEventListener("change", () => {
+      if (modeAutoInput.checked) sendFrameToEngine(setModeFrame({ mode: "auto" }));
+    });
+  }
   if (turnCapInput !== null) {
     turnCapInput.disabled = true;
     turnCapInput.addEventListener("change", () => {
@@ -873,5 +1008,10 @@
       sendFrameToEngine(exportFrame(pendingExport));
     });
   }
+  setInterval(() => {
+    if (Object.keys(countdownState.secondsLeft).length === 0) return;
+    countdownState = tickCountdowns(countdownState);
+    renderCountdownFooters();
+  }, 1e3);
   connect();
 })();

@@ -124,7 +124,7 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `send` | body, targets (astra, codex, or both); GUI only. Creates a user message and its deliveries; the user's explicit send is the approval |
 | GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
-| GUI → engine | `set_mode` | mode (manual or approve\_each, auto in M5.1), turnCap, autoSend (bool), autoSendDelaySec — any subset; GUI only; invalid frames are ignored whole |
+| GUI → engine | `set_mode` | mode (manual, approve\_each or auto), turnCap, autoSend (bool), autoSendDelaySec — any subset; GUI only; invalid frames are ignored whole |
 | GUI → engine | `search` | requestId, query (trimmed, 1–200 chars; GUI only). Case-insensitive substring over message bodies, % and _ escaped, newest 100 matches |
 | engine → GUI | `search_result` | requestId, messages (newest 100, newest first), total — the asking socket only |
 | GUI → engine | `export` | requestId (GUI only) |
@@ -133,10 +133,11 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `resume` | none — clears the stopped state |
 | GUI → engine | `approval_answer` | requestId, decision (accept or decline) |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
-| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool), `approvals` (the pending Codex approvals) and `settings` — sent once, to that socket only |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool), `approvals` (the pending Codex approvals), `settings`, `countdowns` (the running auto-send timers, with seconds left) and `held` (the turn-cap holds) — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
 | engine → GUI | `delivery_update` | message id, target, status, attempts, updatedAt, error if any |
-| engine → GUI | `countdown` | message id, target, seconds left (sent when a countdown starts and when it is cancelled) |
+| engine → GUI | `countdown` | message id, target, seconds — the delay when a countdown starts, null when it ends or is cancelled by anything |
+| engine → GUI | `routing_held` | message id, hop, cap — an Auto-mode turn-cap hold; every countdown cancels; the manual Send still works |
 | engine → GUI | `pause_update` | paused (bool) — broadcast whenever the stopped state changes |
 | engine → GUI | `settings_update` | the full settings object — mode, turnCap, autoSend, autoSendDelaySec — broadcast on any change |
 | engine → GUI | `approval_request` | requestId, kind, summary, method — broadcast when a Codex approval arrives |
@@ -153,7 +154,7 @@ Each adapter does four things and nothing else: report status, report completed 
 The GUI has an "Auto-send after N seconds" tick box (default off, N default 10, allowed 3 seconds to 30 minutes; the GUI lets you enter it in seconds or minutes).
 
 - Off (manual): every relayed message waits as a pending item until the user clicks Send. This is the default and the only behaviour before Milestone 5.
-- On (automatic): when a relayed message becomes ready, the engine starts a countdown for it and the GUI shows the seconds left on that pending item, with Cancel and Send now buttons. At zero the engine delivers it. Cancel marks the delivery `cancelled`.
+- On (automatic): when a relayed message becomes ready, the engine starts a countdown for it and the GUI shows the seconds left on that pending item, with Cancel and Send now buttons. At zero the engine delivers it. Cancel marks the delivery `cancelled`. Cancel is the `reject` frame and Send now is the `approve` frame.
 - The countdown is a delivery delay only. It never answers Codex approval requests, which always wait for the user (Hard rule: no automatic approvals). The ChatGPT side still follows M3.1: by default the text is typed into the box and the user clicks Send there.
 - The turn cap, Stop and Pause all win over the timer: hitting the cap, pressing Stop or pausing cancels every running countdown and the items stay pending.
 - Countdowns are not persisted. After a restart, nothing resumes counting; items wait for the user (Hard rule: no replay). Unticking the box cancels running countdowns and leaves those items pending.

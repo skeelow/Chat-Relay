@@ -490,6 +490,13 @@ test('relay settings: defaults, accessors and persistence across a reopen', () =
       assert.equal(store.getSetting('auto_send'), null, 'clearing removes the key entirely');
       store.close();
     }
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      // M5.1: auto is a real mode now — it round-trips like the others.
+      store.setRelayMode('auto');
+      assert.equal(store.relayMode(), 'auto');
+      store.close();
+    }
   } finally {
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); }
     catch (err) { console.warn(`[test] could not remove temp dir ${dir}: ${String(err)}`); }
@@ -500,7 +507,7 @@ test('validateModeUpdate: good and bad values per field; one bad field poisons t
   assert.deepEqual(validateModeUpdate({}), {}, 'an empty frame is valid — it changes nothing');
   assert.deepEqual(validateModeUpdate({ mode: 'manual' }), { mode: 'manual' });
   assert.deepEqual(validateModeUpdate({ mode: 'approve_each' }), { mode: 'approve_each' });
-  assert.equal(validateModeUpdate({ mode: 'auto' }), null, 'auto is not accepted until M5.1');
+  assert.deepEqual(validateModeUpdate({ mode: 'auto' }), { mode: 'auto' }, 'M5.1: auto is accepted now');
   assert.equal(validateModeUpdate({ mode: 'nonsense' }), null);
   assert.deepEqual(validateModeUpdate({ turnCap: 1 }), { turnCap: 1 });
   assert.deepEqual(validateModeUpdate({ turnCap: 50 }), { turnCap: 50 });

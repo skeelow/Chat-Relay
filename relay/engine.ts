@@ -42,6 +42,11 @@
 //   GUI → engine    {type:'export', requestId}                     M4.3: Markdown export
 //   engine → GUI    {type:'export_result', requestId, markdown,   M4.3: asking socket only
 //                    messageCount}
+//   engine → GUI    {type:'countdown', messageId, target, seconds} M5.1: the delay when an auto-send
+//                                                                     countdown starts; null when it
+//                                                                     ends or is cancelled by anything
+//   engine → GUI    {type:'routing_held', messageId, hop, cap}    M5.1: an Auto turn-cap hold;
+//                                                                     every countdown cancels
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -51,7 +56,7 @@
 
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  openStore, StoreError, validateModeUpdate,
+  openStore, StoreError, isOverTurnCap, validateModeUpdate,
   type Participant, type PendingDelivery, type RelayMessage, type RelayStore,
 } from './store.ts';
 import { exportMarkdown, EXPORT_CAP, type ExportDelivery } from './export.ts';
@@ -68,6 +73,11 @@ export interface EngineOptions {
   /** M2.1: how long a delivery waits for the adapter's delivered/failed
    *  ack before the row is marked failed. Default 30 s. */
   deliverAckTimeoutMs?: number;
+  /** M5.1 (D18-3): the clock and the timer functions, injectable so the
+   *  tests run whole auto-send chains on a fake clock, without waiting. */
+  now?: () => number;
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
 }
 
 export interface EngineHandle {
@@ -151,8 +161,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   }
   // M4.2 (D16): the relay settings, persisted in the settings table and
   // cached here — a restart reads them back (the snapshot proves it).
+  // M5.1: 'auto' is a real mode now.
   const settings = {
-    mode: store.relayMode(),
+    mode: store.relayMode() as 'manual' | 'approve_each' | 'auto',
     turnCap: store.turnCap(),
     autoSend: store.autoSend(),
     autoSendDelaySec: store.autoSendDelaySec(),
@@ -278,6 +289,118 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       failDelivery(pending.messageId, pending.target, 'no confirmation from adapter');
     }, ackTimeoutMs));
     broadcastDeliveryUpdate(pending.messageId, pending.target);
+  };
+
+  // --- M5.1 (D18): Auto mode — the auto-send countdowns and the turn-cap
+  // holds. Both are in memory only: a restart has none, and every row
+  // comes back pending, as ever. The clock and the timer functions are
+  // injectable so tests run whole chains without real waiting. ---
+
+  const nowMs = options.now ?? (() => Date.now());
+  const armTimer = options.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+  const disarmTimer = options.clearTimer
+    ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+
+  interface RunningCountdown {
+    messageId: string;
+    target: Participant;
+    startedAtMs: number;
+    seconds: number;
+    handle: unknown;
+  }
+  const countdowns = new Map<string, RunningCountdown>();
+  const heldMessages: Array<{ messageId: string; hop: number; cap: number }> = [];
+
+  const countdownKey = (messageId: string, target: Participant): string => `${messageId}:${target}`;
+
+  const broadcastCountdown = (messageId: string, target: Participant, seconds: number | null): void => {
+    broadcast({ type: 'countdown', messageId, target, seconds });
+  };
+
+  /** Remove one timer. quiet skips the seconds:null broadcast (an internal
+   *  replacement or engine shutdown). */
+  const clearCountdown = (messageId: string, target: Participant, quiet = false): void => {
+    const key = countdownKey(messageId, target);
+    const running = countdowns.get(key);
+    if (running === undefined) return;
+    countdowns.delete(key);
+    disarmTimer(running.handle);
+    if (!quiet) broadcastCountdown(messageId, target, null);
+  };
+
+  /** D18-4: everything that cancels the auto-send — Stop, a hold, unticking
+   *  auto_send, leaving Auto, a restart — goes through here: every timer
+   *  clears, every GUI hears seconds:null, and every row stays pending. */
+  const clearAllCountdowns = (reason: string, quiet = false): void => {
+    const cancelled = [...countdowns.values()];
+    countdowns.clear();
+    for (const running of cancelled) {
+      disarmTimer(running.handle);
+      if (!quiet) broadcastCountdown(running.messageId, running.target, null);
+    }
+    if (cancelled.length > 0) console.log(`[engine] cancelled ${cancelled.length} countdown(s): ${reason}`);
+  };
+
+  /** The approve case's body, extracted so a countdown expiry does exactly
+   *  what an approve frame does: pending row → queued → deliver, with the
+   *  outbound dedupe (D11-3) and queued/no-adapter handling for free. */
+  const approveDelivery = (messageId: string, target: Participant): void => {
+    const row = store.getDelivery(messageId, target);
+    if (row === null || row.status !== 'pending_approval') return;
+    const message = store.getMessage(messageId);
+    const twin = message === null ? null
+      : store.recentIdenticalDelivery(message.contentHash, target, messageId);
+    if (twin !== null) {
+      store.markStatus(messageId, target, 'failed',
+        `identical text was already sent to ${target} a moment ago`);
+      broadcastDeliveryUpdate(messageId, target);
+      return;
+    }
+    store.markStatus(messageId, target, 'queued');
+    broadcastDeliveryUpdate(messageId, target);
+    const adapter = adapterSocketFor(target);
+    if (adapter !== null) {
+      const pending = store.deliveriesForTarget(target, 'queued')
+        .find((p) => p.messageId === messageId);
+      if (pending !== undefined) deliverTo(adapter, pending);
+    }
+  };
+
+  /** D18-3: one expiry. Re-check every condition fresh from the store — the
+   *  source of truth, so even a state change that bypassed set_mode's
+   *  clearing path is caught here — then do exactly what an approve does. */
+  const onCountdownExpiry = (messageId: string, target: Participant): void => {
+    countdowns.delete(countdownKey(messageId, target)); // it fired — no longer running
+    const row = store.getDelivery(messageId, target);
+    const conditionsOk = !store.paused() && store.relayMode() === 'auto'
+      && store.autoSend() && row !== null && row.status === 'pending_approval';
+    broadcastCountdown(messageId, target, null); // the countdown ends either way
+    if (!conditionsOk) {
+      console.log(`[engine] countdown for ${messageId} → ${target} expired without acting (a condition changed)`);
+      return;
+    }
+    console.log(`[engine] auto-send: approving ${messageId} → ${target}`);
+    approveDelivery(messageId, target);
+  };
+
+  /** D18-3: the single creation point — every countdown starts here and
+   *  nowhere else, so the rules live in one place. */
+  const startCountdown = (messageId: string, target: Participant): void => {
+    clearCountdown(messageId, target, true); // replace any stale timer first
+    const seconds = settings.autoSendDelaySec;
+    const handle = armTimer(() => onCountdownExpiry(messageId, target), seconds * 1000);
+    countdowns.set(countdownKey(messageId, target), { messageId, target, startedAtMs: nowMs(), seconds, handle });
+    broadcastCountdown(messageId, target, seconds);
+    console.log(`[engine] countdown: ${messageId} → ${target} sends in ${seconds}s`);
+  };
+
+  /** D18-5: the turn-cap hold. In memory only; the manual Send to X button
+   *  keeps working (manual forwards are never blocked, D11-2). */
+  const holdMessage = (messageId: string, hop: number, cap: number): void => {
+    heldMessages.push({ messageId, hop, cap });
+    broadcast({ type: 'routing_held', messageId, hop, cap });
+    clearAllCountdowns(`turn cap reached (hop ${hop} >= cap ${cap})`);
+    console.log(`[engine] routing held: ${messageId} at hop ${hop} (cap ${cap}) — manual Send only`);
   };
 
   server.on('connection', (ws: WebSocket) => {
@@ -410,13 +533,25 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 initialStatus: 'captured',
               });
               broadcast({ type: 'transcript_update', message });
-              // M4.2 (D16-3): in approve_each, every stored AI capture gets one
-              // pending_approval row to the other AI — the user approves each
-              // hop, so the turn cap never applies here. No backfill on a mode
-              // change, no replay after a restart: rows are born only now.
-              if (settings.mode === 'approve_each') {
+              // M4.2 (D16-3) + M5.1 (D18-2): approve_each and auto route
+              // every stored AI capture to the other AI as a pending item.
+              // Auto enforces the turn cap — an over-cap capture is held
+              // with no row, cancelling every countdown — and while the
+              // relay is stopped, auto creates nothing at all. approve_each
+              // keeps its existing Stop behaviour (rows are not deliveries).
+              if (message.source !== 'user' && settings.mode !== 'manual') {
                 const other: Participant = message.source === 'astra' ? 'codex' : 'astra';
-                if (store.getDelivery(message.id, other) === null) {
+                if (settings.mode === 'auto') {
+                  if (paused) {
+                    console.log(`[engine] auto capture ${message.id} stored without routing (the relay is stopped)`);
+                  } else if (isOverTurnCap(message.hop, settings.turnCap)) {
+                    holdMessage(message.id, message.hop, settings.turnCap);
+                  } else if (store.getDelivery(message.id, other) === null) {
+                    store.insertDelivery(message.id, other);
+                    broadcastDeliveryUpdate(message.id, other);
+                    if (settings.autoSend) startCountdown(message.id, other);
+                  }
+                } else if (store.getDelivery(message.id, other) === null) {
                   store.insertDelivery(message.id, other);
                   broadcastDeliveryUpdate(message.id, other);
                 }
@@ -469,40 +604,20 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'approve': {
-            // M3.2b (D12-3): while stopped, approve is ignored and logged —
-            // nothing may move until the user resumes.
-            if (paused) {
-              console.log('[engine] approve ignored while stopped — resume first');
-              return;
-            }
             // M2.1: only a pending_approval row can be approved. It queues,
             // and goes out immediately when the target adapter is connected
             // (otherwise its hello sends it) — approving twice sends once.
             const messageId = record.messageId;
             if (typeof messageId !== 'string' || !isParticipant(record.target)) return;
             const target = record.target;
-            const row = store.getDelivery(messageId, target);
-            if (row === null || row.status !== 'pending_approval') return;
-            // M3.2a (D11-3): outbound dedupe — the same text must not go to
-            // the same AI twice inside the window, whatever path created the
-            // second copy (the capture-side echo filter is the first half).
-            const message = store.getMessage(messageId);
-            const twin = message === null ? null
-              : store.recentIdenticalDelivery(message.contentHash, target, messageId);
-            if (twin !== null) {
-              store.markStatus(messageId, target, 'failed',
-                `identical text was already sent to ${target} a moment ago`);
-              broadcastDeliveryUpdate(messageId, target);
+            clearCountdown(messageId, target); // M5.1 (D18-3): Send now beats the timer
+            // M3.2b (D12-3): while stopped, approve is ignored and logged —
+            // nothing may move until the user resumes.
+            if (paused) {
+              console.log('[engine] approve ignored while stopped — resume first');
               return;
             }
-            store.markStatus(messageId, target, 'queued');
-            broadcastDeliveryUpdate(messageId, target);
-            const adapter = adapterSocketFor(target);
-            if (adapter !== null) {
-              const pending = store.deliveriesForTarget(target, 'queued')
-                .find((p) => p.messageId === messageId);
-              if (pending !== undefined) deliverTo(adapter, pending);
-            }
+            approveDelivery(messageId, target);
             return;
           }
           case 'reject': {
@@ -510,6 +625,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const messageId = record.messageId;
             if (typeof messageId !== 'string' || !isParticipant(record.target)) return;
             const target = record.target;
+            clearCountdown(messageId, target); // M5.1 (D18-3): Cancel beats the timer
             const row = store.getDelivery(messageId, target);
             if (row === null || (row.status !== 'pending_approval' && row.status !== 'queued')) return;
             store.markStatus(messageId, target, 'cancelled');
@@ -629,6 +745,15 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               approvals: [...approvals.values()],
               // M4.2: the relay settings.
               settings: settingsView(),
+              // M5.1: the running auto-send countdowns (with the seconds
+              // left) and the turn-cap holds — in memory only, so a fresh
+              // engine always starts with both empty.
+              countdowns: [...countdowns.values()].map((c) => ({
+                messageId: c.messageId,
+                target: c.target,
+                secondsLeft: Math.max(0, c.seconds - Math.floor((nowMs() - c.startedAtMs) / 1000)),
+              })),
+              held: [...heldMessages],
             }));
             return;
           }
@@ -653,6 +778,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               broadcastDeliveryUpdate(pending.messageId, pending.target);
             }
             resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
+            clearAllCountdowns('Stop'); // M5.1 (D18-4): and every countdown — the rows stay pending
             broadcast({ type: 'pause_update', paused: true });
             const codex = adapterSocketFor('codex');
             if (codex !== null) codex.send(JSON.stringify({ type: 'interrupt' }));
@@ -772,6 +898,14 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] settings changed: ${JSON.stringify(settingsView())}`);
               broadcast({ type: 'settings_update', ...settingsView() });
             }
+            // M5.1 (D18-4): leaving Auto or unticking auto_send cancels every
+            // running countdown — the rows stay pending, nothing delivers.
+            if (update.mode !== undefined && update.mode !== 'auto') {
+              clearAllCountdowns(`mode changed to ${update.mode}`);
+            }
+            if (update.autoSend === false) {
+              clearAllCountdowns('auto_send turned off');
+            }
             return;
           }
           case 'search': {
@@ -837,6 +971,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       for (const ws of server.clients) ws.terminate(); // server.clients is the authoritative set
       for (const timer of ackTimers.values()) clearTimeout(timer); // M2.1: no dangling ack timers
       ackTimers.clear();
+      clearAllCountdowns('engine shutdown', true); // M5.1: timers are memory-only
       server.close();
       store.close();
     },

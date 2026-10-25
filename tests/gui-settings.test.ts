@@ -65,6 +65,7 @@ test('settingsControls: the panel state for each server value', () => {
 test('modeLabel and the exact set_mode frames', () => {
   assert.equal(modeLabel('manual'), 'Manual');
   assert.equal(modeLabel('approve_each'), 'Approve each');
+  assert.equal(modeLabel('auto'), 'Auto');
   assert.deepEqual(setModeFrame({ mode: 'approve_each' }), { type: 'set_mode', mode: 'approve_each' });
   assert.equal(JSON.stringify(setModeFrame({ turnCap: 5 })), '{"type":"set_mode","turnCap":5}');
   assert.equal(JSON.stringify(setModeFrame({ autoSend: true, autoSendDelaySec: 300 })),

@@ -54,6 +54,10 @@ import {
   delayToSeconds, isDelayValid, isTurnCapValid, modeLabel, setModeFrame, settingsControls,
   type RelaySettings,
 } from './settings.ts';
+import {
+  applyCountdownFrame, autoSendControlsEnabled, countdownHeaderText, emptyCountdownState,
+  heldNotice, heldNoticeHelp, pendingDecision, tickCountdowns, type CountdownState,
+} from './countdown.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
 const RECONNECT_MS = 2000;
@@ -99,6 +103,7 @@ const settingsHint = document.getElementById('settings-hint');
 const modeLabelEl = document.getElementById('mode-label');
 const modeManualInput = document.getElementById('mode-manual') as HTMLInputElement | null;
 const modeApproveInput = document.getElementById('mode-approve-each') as HTMLInputElement | null;
+const modeAutoInput = document.getElementById('mode-auto') as HTMLInputElement | null;
 const turnCapInput = document.getElementById('turn-cap') as HTMLInputElement | null;
 const autoSendInput = document.getElementById('auto-send') as HTMLInputElement | null;
 const autoSendDelayInput = document.getElementById('auto-send-delay') as HTMLInputElement | null;
@@ -110,6 +115,7 @@ const searchResults = document.getElementById('search-results');
 const searchTotal = document.getElementById('search-total');
 const exportButton = document.getElementById('export-btn') as HTMLButtonElement | null;
 const exportNote = document.getElementById('export-note');
+const countdownCountEl = document.getElementById('countdown-count');
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -128,6 +134,10 @@ let relaySettings: RelaySettings | null = null;
 let searchState: SearchState = emptySearchState();
 // M4.3: the export in flight, matched by requestId when it comes back.
 let pendingExport: string | null = null;
+// M5.1: the auto-send countdowns (server-announced only) and the turn-cap
+// holds shown as notices. The seconds tick locally; the server's null clears.
+let countdownState: CountdownState = emptyCountdownState();
+const heldNotices = new Map<string, { hop: number; cap: number }>();
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
@@ -144,6 +154,7 @@ function engineState(label: string, on: boolean): void {
   if (exportButton !== null) exportButton.disabled = !on; // M4.3: so does export
   if (modeManualInput !== null) modeManualInput.disabled = !on;
   if (modeApproveInput !== null) modeApproveInput.disabled = !on;
+  if (modeAutoInput !== null) modeAutoInput.disabled = !on;
   if (turnCapInput !== null) turnCapInput.disabled = !on;
   if (autoSendInput !== null) autoSendInput.disabled = !on;
   if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
@@ -184,7 +195,13 @@ function renderSettings(): void {
   const controls = settingsControls(relaySettings);
   if (modeManualInput !== null) modeManualInput.checked = controls.mode === 'manual';
   if (modeApproveInput !== null) modeApproveInput.checked = controls.mode === 'approve_each';
+  if (modeAutoInput !== null) modeAutoInput.checked = controls.mode === 'auto';
   if (turnCapInput !== null) turnCapInput.value = controls.turnCap;
+  // M5.1 (D18 GUI): the auto-send controls live only in Auto mode.
+  const autoUsable = autoSendControlsEnabled(relaySettings.mode) && engineOnline;
+  if (autoSendInput !== null) autoSendInput.disabled = !autoUsable;
+  if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !autoUsable;
+  if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !autoUsable;
   if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
   if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
   if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
@@ -244,6 +261,23 @@ function reportTray(): void {
   const pending = pendingCount([...deliveryState.rows.values()]);
   const approvals = visibleApprovals(approvalState).length;
   preload?.reportTrayCounts(pending, approvals);
+}
+
+/** M5.1: the header's "N countdowns running" count. */
+function updateCountdownHeader(): void {
+  if (countdownCountEl === null) return;
+  const running = Object.keys(countdownState.secondsLeft).length;
+  countdownCountEl.textContent = countdownHeaderText(running);
+}
+
+/** M5.1: re-render every footer a running countdown touches (a frame arrived
+ *  or a local second passed). */
+function renderCountdownFooters(): void {
+  for (const key of Object.keys(countdownState.secondsLeft)) {
+    const messageId = key.slice(0, key.lastIndexOf(':'));
+    renderDelivery(messageId);
+  }
+  updateCountdownHeader();
 }
 
 /** M4.1 (N4): the local Dismiss on a card the relay cannot answer. Purely
@@ -427,13 +461,30 @@ function renderDelivery(messageId: string): void {
   const view = delivery === undefined
     ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
     : deliveryStatusView(delivery, target);
-  footer.status.textContent = view.label; // textContent only — error text included
+  // M5.1 (D18-5): a held message shows the turn-cap notice instead of an
+  // empty footer — and its manual Send to X button keeps working.
+  const held = heldNotices.get(messageId);
+  if (held !== undefined) {
+    footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+  } else {
+    footer.status.textContent = view.label; // textContent only — error text included
+  }
   const buttons: Array<{ action: 'forward' | 'approve' | 'reject'; label: string }> = [];
   const send = sendButton(footer.source, delivery);
   if (send.show) buttons.push({ action: 'forward', label: send.label });
+  // M5.1 (D18 GUI): while a countdown runs on a pending item, the labels
+  // read Sending in Ns / Send now / Cancel — the frames stay approve/reject.
+  const countdownSeconds = countdownState.secondsLeft[key];
+  const decision = pendingDecision(
+    countdownSeconds !== undefined && view.actions.includes('approve'), countdownSeconds ?? 0);
+  if (held !== undefined && view.label === '') {
+    footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+  } else if (countdownSeconds !== undefined && view.actions.includes('approve')) {
+    footer.status.textContent = decision.label;
+  }
   for (const action of view.actions) {
-    if (action === 'approve') buttons.push({ action, label: 'Approve' });
-    else if (action === 'reject') buttons.push({ action, label: 'Reject' });
+    if (action === 'approve') buttons.push({ action, label: decision.approveLabel });
+    else if (action === 'reject') buttons.push({ action, label: decision.rejectLabel });
     // 'forward' in the table is the failed case — sendButton shows it as Send again.
   }
   for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
@@ -479,6 +530,29 @@ function handleFrame(frame: Frame): void {
     // M4.2: the settings arrive with the catch-up.
     relaySettings = (frame.settings ?? null) as RelaySettings | null;
     renderSettings();
+    // M5.1: any running countdowns (with the seconds left) and holds ride
+    // along, so a joining GUI shows them at once.
+    if (Array.isArray(frame.countdowns)) {
+      countdownState = emptyCountdownState();
+      for (const entry of frame.countdowns as Array<{ messageId?: unknown; target?: unknown; secondsLeft?: unknown }>) {
+        countdownState = applyCountdownFrame(countdownState, {
+          messageId: entry.messageId, target: entry.target, seconds: entry.secondsLeft,
+        });
+      }
+    }
+    if (Array.isArray(frame.held)) {
+      heldNotices.clear();
+      for (const entry of frame.held as Array<{ messageId?: unknown; hop?: unknown; cap?: unknown }>) {
+        if (typeof entry.messageId === 'string') {
+          heldNotices.set(entry.messageId, {
+            hop: typeof entry.hop === 'number' ? entry.hop : 0,
+            cap: typeof entry.cap === 'number' ? entry.cap : 0,
+          });
+        }
+      }
+    }
+    renderCountdownFooters();
+    for (const messageId of heldNotices.keys()) renderDelivery(messageId);
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
     return;
@@ -490,9 +564,10 @@ function handleFrame(frame: Frame): void {
     return;
   }
   if (type === 'settings_update') {
-    // M4.2: the server's settings are the panel's only truth.
+    // M4.2 + M5.1: the server's settings are the panel's only truth —
+    // manual, approve_each or auto.
     relaySettings = {
-      mode: frame.mode === 'approve_each' ? 'approve_each' : 'manual',
+      mode: frame.mode === 'approve_each' ? 'approve_each' : frame.mode === 'auto' ? 'auto' : 'manual',
       turnCap: typeof frame.turnCap === 'number' ? frame.turnCap : 4,
       autoSend: frame.autoSend === true,
       autoSendDelaySec: typeof frame.autoSendDelaySec === 'number' ? frame.autoSendDelaySec : 10,
@@ -527,6 +602,29 @@ function handleFrame(frame: Frame): void {
         console.log(`[relay-gui] export ${path === null || path === undefined ? 'cancelled' : `saved to ${path}`}`);
       });
     }
+    return;
+  }
+  if (type === 'countdown') {
+    // M5.1: the server announces every start (seconds = the delay) and every
+    // end or cancel (seconds = null). Nothing is shown the server has not
+    // announced; the visible seconds tick locally.
+    countdownState = applyCountdownFrame(countdownState, frame);
+    renderDelivery(String(frame.messageId ?? ''));
+    renderCountdownFooters();
+    console.log(`[relay-gui] countdown: ${JSON.stringify(frame)}`);
+    return;
+  }
+  if (type === 'routing_held') {
+    // M5.1: the turn cap held this message — a notice on its footer; the
+    // manual Send button still works.
+    if (typeof frame.messageId === 'string') {
+      heldNotices.set(frame.messageId, {
+        hop: typeof frame.hop === 'number' ? frame.hop : 0,
+        cap: typeof frame.cap === 'number' ? frame.cap : 0,
+      });
+      renderDelivery(frame.messageId);
+    }
+    console.log(`[relay-gui] routing held: ${JSON.stringify(frame)}`);
     return;
   }
   if (type === 'approval_request') {
@@ -692,6 +790,13 @@ if (modeApproveInput !== null) {
     if (modeApproveInput.checked) sendFrameToEngine(setModeFrame({ mode: 'approve_each' }));
   });
 }
+if (modeAutoInput !== null) {
+  // M5.1 (D18-1): Auto is selectable now — same frame, same validation.
+  modeAutoInput.disabled = true;
+  modeAutoInput.addEventListener('change', () => {
+    if (modeAutoInput.checked) sendFrameToEngine(setModeFrame({ mode: 'auto' }));
+  });
+}
 if (turnCapInput !== null) {
   turnCapInput.disabled = true;
   turnCapInput.addEventListener('change', () => {
@@ -780,5 +885,13 @@ if (exportButton !== null) {
     sendFrameToEngine(exportFrame(pendingExport));
   });
 }
+
+// M5.1: the visible seconds tick locally, one per second — the server's
+// seconds: null is the only thing that ever removes an item.
+setInterval(() => {
+  if (Object.keys(countdownState.secondsLeft).length === 0) return;
+  countdownState = tickCountdowns(countdownState);
+  renderCountdownFooters();
+}, 1000);
 
 connect();

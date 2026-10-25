@@ -107,7 +107,7 @@ export function isOverTurnCap(hop: number, cap: number): boolean {
 
 /** The set_mode fields after validation — only the provided ones. */
 export interface ModeUpdate {
-  mode?: 'manual' | 'approve_each';
+  mode?: 'manual' | 'approve_each' | 'auto';
   turnCap?: number;
   autoSend?: boolean;
   autoSendDelaySec?: number;
@@ -124,7 +124,7 @@ export function validateModeUpdate(update: {
 }): ModeUpdate | null {
   const result: ModeUpdate = {};
   if (update.mode !== undefined) {
-    if (update.mode !== 'manual' && update.mode !== 'approve_each') return null;
+    if (update.mode !== 'manual' && update.mode !== 'approve_each' && update.mode !== 'auto') return null;
     result.mode = update.mode;
   }
   if (update.turnCap !== undefined) {
@@ -263,11 +263,11 @@ export interface RelayStore {
   setSetting(key: string, value: string): void;
   /** M3.2a (D11-2): the turn_cap setting; 4 unless a positive integer is stored. */
   turnCap(): number;
-  /** M4.2 (D16-1): the relay_mode setting — 'manual' (default) or
-   *  'approve_each'; anything else reads back as manual. 'auto' arrives with
-   *  M5.1 and is rejected by set_mode long before here. */
-  relayMode(): 'manual' | 'approve_each';
-  setRelayMode(mode: 'manual' | 'approve_each'): void;
+  /** M4.2 (D16-1) + M5.1 (D18-1): the relay_mode setting — 'manual'
+   *  (default), 'approve_each' or 'auto'; anything else reads back as
+   *  manual. */
+  relayMode(): 'manual' | 'approve_each' | 'auto';
+  setRelayMode(mode: 'manual' | 'approve_each' | 'auto'): void;
   setTurnCap(cap: number): void;
   /** M4.2: the auto_send setting — "1" or absent (off). Stored and shown
    *  only until M5.1 gives it an effect. */
@@ -527,12 +527,12 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     setSetting('turn_cap', String(cap));
   };
 
-  const relayMode = (): 'manual' | 'approve_each' => {
+  const relayMode = (): 'manual' | 'approve_each' | 'auto' => {
     const raw = getSetting('relay_mode');
-    return raw === 'approve_each' ? 'approve_each' : 'manual';
+    return raw === 'approve_each' || raw === 'auto' ? raw : 'manual';
   };
 
-  const setRelayMode = (mode: 'manual' | 'approve_each'): void => {
+  const setRelayMode = (mode: 'manual' | 'approve_each' | 'auto'): void => {
     setSetting('relay_mode', mode);
   };
 

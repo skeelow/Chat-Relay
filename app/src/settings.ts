@@ -8,7 +8,7 @@
 
 /** The server's settings as the engine reports them. */
 export interface RelaySettings {
-  mode: 'manual' | 'approve_each';
+  mode: 'manual' | 'approve_each' | 'auto';
   turnCap: number;
   autoSend: boolean;
   autoSendDelaySec: number;
@@ -45,7 +45,9 @@ export function isTurnCapValid(value: number): boolean {
 
 /** The header label for a mode. */
 export function modeLabel(mode: string): string {
-  return mode === 'approve_each' ? 'Approve each' : 'Manual';
+  if (mode === 'approve_each') return 'Approve each';
+  if (mode === 'auto') return 'Auto';
+  return 'Manual';
 }
 
 /**
@@ -54,7 +56,7 @@ export function modeLabel(mode: string): string {
  * just applies it, so the panel can only ever show the server's truth.
  */
 export function settingsControls(server: RelaySettings): {
-  mode: 'manual' | 'approve_each';
+  mode: 'manual' | 'approve_each' | 'auto';
   turnCap: string;
   autoSend: boolean;
   delay: { value: number; unit: DelayUnit };
@@ -69,7 +71,7 @@ export function settingsControls(server: RelaySettings): {
 
 /** The exact frame the GUI sends (SPEC protocol table) — any subset. */
 export function setModeFrame(update: {
-  mode?: 'manual' | 'approve_each';
+  mode?: 'manual' | 'approve_each' | 'auto';
   turnCap?: number;
   autoSend?: boolean;
   autoSendDelaySec?: number;

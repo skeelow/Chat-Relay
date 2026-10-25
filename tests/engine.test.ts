@@ -145,7 +145,12 @@ function cleanupDir(dir: string): void {
 async function withEngine(
   label: string,
   run: (engine: EngineHandle, url: string, token: string, dir: string) => Promise<void>,
-  options: { deliverAckTimeoutMs?: number } = {}, // M3.2b: tests may shorten the ack window
+  options: { // M3.2b: tests may shorten the ack window; M5.1: inject the clock
+    deliverAckTimeoutMs?: number;
+    now?: () => number;
+    setTimer?: (fn: () => void, ms: number) => unknown;
+    clearTimer?: (handle: unknown) => void;
+  } = {},
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), `relay-engine-${label}-`));
   const engine = await startEngine({
@@ -2002,7 +2007,7 @@ test('set_mode: GUI sockets only; partial frames change only their fields; inval
     }, 'a partial frame changes only its field; the broadcast carries the whole object');
 
     gui.send({ type: 'set_mode', mode: 'approve_each', turnCap: 99 }); // one bad field poisons all
-    gui.send({ type: 'set_mode', mode: 'auto' }); // not accepted until M5.1
+    gui.send({ type: 'set_mode', mode: 'nonsense' }); // no such mode, ever
     await gui.expectSilence(300);
 
     const late = await openClient(url, token);
@@ -2218,4 +2223,589 @@ test('export: GUI-only, and export_result reaches the asking socket only', async
     await other.expectSilence(300); // nobody else sees it
     assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval', 'export changed nothing');
   });
+});
+
+// --- M5.1: Auto mode, the turn cap and the auto-send countdown ---
+
+/** Real milliseconds for the local-socket round trips between clock moves. */
+const pause = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** A fake clock: the engine's injectable now/setTimer/clearTimer. advance()
+ *  fires every due timer in order — including timers armed by the expiry of
+ *  an earlier one — so a whole auto chain runs without real waiting. */
+class FakeClock {
+  private currentMs = 0;
+  private timers = new Map<object, { at: number; fn: () => void }>();
+  readonly now = (): number => this.currentMs;
+  readonly setTimer = (fn: () => void, ms: number): object => {
+    const handle = {};
+    this.timers.set(handle, { at: this.currentMs + ms, fn });
+    return handle;
+  };
+  readonly clearTimer = (handle: unknown): void => { this.timers.delete(handle as object); };
+  advance(ms: number): void {
+    const target = this.currentMs + ms;
+    for (;;) {
+      let next: { handle: object; at: number; fn: () => void } | null = null;
+      for (const [handle, timer] of this.timers) {
+        if (timer.at <= target && (next === null || timer.at < next.at)) {
+          next = { handle, at: timer.at, fn: timer.fn };
+        }
+      }
+      if (next === null) break;
+      this.timers.delete(next.handle);
+      this.currentMs = next.at;
+      next.fn();
+    }
+    this.currentMs = target;
+  }
+}
+
+/** Collect every frame a client receives, for broadcast assertions. */
+function collector(client: Client): { frames: Frame[]; stop: () => void } {
+  const frames: Frame[] = [];
+  let running = true;
+  const loop = async (): Promise<void> => {
+    while (running) {
+      try { frames.push(await client.nextMessage(250)); } catch { /* keep polling */ }
+    }
+  };
+  void loop();
+  return { frames, stop: () => { running = false; } };
+}
+
+/** A fake adapter that replies to every deliver instantly with a unique
+ *  capture — the fuel for the auto chains. */
+async function autoReplyAdapter(url: string, token: string, name: 'astra' | 'codex')
+  : Promise<{ client: Client; delivers: Frame[]; stop: () => void }> {
+  const client = await openAdapter(url, token, name);
+  const delivers: Frame[] = [];
+  let running = true;
+  let n = 0;
+  const loop = async (): Promise<void> => {
+    while (running) {
+      let frame: Frame | null = null;
+      try { frame = await client.nextMessage(250); } catch { continue; }
+      if (frame.type === 'deliver') {
+        delivers.push(frame);
+        client.send({ type: 'delivered', messageId: frame.messageId });
+        n += 1;
+        client.send({ type: 'captured', body: `auto reply ${name} ${n}`, sourceRef: `m51-${name}-${n}` });
+      }
+    }
+  };
+  void loop();
+  return { client, delivers, stop: () => { running = false; } };
+}
+
+/** The standard M5.1 setup: auto mode + auto-send, a delivered hop-0 user
+ *  message to codex, and one codex capture at hop 1 → a pending row to
+ *  astra with a countdown armed. Polls until the row exists, so a loaded
+ *  parallel run cannot race it. Returns the captured message. */
+async function armCountdown(
+  engine: EngineHandle, gui: Client, codex: Client,
+): Promise<{ id: string; seconds: number }> {
+  gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoSend: true, autoSendDelaySec: 3 });
+  const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
+  engine.store.insertDelivery(seed.id, 'codex');
+  engine.store.markStatus(seed.id, 'codex', 'queued');
+  engine.store.markStatus(seed.id, 'codex', 'delivered');
+  codex.send({ type: 'captured', body: 'count me down', sourceRef: 'm51-arm-1' });
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    await pause(200);
+    const message = engine.store.recentMessages(1)[0];
+    if (message.id !== seed.id && engine.store.getDelivery(message.id, 'astra')?.status === 'pending_approval') {
+      return { id: message.id, seconds: 3 };
+    }
+    if (Date.now() > deadline) throw new Error(`armCountdown never settled; newest is ${message.body}`);
+  }
+}
+
+test('auto: the cap is never exceeded — the chain holds and never moves again', async () => {
+  const clock = new FakeClock();
+  await withEngine('autocap', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await autoReplyAdapter(url, token, 'codex');
+    const astra = await autoReplyAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoSend: true, autoSendDelaySec: 3 });
+    gui.send({ type: 'send', body: 'start the chain', targets: ['codex'] });
+    for (let round = 0; round < 12; round++) {
+      await pause(300);
+      clock.advance(3000);
+      await pause(300);
+    }
+    const delivers = [...codex.delivers, ...astra.delivers];
+    const hops = delivers.map((d) => Number(/hop (\d+)\]/.exec(String(d.text))?.[1] ?? 0));
+    assert.equal(delivers.length, 4, 'exactly four deliveries: the user turn plus three AI hops');
+    assert.deepEqual([...hops].sort((a, b) => a - b), [1, 2, 3, 4], 'header hops 1..4 — none pass the cap');
+    assert.equal(hops.every((h) => h <= 4), true, 'no delivered header hop exceeds the cap');
+    const held = guiLog.frames.filter((f) => f.type === 'routing_held');
+    assert.equal(held.length, 1, 'exactly one hold');
+    assert.equal(held[0].hop, 4, 'the hold fires at hop 4');
+    assert.equal(held[0].cap, 4);
+    assert.equal(guiLog.frames.filter((f) => f.type === 'countdown' && f.seconds === 3).length, 3,
+      'three countdowns started (hops 1, 2, 3)');
+    assert.equal(guiLog.frames.filter((f) => f.type === 'countdown' && f.seconds === null).length, 3,
+      'each countdown announced its end');
+    assert.equal(engine.store.getDelivery(String(held[0].messageId), 'codex'), null,
+      'the held message has no delivery row');
+    // Nothing moves however far the clock advances:
+    clock.advance(60000);
+    await pause(400);
+    clock.advance(60000);
+    await pause(400);
+    assert.equal([...codex.delivers, ...astra.delivers].length, 4, 'the hold froze the chain for good');
+    guiLog.stop(); codex.stop(); astra.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('auto with auto-send off: rows are created pending; nothing delivers without an approve', async () => {
+  const clock = new FakeClock();
+  await withEngine('autooff', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await autoReplyAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra'); // plain — never auto-delivered
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4 });
+    gui.send({ type: 'send', body: 'kick', targets: ['codex'] });
+    await pause(1000);
+    clock.advance(30000);
+    await pause(300);
+    const reply = engine.store.recentMessages(1)[0];
+    assert.equal(reply.source, 'codex', 'the codex reply was captured');
+    assert.equal(engine.store.getDelivery(reply.id, 'astra')?.status, 'pending_approval', 'the row waits');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown'), false, 'no countdown ever started');
+    await astra.expectSilence(300);
+    // The user's own approve is still the only way it moves:
+    gui.send({ type: 'approve', messageId: reply.id, target: 'astra' });
+    const deliver = await astra.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    astra.send({ type: 'delivered', messageId: reply.id });
+    await pause(300);
+    await astra.expectSilence(300);
+    guiLog.stop(); codex.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('auto-send: the countdown fires once after the delay and delivers once', async () => {
+  const clock = new FakeClock();
+  await withEngine('autoonce', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    assert.equal(engine.store.getDelivery(id, 'astra')?.status, 'pending_approval');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === 3), true, 'the countdown was announced');
+    clock.advance(2999); // one millisecond short
+    await pause(300);
+    await astra.expectSilence(300);
+    clock.advance(1);
+    await pause(400);
+    const deliver = await astra.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.ok(String(deliver.text).startsWith(`[Relay · from Codex · #${id} · hop 2]`), 'the usual header');
+    astra.send({ type: 'delivered', messageId: id });
+    await pause(300);
+    clock.advance(30000);
+    await pause(300);
+    await astra.expectSilence(300, ); // the timer fired once — nothing more
+    assert.equal(engine.store.getDelivery(id, 'astra')?.status, 'delivered');
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('auto-send: reject cancels the countdown — nothing delivers, the row is cancelled', async () => {
+  const clock = new FakeClock();
+  await withEngine('autocancel', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    gui.send({ type: 'reject', messageId: id, target: 'astra' });
+    await pause(400);
+    assert.equal(engine.store.getDelivery(id, 'astra')?.status, 'cancelled');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === null
+      && f.messageId === id), true, 'the cancel was announced');
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300);
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('auto-send: Send now delivers immediately, and the expiry does nothing after', async () => {
+  const clock = new FakeClock();
+  await withEngine('autosendnow', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    gui.send({ type: 'approve', messageId: id, target: 'astra' });
+    const deliver = await astra.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    astra.send({ type: 'delivered', messageId: id });
+    await pause(300);
+    clock.advance(60000); // the cleared timer never fires
+    await pause(300);
+    await astra.expectSilence(300);
+    assert.equal(engine.store.getDelivery(id, 'astra')?.status, 'delivered');
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('Stop cancels every countdown, leaves the rows pending; Resume starts nothing', async () => {
+  const clock = new FakeClock();
+  await withEngine('autostop', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    gui.send({ type: 'stop' });
+    await pause(400);
+    assert.equal(engine.store.getDelivery(id, 'astra')?.status, 'pending_approval',
+      'Stop leaves a pending row alone');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === null
+      && f.messageId === id), true, 'the countdown ended');
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300);
+    gui.send({ type: 'resume' });
+    await pause(300);
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300); // resume never restarts a timer
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('a turn-cap hold cancels every running countdown', async () => {
+  const clock = new FakeClock();
+  await withEngine('autoholdcancel', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    // cap 2, so a hop-2 capture is held while the hop-1 countdown runs
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 2, autoSend: true, autoSendDelaySec: 3 });
+    const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
+    engine.store.insertDelivery(seed.id, 'codex');
+    engine.store.markStatus(seed.id, 'codex', 'queued');
+    engine.store.markStatus(seed.id, 'codex', 'delivered');
+    codex.send({ type: 'captured', body: 'first hop', sourceRef: 'm51-hold-1' });
+    await pause(600);
+    const first = engine.store.recentMessages(1)[0];
+    assert.equal(engine.store.getDelivery(first.id, 'astra')?.status, 'pending_approval', 'the hop-1 row + countdown');
+    // make the next astra capture hop 2:
+    const seedA = engine.store.insertMessage({ source: 'codex', targets: ['user'], body: 'seed a', hop: 1 });
+    engine.store.insertDelivery(seedA.id, 'astra');
+    engine.store.markStatus(seedA.id, 'astra', 'queued');
+    engine.store.markStatus(seedA.id, 'astra', 'delivered');
+    astra.send({ type: 'captured', body: 'over the top', sourceRef: 'm51-hold-2' });
+    await pause(600);
+    const second = engine.store.recentMessages(1)[0];
+    assert.equal(guiLog.frames.some((f) => f.type === 'routing_held' && f.messageId === second.id
+      && f.hop === 2 && f.cap === 2), true, 'the hold was broadcast');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === null
+      && f.messageId === first.id), true, 'the running countdown was cancelled by the hold');
+    assert.equal(engine.store.getDelivery(first.id, 'astra')?.status, 'pending_approval', 'still pending');
+    assert.equal(engine.store.getDelivery(second.id, 'codex'), null, 'the held message has no row');
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300);
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('unticking auto_send and leaving Auto both cancel the countdowns', async () => {
+  const clock = new FakeClock();
+  await withEngine('autountick', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    // Part A — untick.
+    const first = await armCountdown(engine, gui, codex);
+    gui.send({ type: 'set_mode', autoSend: false });
+    await pause(400);
+    assert.equal(engine.store.getDelivery(first.id, 'astra')?.status, 'pending_approval');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === null
+      && f.messageId === first.id), true, 'the untick cancelled the countdown');
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300);
+    // Part B — tick again, arm a second countdown, then leave Auto entirely.
+    gui.send({ type: 'set_mode', autoSend: true });
+    await pause(300);
+    codex.send({ type: 'captured', body: 'second try', sourceRef: 'm51-untick-2' });
+    await pause(600);
+    const second = engine.store.recentMessages(1)[0];
+    assert.notEqual(second.id, first.id);
+    assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval');
+    gui.send({ type: 'set_mode', mode: 'manual' });
+    await pause(400);
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === null
+      && f.messageId === second.id), true, 'the mode change cancelled the countdown');
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300);
+    assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval');
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('a restart drops the countdowns; nothing resumes or re-creates', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-autorestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    const clock = new FakeClock();
+    { // Run 1: arm a countdown and die with it running.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath,
+        now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const codex = await openAdapter(url, token, 'codex');
+      await armCountdown(engine, gui, codex);
+      engine.stop();
+    }
+    { // Run 2: a fresh engine has no timers, and nothing is re-created.
+      const clock2 = new FakeClock();
+      const engine = await startEngine({ port: 0, dbPath, tokenPath,
+        now: clock2.now, setTimer: clock2.setTimer, clearTimer: clock2.clearTimer });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const astra = await openAdapter(url, token, 'astra');
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as {
+        countdowns?: unknown[]; held?: unknown[]; deliveries?: Array<{ status?: string }>;
+      };
+      assert.deepEqual(snapshot.countdowns, [], 'no countdowns survive a restart');
+      assert.deepEqual(snapshot.held, [], 'no holds survive a restart');
+      assert.equal(snapshot.deliveries?.some((d) => d.status === 'pending_approval'), true,
+        'the row came back pending, as ever');
+      clock2.advance(60000);
+      await pause(300);
+      await astra.expectSilence(300); // nothing resumed, nothing re-created
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('while stopped, an auto capture creates no row and no hold; Resume starts nothing', async () => {
+  const clock = new FakeClock();
+  await withEngine('autostopped', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'stop' });
+    await pause(300);
+    const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
+    engine.store.insertDelivery(seed.id, 'codex');
+    engine.store.markStatus(seed.id, 'codex', 'queued');
+    engine.store.markStatus(seed.id, 'codex', 'delivered');
+    codex.send({ type: 'captured', body: 'while stopped', sourceRef: 'm51-stopped-1' });
+    await pause(600);
+    const message = engine.store.recentMessages(1)[0];
+    assert.equal(message.body, 'while stopped', 'the capture is stored');
+    assert.equal(engine.store.getDelivery(message.id, 'astra'), null, 'no row while stopped');
+    assert.equal(guiLog.frames.some((f) => f.type === 'routing_held'), false, 'no hold while stopped');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown'), false, 'no countdown while stopped');
+    gui.send({ type: 'resume' });
+    await pause(300);
+    clock.advance(60000);
+    await pause(300);
+    await astra.expectSilence(300); // resume creates nothing, starts nothing
+    assert.equal(engine.store.getDelivery(message.id, 'astra'), null, 'still no row');
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('the expiry re-check: state set directly (bypassing set_mode) still stops the delivery', async () => {
+  const clock = new FakeClock();
+  await withEngine('autorecheck', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const first = await armCountdown(engine, gui, codex);
+    // Bypass the clearing path entirely: the engine's cached settings still
+    // say auto, but the store (the source of truth) says manual.
+    engine.store.setRelayMode('manual');
+    clock.advance(3000);
+    await pause(400);
+    assert.equal(engine.store.getDelivery(first.id, 'astra')?.status, 'pending_approval', 'nothing moved');
+    await astra.expectSilence(300);
+    // The same safety net for auto_send, again set directly:
+    engine.store.setRelayMode('auto');
+    codex.send({ type: 'captured', body: 'second wind', sourceRef: 'm51-recheck-2' });
+    await pause(600);
+    const second = engine.store.recentMessages(1)[0];
+    assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval');
+    engine.store.setAutoSend(false);
+    clock.advance(30000);
+    await pause(400);
+    assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval', 'still nothing');
+    await astra.expectSilence(300);
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('the outbound dedupe at expiry fails the row visibly', async () => {
+  const clock = new FakeClock();
+  await withEngine('autodedupe', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 10, autoSend: true, autoSendDelaySec: 3 });
+    // "D" was already delivered to astra moments ago:
+    const twin = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'D', hop: 1,
+      sourceRef: 'm51-dup-1' });
+    engine.store.insertDelivery(twin.id, 'astra');
+    engine.store.markStatus(twin.id, 'astra', 'queued');
+    engine.store.markStatus(twin.id, 'astra', 'delivered');
+    codex.send({ type: 'captured', body: 'D', sourceRef: 'm51-dup-2' }); // same text, other source
+    await pause(600);
+    const message = engine.store.recentMessages(1)[0];
+    assert.equal(message.body, 'D');
+    assert.equal(engine.store.getDelivery(message.id, 'astra')?.status, 'pending_approval');
+    clock.advance(3000);
+    await pause(400);
+    const row = engine.store.getDelivery(message.id, 'astra');
+    assert.equal(row?.status, 'failed', 'the dedupe fails the row');
+    assert.equal(row?.error, 'identical text was already sent to astra a moment ago');
+    assert.equal(guiLog.frames.some((f) => f.type === 'delivery_update' && f.status === 'failed'
+      && f.messageId === message.id), true, 'the failure was broadcast');
+    await astra.expectSilence(300);
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('codex approvals ride through an auto run untouched', async () => {
+  const clock = new FakeClock();
+  await withEngine('autoapprovals', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    // An approval arrives mid-countdown:
+    codex.send({ type: 'approval_request', requestId: 'req-51', kind: 'command_execution',
+      method: 'shell', summary: 'a smoke approval' });
+    await pause(400);
+    assert.equal(guiLog.frames.some((f) => f.type === 'approval_request' && f.requestId === 'req-51'),
+      true, 'the approval reached the GUI');
+    await codex.expectSilence(300); // the relay never answers on its own
+    clock.advance(3000); // the auto-send fires anyway — approvals delay nothing
+    await pause(400);
+    const deliver = await astra.nextMessage();
+    assert.equal(deliver.type, 'deliver', 'the countdown delivered despite the pending approval');
+    astra.send({ type: 'delivered', messageId: id });
+    await pause(300);
+    await codex.expectSilence(300); // still not answered after the delivery
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snapshot = await late.nextMessage() as { approvals?: Array<{ requestId?: string }> };
+    assert.equal(snapshot.approvals?.some((a) => a.requestId === 'req-51'), true, 'still pending');
+    // The only answering path is still the GUI's approval_answer:
+    gui.send({ type: 'approval_answer', requestId: 'req-51', decision: 'decline' });
+    const answer = await codex.nextMessage();
+    assert.equal(answer.type, 'approval_answer');
+    assert.equal(answer.requestId, 'req-51');
+    assert.equal(answer.decision, 'decline');
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('a new user message resets the chain after a hold', async () => {
+  const clock = new FakeClock();
+  await withEngine('autoreset', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 2, autoSend: true, autoSendDelaySec: 3 });
+    const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
+    engine.store.insertDelivery(seed.id, 'codex');
+    engine.store.markStatus(seed.id, 'codex', 'queued');
+    engine.store.markStatus(seed.id, 'codex', 'delivered');
+    codex.send({ type: 'captured', body: 'one', sourceRef: 'm51-reset-1' }); // hop 1 → routed
+    await pause(600);
+    clock.advance(3000); // delivered to astra
+    await pause(400);
+    const ack = await astra.nextMessage();
+    assert.equal(ack.type, 'deliver');
+    astra.send({ type: 'delivered', messageId: ack.messageId });
+    await pause(300);
+    astra.send({ type: 'captured', body: 'two', sourceRef: 'm51-reset-2' }); // hop 2 → held
+    await pause(600);
+    assert.equal(guiLog.frames.filter((f) => f.type === 'routing_held').length, 1, 'the chain hit the cap');
+    // A fresh user message resets the chain — it is hop 0:
+    gui.send({ type: 'send', body: 'fresh start', targets: ['codex'] });
+    const userDeliver = await codex.nextMessage();
+    assert.equal(userDeliver.type, 'deliver');
+    codex.send({ type: 'delivered', messageId: userDeliver.messageId });
+    await pause(300);
+    codex.send({ type: 'captured', body: 'reborn', sourceRef: 'm51-reset-3' }); // hop 1 again
+    await pause(600);
+    const reborn = engine.store.recentMessages(1)[0];
+    assert.equal(engine.store.getDelivery(reborn.id, 'astra')?.status, 'pending_approval',
+      'the reset chain routes again');
+    assert.equal(guiLog.frames.filter((f) => f.type === 'routing_held').length, 1, 'no second hold');
+    assert.equal(guiLog.frames.some((f) => f.type === 'countdown' && f.seconds === 3
+      && f.messageId === reborn.id), true, 'a new countdown started');
+    clock.advance(3000);
+    await pause(400);
+    const redeliver = await astra.nextMessage();
+    assert.ok(String(redeliver.text).includes('reborn'), 'the reset chain delivered');
+    guiLog.stop();
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+test('the snapshot carries countdowns and held', async () => {
+  const clock = new FakeClock();
+  await withEngine('autosnapshot', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    const { id } = await armCountdown(engine, gui, codex);
+    clock.advance(1000); // one second in
+    const midRun = await openClient(url, token);
+    midRun.send({ type: 'gui_hello' });
+    const mid = await midRun.nextMessage() as {
+      countdowns?: Array<{ messageId?: string; target?: string; secondsLeft?: number }>; held?: unknown[];
+    };
+    assert.deepEqual(mid.countdowns, [{ messageId: id, target: 'astra', secondsLeft: 2 }],
+      'a joining GUI sees the countdown with the seconds left');
+    assert.deepEqual(mid.held, []);
+    // Now an astra capture at hop 2 under cap 1 is held — and the hold
+    // cancels the running countdown. (The capture must come from the other
+    // side: a second codex capture would read as a fresh hop-0 chain.)
+    gui.send({ type: 'set_mode', turnCap: 1 });
+    await pause(300);
+    const seedA = engine.store.insertMessage({ source: 'codex', targets: ['user'], body: 'seed a', hop: 1 });
+    engine.store.insertDelivery(seedA.id, 'astra');
+    engine.store.markStatus(seedA.id, 'astra', 'queued');
+    engine.store.markStatus(seedA.id, 'astra', 'delivered');
+    astra.send({ type: 'captured', body: 'over now', sourceRef: 'm51-snap-2' });
+    await pause(600);
+    const afterHold = await openClient(url, token);
+    afterHold.send({ type: 'gui_hello' });
+    const after = await afterHold.nextMessage() as {
+      countdowns?: unknown[]; held?: Array<{ messageId?: string; hop?: number; cap?: number }>;
+    };
+    const heldMsg = engine.store.recentMessages(1)[0];
+    assert.deepEqual(after.countdowns, [], 'the hold cancelled the running countdown');
+    assert.equal(after.held?.length, 1, 'the hold rides in the snapshot');
+    assert.equal(after.held?.[0]?.messageId, heldMsg.id);
+    assert.equal(after.held?.[0]?.hop, 2);
+    assert.equal(after.held?.[0]?.cap, 1);
+  }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
 });
