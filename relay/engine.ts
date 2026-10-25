@@ -47,6 +47,9 @@
 //                                                                     ends or is cancelled by anything
 //   engine → GUI    {type:'routing_held', messageId, hop, cap}    M5.1: an Auto turn-cap hold;
 //                                                                     every countdown cancels
+//   engine → GUI    {type:'session_summary', turnsUsed, held,    M5.2: broadcast on any change
+//                    approvalsPending, since}                      of the three; one session is
+//                                                                     one engine run
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -174,6 +177,23 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   // M3.2b (D12-1): the stopped state is a persisted setting — a restarted
   // engine that was stopped stays stopped, until the user resumes.
   let paused = store.paused();
+
+  // M5.2 (D19): the per-session summary. A session is one engine run; the
+  // three numbers live here in memory only — nothing is persisted, nothing
+  // is replayed. turnsUsed counts stored AI captures; dropped duplicates
+  // and echoes never reach it.
+  const sessionStartedAt = new Date().toISOString();
+  let turnsUsed = 0;
+  const summaryView = (): { turnsUsed: number; held: number; approvalsPending: number; since: string } =>
+    ({ turnsUsed, held: heldMessages.length, approvalsPending: approvals.size, since: sessionStartedAt });
+  let lastSummarySent = '';
+  const broadcastSessionSummary = (): void => {
+    const view = summaryView();
+    const text = JSON.stringify(view);
+    if (text === lastSummarySent) return; // never broadcast when nothing changed
+    lastSummarySent = text;
+    broadcast({ type: 'session_summary', ...view });
+  };
   if (paused) {
     console.log('[engine] starting stopped — nothing delivers until the user resumes');
   }
@@ -240,6 +260,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       approvals.delete(requestId);
       broadcastApprovalResolved(requestId, decision);
     }
+    broadcastSessionSummary(); // M5.2: approvalsPending changed (a no-op guard if the list was empty)
   };
 
   const clearAckTimer = (messageId: string, target: Participant): void => {
@@ -400,6 +421,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     heldMessages.push({ messageId, hop, cap });
     broadcast({ type: 'routing_held', messageId, hop, cap });
     clearAllCountdowns(`turn cap reached (hop ${hop} >= cap ${cap})`);
+    broadcastSessionSummary(); // M5.2: the held count changed
     console.log(`[engine] routing held: ${messageId} at hop ${hop} (cap ${cap}) — manual Send only`);
   };
 
@@ -533,6 +555,12 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 initialStatus: 'captured',
               });
               broadcast({ type: 'transcript_update', message });
+              // M5.2 (D19): a stored AI capture is one used turn — duplicates
+              // and echoes were dropped above and never reach this line.
+              if (message.source !== 'user') {
+                turnsUsed += 1;
+                broadcastSessionSummary();
+              }
               // M4.2 (D16-3) + M5.1 (D18-2): approve_each and auto route
               // every stored AI capture to the other AI as a pending item.
               // Auto enforces the turn cap — an over-cap capture is held
@@ -659,6 +687,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] approval_answer for ${requestId}: the codex adapter is gone; the request died with it`);
             }
             broadcastApprovalResolved(requestId, decision);
+            broadcastSessionSummary(); // M5.2: approvalsPending changed
             return;
           }
           case 'thread': {
@@ -688,6 +717,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             };
             approvals.set(requestId, approval); // a re-sent id replaces its card
             broadcast({ type: 'approval_request', ...approval });
+            broadcastSessionSummary(); // M5.2: approvalsPending changed
             return;
           }
           case 'delivered':
@@ -754,6 +784,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 secondsLeft: Math.max(0, c.seconds - Math.floor((nowMs() - c.startedAtMs) / 1000)),
               })),
               held: [...heldMessages],
+              // M5.2: the per-session summary (in memory only).
+              summary: summaryView(),
             }));
             return;
           }

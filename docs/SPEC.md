@@ -133,13 +133,14 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `resume` | none — clears the stopped state |
 | GUI → engine | `approval_answer` | requestId, decision (accept or decline) |
 | GUI → engine | `gui_hello` | none — once, right after auth; marks the socket a GUI |
-| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool), `approvals` (the pending Codex approvals), `settings`, `countdowns` (the running auto-send timers, with seconds left) and `held` (the turn-cap holds) — sent once, to that socket only |
+| engine → GUI | `snapshot` | status per adapter + the newest 200 messages, also `deliveries`: every delivery row of the snapshot's messages whose target is not `user`, plus `paused` (bool), `approvals` (the pending Codex approvals), `settings`, `countdowns` (the running auto-send timers, with seconds left), `held` (the turn-cap holds) and `summary` (the session summary) — sent once, to that socket only |
 | engine → GUI | `transcript_update`, `status_update` | changed rows |
 | engine → GUI | `delivery_update` | message id, target, status, attempts, updatedAt, error if any |
 | engine → GUI | `countdown` | message id, target, seconds — the delay when a countdown starts, null when it ends or is cancelled by anything |
 | engine → GUI | `routing_held` | message id, hop, cap — an Auto-mode turn-cap hold; every countdown cancels; the manual Send still works |
 | engine → GUI | `pause_update` | paused (bool) — broadcast whenever the stopped state changes |
 | engine → GUI | `settings_update` | the full settings object — mode, turnCap, autoSend, autoSendDelaySec — broadcast on any change |
+| engine → GUI | `session_summary` | turnsUsed, held, approvalsPending, since (the engine start) — broadcast whenever any of the three changes; one session is one engine run, all in memory |
 | engine → GUI | `approval_request` | requestId, kind, summary, method — broadcast when a Codex approval arrives |
 | engine → GUI | `approval_resolved` | requestId, decision (accept / decline / lost / stopped) |
 

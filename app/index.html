@@ -101,6 +101,10 @@
     #export-note:empty { display: none; }
     #countdown-count { font-size: 12px; color: #e3b341; }
     #countdown-count:empty { display: none; }
+    #session-summary { padding: 6px 14px 10px 14px; font-size: 12px; color: #8b949e;
+                        border-top: 1px solid #26292d; }
+    #session-summary:empty { display: none; padding: 0; border-top: none; }
+    #session-summary.attention { color: #e3b341; }
     #search { position: fixed; top: 52px; right: 10px; width: 360px; max-height: 68%;
                overflow-y: auto; z-index: 30; background: #1b1e21; border: 1px solid #33373c;
                border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px;
@@ -195,6 +199,7 @@
     <div id="settings-hint"></div>
   </div>
   <div id="transcript"></div>
+  <div id="session-summary"></div>
   <div id="compose">
     <textarea id="compose-text" rows="2"
       placeholder="Write to the room — start with @astra, @codex or @both to pick a target; Enter sends, Shift+Enter is a newline"></textarea>

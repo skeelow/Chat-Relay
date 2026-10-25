@@ -58,6 +58,7 @@ import {
   applyCountdownFrame, autoSendControlsEnabled, countdownHeaderText, emptyCountdownState,
   heldNotice, heldNoticeHelp, pendingDecision, tickCountdowns, type CountdownState,
 } from './countdown.ts';
+import { summaryLine, type SessionSummary } from './summary.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
 const RECONNECT_MS = 2000;
@@ -116,6 +117,7 @@ const searchTotal = document.getElementById('search-total');
 const exportButton = document.getElementById('export-btn') as HTMLButtonElement | null;
 const exportNote = document.getElementById('export-note');
 const countdownCountEl = document.getElementById('countdown-count');
+const sessionSummaryEl = document.getElementById('session-summary');
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -138,6 +140,21 @@ let pendingExport: string | null = null;
 // holds shown as notices. The seconds tick locally; the server's null clears.
 let countdownState: CountdownState = emptyCountdownState();
 const heldNotices = new Map<string, { hop: number; cap: number }>();
+// M5.2: the session summary — server-fed only; the line is live-view only.
+let sessionSummary: SessionSummary | null = null;
+
+/** M5.2: the pinned session line, built only from the server's summary. */
+function renderSessionSummary(): void {
+  if (sessionSummaryEl === null) return;
+  const line = summaryLine(sessionSummary);
+  if (line === null) {
+    sessionSummaryEl.textContent = '';
+    sessionSummaryEl.classList.remove('attention');
+    return;
+  }
+  sessionSummaryEl.textContent = line.text;
+  sessionSummaryEl.classList.toggle('attention', line.approvalsEmphasised);
+}
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
@@ -553,6 +570,17 @@ function handleFrame(frame: Frame): void {
     }
     renderCountdownFooters();
     for (const messageId of heldNotices.keys()) renderDelivery(messageId);
+    // M5.2: the session line rides along with the catch-up.
+    if (frame.summary !== undefined && frame.summary !== null) {
+      const summary = frame.summary as { turnsUsed?: unknown; held?: unknown; approvalsPending?: unknown; since?: unknown };
+      sessionSummary = {
+        turnsUsed: typeof summary.turnsUsed === 'number' ? summary.turnsUsed : 0,
+        held: typeof summary.held === 'number' ? summary.held : 0,
+        approvalsPending: typeof summary.approvalsPending === 'number' ? summary.approvalsPending : 0,
+        since: typeof summary.since === 'string' ? summary.since : '',
+      };
+      renderSessionSummary();
+    }
     console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
     engineState('engine connected', true); // N3: the engine counts as connected only once the snapshot has arrived
     return;
@@ -625,6 +653,17 @@ function handleFrame(frame: Frame): void {
       renderDelivery(frame.messageId);
     }
     console.log(`[relay-gui] routing held: ${JSON.stringify(frame)}`);
+    return;
+  }
+  if (type === 'session_summary') {
+    // M5.2: the three live numbers; the line is built purely from them.
+    sessionSummary = {
+      turnsUsed: typeof frame.turnsUsed === 'number' ? frame.turnsUsed : 0,
+      held: typeof frame.held === 'number' ? frame.held : 0,
+      approvalsPending: typeof frame.approvalsPending === 'number' ? frame.approvalsPending : 0,
+      since: typeof frame.since === 'string' ? frame.since : '',
+    };
+    renderSessionSummary();
     return;
   }
   if (type === 'approval_request') {

@@ -44,41 +44,59 @@ class Client {
     });
   }
 
+  /** M5.2: session_summary broadcasts follow every stored AI capture, hold
+   *  and approval change. Tests written before M5.2 treat them as background
+   *  chatter; a collector sets this to false to see every frame. */
+  summaryTolerant = true;
+
   send(frame: Frame): void {
     this.socket.send(JSON.stringify(frame));
   }
 
   async nextMessage(timeoutMs = 3000): Promise<Frame> {
-    const queued = this.queue.shift();
-    if (queued !== undefined) return queued;
-    const frame = await new Promise<Frame | null>((resolve) => {
-      let wrapper: (m: Frame | null) => void;
-      const timer = setTimeout(() => {
-        const index = this.messageWaiters.indexOf(wrapper);
-        if (index !== -1) this.messageWaiters.splice(index, 1);
-        resolve(null);
-      }, timeoutMs);
-      wrapper = (message) => { clearTimeout(timer); resolve(message); };
-      this.messageWaiters.push(wrapper);
-    });
-    if (frame === null) throw new Error('timed out waiting for a message');
-    return frame;
+    for (;;) {
+      const queued = this.queue.shift();
+      if (queued !== undefined) {
+        if (queued.type === 'session_summary' && this.summaryTolerant) continue;
+        return queued;
+      }
+      const frame = await new Promise<Frame | null>((resolve) => {
+        let wrapper: (m: Frame | null) => void;
+        const timer = setTimeout(() => {
+          const index = this.messageWaiters.indexOf(wrapper);
+          if (index !== -1) this.messageWaiters.splice(index, 1);
+          resolve(null);
+        }, timeoutMs);
+        wrapper = (message) => { clearTimeout(timer); resolve(message); };
+        this.messageWaiters.push(wrapper);
+      });
+      if (frame === null) throw new Error('timed out waiting for a message');
+      if (frame.type === 'session_summary' && this.summaryTolerant) continue;
+      return frame;
+    }
   }
 
   async expectSilence(timeoutMs = 500): Promise<void> {
-    const queued = this.queue.shift();
-    if (queued !== undefined) throw new Error(`expected silence, got ${JSON.stringify(queued)}`);
-    const frame = await new Promise<Frame | null>((resolve) => {
-      let wrapper: (m: Frame | null) => void;
-      const timer = setTimeout(() => {
-        const index = this.messageWaiters.indexOf(wrapper);
-        if (index !== -1) this.messageWaiters.splice(index, 1);
-        resolve(null);
-      }, timeoutMs);
-      wrapper = (message) => { clearTimeout(timer); resolve(message); };
-      this.messageWaiters.push(wrapper);
-    });
-    if (frame !== null) throw new Error(`expected silence, got ${JSON.stringify(frame)}`);
+    for (;;) {
+      const queued = this.queue.shift();
+      if (queued !== undefined) {
+        if (queued.type === 'session_summary' && this.summaryTolerant) continue;
+        throw new Error(`expected silence, got ${JSON.stringify(queued)}`);
+      }
+      const frame = await new Promise<Frame | null>((resolve) => {
+        let wrapper: (m: Frame | null) => void;
+        const timer = setTimeout(() => {
+          const index = this.messageWaiters.indexOf(wrapper);
+          if (index !== -1) this.messageWaiters.splice(index, 1);
+          resolve(null);
+        }, timeoutMs);
+        wrapper = (message) => { clearTimeout(timer); resolve(message); };
+        this.messageWaiters.push(wrapper);
+      });
+      if (frame === null) return; // the window passed quietly
+      if (frame.type === 'session_summary' && this.summaryTolerant) continue;
+      throw new Error(`expected silence, got ${JSON.stringify(frame)}`);
+    }
   }
 
   async expectClosed(timeoutMs = 3000): Promise<number | null> {
@@ -2264,6 +2282,7 @@ class FakeClock {
 /** Collect every frame a client receives, for broadcast assertions. */
 function collector(client: Client): { frames: Frame[]; stop: () => void } {
   const frames: Frame[] = [];
+  client.summaryTolerant = false; // M5.2: collectors see every frame, summaries included
   let running = true;
   const loop = async (): Promise<void> => {
     while (running) {
@@ -2808,4 +2827,143 @@ test('the snapshot carries countdowns and held', async () => {
     assert.equal(after.held?.[0]?.hop, 2);
     assert.equal(after.held?.[0]?.cap, 1);
   }, { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+});
+
+// --- M5.2: the per-session summary line ---
+
+test('session summary: turnsUsed counts stored AI captures only', async () => {
+  await withEngine('summaryturns', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    // A stored AI capture counts:
+    astra.send({ type: 'captured', body: 'count me', sourceRef: 'm52-1' });
+    await pause(600);
+    assert.equal(engine.store.recentMessages(1)[0].source, 'astra');
+    const summaries = () => guiLog.frames.filter((f) => f.type === 'session_summary');
+    assert.equal(summaries().length, 1, 'one broadcast for one stored capture');
+    assert.equal(summaries()[0].turnsUsed, 1);
+    assert.equal(summaries()[0].held, 0);
+    assert.equal(summaries()[0].approvalsPending, 0);
+    assert.equal(typeof summaries()[0].since, 'string', 'the engine start time, ISO 8601');
+    // A duplicate capture is dropped by the store — nothing counts, nothing broadcasts:
+    astra.send({ type: 'captured', body: 'count me', sourceRef: 'm52-1' });
+    await pause(600);
+    assert.equal(summaries().length, 1);
+    // An echo is dropped too: deliver the user's text to codex, then codex
+    // "replies" with the same text — the echo rule eats it.
+    gui.send({ type: 'send', body: 'echo bait', targets: ['codex'] });
+    await pause(800);
+    codex.send({ type: 'captured', body: 'echo bait', sourceRef: 'm52-echo' });
+    await pause(600);
+    assert.equal(summaries().length, 1, 'the echo never counted');
+    // A user message is not an AI turn — the summary is unchanged by the
+    // send above, and a no-op frame changes nothing either:
+    gui.send({ type: 'approve', messageId: 'UNKNOWN', target: 'codex' });
+    await pause(600);
+    assert.equal(summaries().length, 1, 'nothing changed, nothing broadcast');
+    // The snapshot carries the same summary:
+    const late = await openClient(url, token);
+    late.send({ type: 'gui_hello' });
+    const snapshot = await late.nextMessage() as { summary?: { turnsUsed?: number; held?: number; approvalsPending?: number; since?: string } };
+    assert.equal(snapshot.summary?.turnsUsed, 1, 'the user message and the drops did not count');
+    assert.equal(snapshot.summary?.held, 0);
+    assert.equal(snapshot.summary?.approvalsPending, 0);
+    assert.equal(typeof snapshot.summary?.since, 'string');
+    guiLog.stop();
+  });
+});
+
+test('session summary: held and approvalsPending follow the live state', async () => {
+  await withEngine('summarylive', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const guiLog = collector(gui);
+    const codex = await openAdapter(url, token, 'codex');
+    // A hold (M5.1): auto, cap 1, a hop-1 capture is held.
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 1 });
+    const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
+    engine.store.insertDelivery(seed.id, 'codex');
+    engine.store.markStatus(seed.id, 'codex', 'queued');
+    engine.store.markStatus(seed.id, 'codex', 'delivered');
+    codex.send({ type: 'captured', body: 'over the cap', sourceRef: 'm52-hold-1' });
+    await pause(700);
+    const heldSummary = guiLog.frames.filter((f) => f.type === 'session_summary').find((f) => f.held === 1);
+    assert.notEqual(heldSummary, undefined, 'the hold is in the summary');
+    assert.equal(heldSummary?.turnsUsed, 1, 'the held capture still counts as a stored AI turn');
+    // Approvals arrive, are answered, arrive again, and Stop clears them:
+    codex.send({ type: 'approval_request', requestId: 'req-52a', kind: 'command_execution',
+      method: 'shell', summary: 'a summary' });
+    await pause(500);
+    assert.notEqual(guiLog.frames.find((f) => f.type === 'session_summary' && f.approvalsPending === 1), undefined,
+      'a waiting approval shows');
+    gui.send({ type: 'approval_answer', requestId: 'req-52a', decision: 'decline' });
+    await pause(500);
+    assert.notEqual(guiLog.frames.find((f) => f.type === 'session_summary' && f.approvalsPending === 0), undefined,
+      'answering clears it');
+    codex.send({ type: 'approval_request', requestId: 'req-52b', kind: 'command_execution',
+      method: 'shell', summary: 'another' });
+    await pause(500);
+    gui.send({ type: 'stop' });
+    await pause(500);
+    assert.notEqual(guiLog.frames.find((f) => f.type === 'session_summary' && f.approvalsPending === 0
+      && f.held === 1), undefined, 'Stop resolves the approval and the hold count survives');
+    // A lost approval (the adapter disconnects while one waits):
+    gui.send({ type: 'resume' });
+    await pause(300);
+    codex.send({ type: 'approval_request', requestId: 'req-52c', kind: 'command_execution',
+      method: 'shell', summary: 'third' });
+    await pause(500);
+    assert.notEqual(guiLog.frames.find((f) => f.type === 'session_summary' && f.approvalsPending === 1), undefined);
+    codex.close();
+    await pause(700);
+    assert.notEqual(guiLog.frames.find((f) => f.type === 'session_summary' && f.approvalsPending === 0), undefined,
+      'the disconnect lost the approval and the summary followed');
+    guiLog.stop();
+  });
+});
+
+test('session summary: nothing is persisted — a restarted engine starts from zero', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-summaryrestart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    let firstSince: string | undefined;
+    { // Run 1: two stored captures, then a no-op that must not broadcast.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      const guiLog = collector(gui);
+      const astra = await openAdapter(url, token, 'astra');
+      astra.send({ type: 'captured', body: 'one', sourceRef: 'm52-r1' });
+      astra.send({ type: 'captured', body: 'two', sourceRef: 'm52-r2' });
+      await pause(800);
+      assert.equal(guiLog.frames.filter((f) => f.type === 'session_summary').length, 2,
+        'a broadcast per change, and none for anything else');
+      gui.send({ type: 'reject', messageId: 'UNKNOWN', target: 'astra' }); // a no-op: nothing changes
+      await pause(600);
+      assert.equal(guiLog.frames.filter((f) => f.type === 'session_summary').length, 2,
+        'no broadcast when nothing changed');
+      firstSince = String(guiLog.frames.find((f) => f.type === 'session_summary')?.since);
+      guiLog.stop();
+      engine.stop();
+    }
+    { // Run 2: zero again, with a new session start time.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { summary?: { turnsUsed?: number; held?: number; approvalsPending?: number; since?: string } };
+      assert.equal(snapshot.summary?.turnsUsed, 0, 'nothing is replayed into the new session');
+      assert.equal(snapshot.summary?.held, 0);
+      assert.equal(snapshot.summary?.approvalsPending, 0);
+      assert.notEqual(snapshot.summary?.since, firstSince, 'a new session has a new start time');
+      assert.equal((snapshot.summary?.since ?? '') > (firstSince ?? ''), true, 'the new session started later');
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
 });

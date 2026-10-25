@@ -320,6 +320,19 @@
     return { label: "Waiting for your approval", approveLabel: "Approve", rejectLabel: "Reject" };
   }
 
+  // app/src/summary.ts
+  function summaryLine(summary, locale = "en-GB") {
+    if (summary === null) return null;
+    const since = new Date(summary.since);
+    const time = Number.isNaN(since.getTime()) ? summary.since : since.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+    const turns = summary.turnsUsed === 1 ? "1 AI turn" : `${summary.turnsUsed} AI turns`;
+    const approvals = summary.approvalsPending === 1 ? "1 approval waiting" : `${summary.approvalsPending} approvals waiting`;
+    return {
+      text: `Session since ${time} \xB7 ${turns} \xB7 ${summary.held} held \xB7 ${approvals}`,
+      approvalsEmphasised: summary.approvalsPending > 0
+    };
+  }
+
   // app/src/renderer.ts
   var ENGINE_URL = "ws://127.0.0.1:8787";
   var RECONNECT_MS = 2e3;
@@ -356,6 +369,7 @@
   var exportButton = document.getElementById("export-btn");
   var exportNote = document.getElementById("export-note");
   var countdownCountEl = document.getElementById("countdown-count");
+  var sessionSummaryEl = document.getElementById("session-summary");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
@@ -366,6 +380,18 @@
   var pendingExport = null;
   var countdownState = emptyCountdownState();
   var heldNotices = /* @__PURE__ */ new Map();
+  var sessionSummary = null;
+  function renderSessionSummary() {
+    if (sessionSummaryEl === null) return;
+    const line = summaryLine(sessionSummary);
+    if (line === null) {
+      sessionSummaryEl.textContent = "";
+      sessionSummaryEl.classList.remove("attention");
+      return;
+    }
+    sessionSummaryEl.textContent = line.text;
+    sessionSummaryEl.classList.toggle("attention", line.approvalsEmphasised);
+  }
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
@@ -711,6 +737,16 @@
       }
       renderCountdownFooters();
       for (const messageId of heldNotices.keys()) renderDelivery(messageId);
+      if (frame.summary !== void 0 && frame.summary !== null) {
+        const summary = frame.summary;
+        sessionSummary = {
+          turnsUsed: typeof summary.turnsUsed === "number" ? summary.turnsUsed : 0,
+          held: typeof summary.held === "number" ? summary.held : 0,
+          approvalsPending: typeof summary.approvalsPending === "number" ? summary.approvalsPending : 0,
+          since: typeof summary.since === "string" ? summary.since : ""
+        };
+        renderSessionSummary();
+      }
       console.log(`[relay-gui] snapshot: ${messages.length} messages, statuses ${JSON.stringify(statuses)}`);
       engineState("engine connected", true);
       return;
@@ -769,6 +805,16 @@
         renderDelivery(frame.messageId);
       }
       console.log(`[relay-gui] routing held: ${JSON.stringify(frame)}`);
+      return;
+    }
+    if (type === "session_summary") {
+      sessionSummary = {
+        turnsUsed: typeof frame.turnsUsed === "number" ? frame.turnsUsed : 0,
+        held: typeof frame.held === "number" ? frame.held : 0,
+        approvalsPending: typeof frame.approvalsPending === "number" ? frame.approvalsPending : 0,
+        since: typeof frame.since === "string" ? frame.since : ""
+      };
+      renderSessionSummary();
       return;
     }
     if (type === "approval_request") {
