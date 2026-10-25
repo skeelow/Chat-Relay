@@ -290,6 +290,11 @@ export interface RelayStore {
   recentIdenticalDelivery(contentHash: string, target: Participant, excludeMessageId: string): DeliveryView | null;
   /** Every delivery not yet settled: queued, pending_approval or delivering. */
   pendingDeliveries(): PendingDelivery[];
+  /** M4.3 (D17-2): case-insensitive substring search over message bodies,
+   *  parameterised, with %, _ and the escape character escaped so they all
+   *  match literally. Newest `limit` matches, newest first, plus the total
+   *  count across the whole history. */
+  searchMessages(query: string, limit: number): { messages: RelayMessage[]; total: number };
   /** The newest `limit` messages, oldest first (ids are ULIDs, so id order is
    *  time order). Targets are rebuilt from the deliveries rows, sorted.
    *  A limit <= 0 returns nothing (SQLite would read a negative LIMIT as
@@ -645,6 +650,46 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     }));
   };
 
+  const searchMessages = (query: string, limit: number): { messages: RelayMessage[]; total: number } => {
+    if (limit <= 0) return { messages: [], total: 0 };
+    // M4.3 (D17-2): a parameterised LIKE — %, _ and the escape character in
+    // the user's text are escaped, so they always match literally. LIKE
+    // folds case for ASCII; ULID order is time order, so id DESC is
+    // newest-first without touching created_at formatting.
+    const pattern = `%${query.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+    const total = (db.prepare(
+      `SELECT COUNT(*) AS n FROM messages WHERE body LIKE ? ESCAPE '\\'`
+    ).get(pattern) as { n: number }).n;
+    const rows = db.prepare(
+      `SELECT id, source, body, content_hash, source_ref, hop, created_at
+         FROM messages WHERE body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?`
+    ).all(pattern, limit) as Record<string, unknown>[];
+    if (rows.length === 0) return { messages: [], total };
+    const placeholders = rows.map(() => '?').join(', ');
+    const deliveryRows = db.prepare(
+      `SELECT message_id, target FROM deliveries
+        WHERE message_id IN (${placeholders}) ORDER BY message_id, target`
+    ).all(...rows.map((row) => row.id as string)) as Record<string, unknown>[];
+    const targetsById = new Map<string, Participant[]>();
+    for (const row of deliveryRows) {
+      const id = row.message_id as string;
+      const list = targetsById.get(id);
+      if (list !== undefined) list.push(row.target as Participant);
+      else targetsById.set(id, [row.target as Participant]);
+    }
+    const messages = rows.map((row) => ({
+      id: row.id as string,
+      source: row.source as Participant,
+      targets: targetsById.get(row.id as string) ?? [],
+      body: row.body as string,
+      contentHash: row.content_hash as string,
+      ...(row.source_ref !== null ? { sourceRef: row.source_ref as string } : {}),
+      hop: row.hop as number,
+      createdAt: row.created_at as string,
+    }));
+    return { messages, total };
+  };
+
   return {
     insertMessage,
     markStatus,
@@ -670,6 +715,7 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     recentIdenticalDelivery,
     pendingDeliveries,
     recentMessages,
+    searchMessages,
     isDuplicate,
     close: () => db.close(),
   };

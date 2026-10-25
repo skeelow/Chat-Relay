@@ -2148,3 +2148,74 @@ test('approve_each: switching the mode back-fills nothing, and a restart replays
     cleanupDir(dir);
   }
 });
+
+// --- M4.3: transcript search and Markdown export ---
+
+test('search: GUI-only, the query validated, and the result reaches the asking socket only', async () => {
+  await withEngine('search', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const other = await openGui(url, token);
+    const stranger = await openClient(url, token); // authenticated, never greeted
+
+    const plant = (body: string, hop: number): string =>
+      engine.store.insertMessage({ source: 'astra', targets: ['user'], body, hop }).id;
+    plant('the needle is sharp', 0);
+    plant('no match in this one', 0);
+    const newest = plant('needle again', 1);
+
+    stranger.send({ type: 'search', requestId: 'r0', query: 'needle' });
+    await gui.expectSilence(300); // non-GUI sockets are ignored
+
+    gui.send({ type: 'search', requestId: '', query: 'needle' }); // a bad requestId
+    gui.send({ type: 'search', requestId: 'r1', query: '   ' }); // empty after trim
+    gui.send({ type: 'search', requestId: 'r2', query: 'x'.repeat(201) }); // over 200
+    await gui.expectSilence(300);
+    await other.expectSilence(300);
+
+    gui.send({ type: 'search', requestId: 'r3', query: '  needle  ' });
+    const result = await gui.nextMessage() as {
+      type?: string; requestId?: string; total?: number;
+      messages?: Array<{ id?: string; body?: string; hop?: number }>;
+    };
+    assert.equal(result.type, 'search_result');
+    assert.equal(result.requestId, 'r3');
+    assert.equal(result.total, 2);
+    assert.deepEqual(result.messages?.map((m) => m.body), ['needle again', 'the needle is sharp'],
+      'the newest 100 matches, newest first');
+    assert.equal(result.messages?.[0]?.id, newest);
+    assert.equal(result.messages?.[0]?.hop, 1, 'the rows are full messages');
+    await other.expectSilence(300); // nobody else sees it
+  });
+});
+
+test('export: GUI-only, and export_result reaches the asking socket only', async () => {
+  await withEngine('export', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const other = await openGui(url, token);
+    const stranger = await openClient(url, token);
+
+    engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'searchable prose', hop: 0 });
+    const second = engine.store.insertMessage({ source: 'codex', targets: ['user'], body: 'a reply with ``` fences', hop: 1 });
+    engine.store.insertDelivery(second.id, 'astra'); // a pending row rides along as a Delivery line
+
+    stranger.send({ type: 'export', requestId: 'r0' });
+    await gui.expectSilence(300); // non-GUI sockets are ignored
+    gui.send({ type: 'export', requestId: '' }); // a bad requestId is ignored
+    await gui.expectSilence(300);
+
+    gui.send({ type: 'export', requestId: 'r1' });
+    const result = await gui.nextMessage() as {
+      type?: string; requestId?: string; markdown?: string; messageCount?: number;
+    };
+    assert.equal(result.type, 'export_result');
+    assert.equal(result.requestId, 'r1');
+    assert.equal(result.messageCount, 2);
+    assert.ok(result.markdown?.startsWith('# Relay Chat transcript'), 'the engine builds the Markdown');
+    assert.ok(result.markdown?.includes('searchable prose'), 'oldest message included');
+    assert.ok(result.markdown?.includes('a reply with ``` fences'), 'the fenced body is verbatim');
+    assert.ok(result.markdown?.includes(`Delivery: astra pending_approval`), 'the delivery rows are in it');
+    assert.ok(result.markdown?.includes(`### You —`), 'sender labels');
+    await other.expectSilence(300); // nobody else sees it
+    assert.equal(engine.store.getDelivery(second.id, 'astra')?.status, 'pending_approval', 'export changed nothing');
+  });
+});

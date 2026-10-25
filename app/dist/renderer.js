@@ -190,6 +190,52 @@
     return { ok: true, body: rest, targets: TARGETS_OF[choice] };
   }
 
+  // app/src/search.ts
+  function isSearchQueryValid(query) {
+    const trimmed = query.trim();
+    return trimmed.length >= 1 && trimmed.length <= 200;
+  }
+  function searchFrame(requestId, query) {
+    return { type: "search", requestId, query: query.trim() };
+  }
+  function exportFrame(requestId) {
+    return { type: "export", requestId };
+  }
+  function snippetAround(body, query, radius = 40) {
+    const at = body.toLowerCase().indexOf(query.trim().toLowerCase());
+    const qLen = query.trim().length;
+    if (at < 0) {
+      return body.length <= radius * 2 ? body : `\u2026${body.slice(0, radius * 2 - 1)}\u2026`;
+    }
+    const start = Math.max(0, at - radius);
+    const end = Math.min(body.length, at + qLen + radius);
+    return `${start > 0 ? "\u2026" : ""}${body.slice(start, end)}${end < body.length ? "\u2026" : ""}`;
+  }
+  function emptySearchState() {
+    return { open: false, requestId: null, query: "", results: [], total: 0 };
+  }
+  function startSearch(state, requestId, query) {
+    void state;
+    return { open: true, requestId, results: [], total: 0, query };
+  }
+  function applySearchResult(state, frame) {
+    if (!state.open || frame.requestId !== state.requestId) return null;
+    const messages = Array.isArray(frame.messages) ? frame.messages : [];
+    const query = state.query ?? "";
+    const results = messages.slice(0, 100).map((message) => ({
+      id: String(message.id ?? ""),
+      source: String(message.source ?? ""),
+      createdAt: String(message.createdAt ?? ""),
+      body: String(message.body ?? ""),
+      snippet: snippetAround(String(message.body ?? ""), query)
+    }));
+    return { ...state, results, total: typeof frame.total === "number" ? frame.total : results.length };
+  }
+  function closeSearch(state) {
+    void state;
+    return emptySearchState();
+  }
+
   // app/src/settings.ts
   var TURN_CAP_MIN = 1;
   var TURN_CAP_MAX = 50;
@@ -250,12 +296,21 @@
   var autoSendInput = document.getElementById("auto-send");
   var autoSendDelayInput = document.getElementById("auto-send-delay");
   var autoSendUnitInput = document.getElementById("auto-send-unit");
+  var searchButton = document.getElementById("search-btn");
+  var searchPanel = document.getElementById("search");
+  var searchInput = document.getElementById("search-input");
+  var searchResults = document.getElementById("search-results");
+  var searchTotal = document.getElementById("search-total");
+  var exportButton = document.getElementById("export-btn");
+  var exportNote = document.getElementById("export-note");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
   var paused = false;
   var approvalState = emptyApprovalsState();
   var relaySettings = null;
+  var searchState = emptySearchState();
+  var pendingExport = null;
   var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
@@ -265,6 +320,9 @@
     if (composeTarget !== null) composeTarget.disabled = !on;
     if (composeSend !== null) composeSend.disabled = !on;
     if (settingsButton !== null) settingsButton.disabled = !on;
+    if (searchButton !== null) searchButton.disabled = !on;
+    if (searchInput !== null) searchInput.disabled = !on;
+    if (exportButton !== null) exportButton.disabled = !on;
     if (modeManualInput !== null) modeManualInput.disabled = !on;
     if (modeApproveInput !== null) modeApproveInput.disabled = !on;
     if (turnCapInput !== null) turnCapInput.disabled = !on;
@@ -291,6 +349,7 @@
     if (approvalsBadge !== null) {
       approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
     }
+    reportTray();
   }
   function renderSettings() {
     if (relaySettings === null) return;
@@ -304,6 +363,51 @@
     if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
     if (settingsHint !== null) settingsHint.textContent = "";
     console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
+  }
+  function renderSearchPanel() {
+    if (searchPanel !== null) searchPanel.hidden = !searchState.open;
+    if (searchResults === null) return;
+    searchResults.textContent = "";
+    if (searchTotal !== null) searchTotal.textContent = "";
+    if (!searchState.open) return;
+    if (searchTotal !== null) {
+      searchTotal.textContent = searchState.total > searchState.results.length ? `${searchState.results.length} of ${searchState.total} matches (newest first)` : `${searchState.results.length} ${searchState.results.length === 1 ? "match" : "matches"} (newest first)`;
+    }
+    for (const hit of searchState.results) {
+      const item = document.createElement("div");
+      item.className = "search-hit";
+      const meta = document.createElement("div");
+      meta.className = "search-hit-meta";
+      meta.textContent = `${SENDER_LABELS[hit.source] ?? hit.source} \u2014 ${hit.createdAt}`;
+      const snippet = document.createElement("div");
+      snippet.className = "search-hit-snippet";
+      snippet.textContent = hit.snippet;
+      item.append(meta, snippet);
+      item.addEventListener("click", () => {
+        const loaded = document.getElementById(hit.id);
+        if (loaded !== null) {
+          loaded.scrollIntoView({ block: "center" });
+          loaded.classList.add("found");
+          setTimeout(() => loaded.classList.remove("found"), 1200);
+          return;
+        }
+        const existing = item.querySelector(".search-hit-full");
+        if (existing !== null) {
+          existing.remove();
+          return;
+        }
+        const full = document.createElement("div");
+        full.className = "search-hit-full";
+        full.textContent = hit.body;
+        item.append(full);
+      });
+      searchResults.append(item);
+    }
+  }
+  function reportTray() {
+    const pending = pendingCount([...deliveryState.rows.values()]);
+    const approvals = visibleApprovals(approvalState).length;
+    preload?.reportTrayCounts(pending, approvals);
   }
   function appendDismissButton(actions, requestId) {
     const button = document.createElement("button");
@@ -377,6 +481,7 @@
     shown.add(message.id);
     const row = document.createElement("div");
     row.className = `msg ${message.source}`;
+    row.id = message.id;
     const sender = document.createElement("div");
     sender.className = "sender";
     sender.textContent = SENDER_LABELS[message.source] ?? message.source;
@@ -469,6 +574,7 @@
     if (pendingBadge === null) return;
     const count = pendingCount([...deliveryState.rows.values()]);
     pendingBadge.textContent = count === 0 ? "" : `${count} pending`;
+    reportTray();
   }
   function sendFrameToEngine(frame) {
     if (socket !== null && socket.readyState === WebSocket.OPEN) {
@@ -511,6 +617,29 @@
         autoSendDelaySec: typeof frame.autoSendDelaySec === "number" ? frame.autoSendDelaySec : 10
       };
       renderSettings();
+      return;
+    }
+    if (type === "search_result") {
+      const next = applySearchResult(searchState, frame);
+      if (next !== null) {
+        searchState = next;
+        renderSearchPanel();
+        console.log(`[relay-gui] search results: ${next.results.length} of ${next.total}`);
+      }
+      return;
+    }
+    if (type === "export_result") {
+      if (typeof frame.requestId === "string" && frame.requestId === pendingExport) {
+        const markdown = typeof frame.markdown === "string" ? frame.markdown : "";
+        const count = typeof frame.messageCount === "number" ? frame.messageCount : 0;
+        pendingExport = null;
+        void Promise.resolve(preload?.saveExport(markdown)).then((path) => {
+          if (exportNote !== null) {
+            exportNote.textContent = path === null || path === void 0 ? "Export cancelled" : `Saved ${count} messages: ${path}`;
+          }
+          console.log(`[relay-gui] export ${path === null || path === void 0 ? "cancelled" : `saved to ${path}`}`);
+        });
+      }
       return;
     }
     if (type === "approval_request") {
@@ -690,6 +819,59 @@
   if (autoSendUnitInput !== null) {
     autoSendUnitInput.disabled = true;
     autoSendUnitInput.addEventListener("change", submitDelay);
+  }
+  var submitSearch = () => {
+    if (searchInput === null) return;
+    const query = searchInput.value;
+    if (!isSearchQueryValid(query)) return;
+    const requestId = crypto.randomUUID();
+    searchState = startSearch(searchState, requestId, query);
+    renderSearchPanel();
+    sendFrameToEngine(searchFrame(requestId, query));
+  };
+  var closeSearchPanel = () => {
+    searchState = closeSearch(searchState);
+    renderSearchPanel();
+  };
+  if (searchButton !== null) {
+    searchButton.disabled = true;
+    searchButton.addEventListener("click", () => {
+      if (searchPanel === null) return;
+      if (searchState.open) {
+        closeSearchPanel();
+        return;
+      }
+      searchState = startSearch(searchState, crypto.randomUUID(), "");
+      renderSearchPanel();
+      searchInput?.focus();
+    });
+  }
+  if (searchInput !== null) {
+    searchInput.disabled = true;
+    searchInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submitSearch();
+      }
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && searchState.open) closeSearchPanel();
+  });
+  var searchClear = document.getElementById("search-clear");
+  if (searchClear !== null) {
+    searchClear.addEventListener("click", () => {
+      if (searchInput !== null) searchInput.value = "";
+      closeSearchPanel();
+    });
+  }
+  if (exportButton !== null) {
+    exportButton.disabled = true;
+    exportButton.addEventListener("click", () => {
+      pendingExport = crypto.randomUUID();
+      if (exportNote !== null) exportNote.textContent = "Building the export\u2026";
+      sendFrameToEngine(exportFrame(pendingExport));
+    });
   }
   connect();
 })();

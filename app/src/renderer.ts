@@ -47,6 +47,10 @@ import {
 } from './deliveries.ts';
 import { parseCompose } from './compose.ts';
 import {
+  applySearchResult, closeSearch, emptySearchState, exportFrame, isSearchQueryValid,
+  searchFrame, startSearch, type SearchState,
+} from './search.ts';
+import {
   delayToSeconds, isDelayValid, isTurnCapValid, modeLabel, setModeFrame, settingsControls,
   type RelaySettings,
 } from './settings.ts';
@@ -68,7 +72,13 @@ interface GuiMessage {
 
 interface Frame { [key: string]: unknown; }
 
-interface PreloadApi { getToken(): Promise<string | null>; }
+interface PreloadApi {
+  getToken(): Promise<string | null>;
+  /** M4.3 (D17-3): the one narrow file API — the export save dialog. */
+  saveExport(markdown: string): Promise<string | null>;
+  /** M4.3 (D17-4): the tray tooltip counts, reported as the state changes. */
+  reportTrayCounts(pending: number, approvals: number): void;
+}
 const preload = (window as unknown as { relay?: PreloadApi }).relay;
 
 const shown = new Set<string>(); // message ids already on screen
@@ -93,6 +103,13 @@ const turnCapInput = document.getElementById('turn-cap') as HTMLInputElement | n
 const autoSendInput = document.getElementById('auto-send') as HTMLInputElement | null;
 const autoSendDelayInput = document.getElementById('auto-send-delay') as HTMLInputElement | null;
 const autoSendUnitInput = document.getElementById('auto-send-unit') as HTMLSelectElement | null;
+const searchButton = document.getElementById('search-btn') as HTMLButtonElement | null;
+const searchPanel = document.getElementById('search');
+const searchInput = document.getElementById('search-input') as HTMLInputElement | null;
+const searchResults = document.getElementById('search-results');
+const searchTotal = document.getElementById('search-total');
+const exportButton = document.getElementById('export-btn') as HTMLButtonElement | null;
+const exportNote = document.getElementById('export-note');
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -106,6 +123,11 @@ let paused = false;
 let approvalState = emptyApprovalsState();
 // M4.2: the relay settings — only snapshot.settings and settings_update.
 let relaySettings: RelaySettings | null = null;
+// M4.3: the search panel — the engine answers, the pure state machine in
+// search.ts decides what is current (a new query supersedes an older one).
+let searchState: SearchState = emptySearchState();
+// M4.3: the export in flight, matched by requestId when it comes back.
+let pendingExport: string | null = null;
 
 const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
 
@@ -117,6 +139,9 @@ function engineState(label: string, on: boolean): void {
   if (composeTarget !== null) composeTarget.disabled = !on;
   if (composeSend !== null) composeSend.disabled = !on;
   if (settingsButton !== null) settingsButton.disabled = !on; // M4.2: the settings panel too
+  if (searchButton !== null) searchButton.disabled = !on; // M4.3: search needs the engine
+  if (searchInput !== null) searchInput.disabled = !on;
+  if (exportButton !== null) exportButton.disabled = !on; // M4.3: so does export
   if (modeManualInput !== null) modeManualInput.disabled = !on;
   if (modeApproveInput !== null) modeApproveInput.disabled = !on;
   if (turnCapInput !== null) turnCapInput.disabled = !on;
@@ -148,6 +173,7 @@ function updateApprovalsBadge(): void {
   if (approvalsBadge !== null) {
     approvalsBadge.textContent = approvalsBadgeText(visibleApprovals(approvalState).length);
   }
+  reportTray(); // M4.3: the tray tooltip rides every count change
 }
 
 /** M4.2: apply the server's settings to the panel — the only writer of the
@@ -165,6 +191,59 @@ function renderSettings(): void {
   if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
   if (settingsHint !== null) settingsHint.textContent = '';
   console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
+}
+
+/** M4.3: the search panel over the transcript — sender, time and a snippet
+ *  per hit. Clicking a hit scrolls to the message if it is loaded, else
+ *  the full text unfolds right here in the panel. */
+function renderSearchPanel(): void {
+  if (searchPanel !== null) searchPanel.hidden = !searchState.open;
+  if (searchResults === null) return;
+  searchResults.textContent = '';
+  if (searchTotal !== null) searchTotal.textContent = '';
+  if (!searchState.open) return;
+  if (searchTotal !== null) {
+    searchTotal.textContent = searchState.total > searchState.results.length
+      ? `${searchState.results.length} of ${searchState.total} matches (newest first)`
+      : `${searchState.results.length} ${searchState.results.length === 1 ? 'match' : 'matches'} (newest first)`;
+  }
+  for (const hit of searchState.results) {
+    const item = document.createElement('div');
+    item.className = 'search-hit';
+    const meta = document.createElement('div');
+    meta.className = 'search-hit-meta';
+    meta.textContent = `${SENDER_LABELS[hit.source] ?? hit.source} — ${hit.createdAt}`;
+    const snippet = document.createElement('div');
+    snippet.className = 'search-hit-snippet';
+    snippet.textContent = hit.snippet;
+    item.append(meta, snippet);
+    item.addEventListener('click', () => {
+      const loaded = document.getElementById(hit.id);
+      if (loaded !== null) {
+        loaded.scrollIntoView({ block: 'center' });
+        loaded.classList.add('found');
+        setTimeout(() => loaded.classList.remove('found'), 1200);
+        return;
+      }
+      // Older than the snapshot window: show the full text in the panel.
+      const existing = item.querySelector('.search-hit-full');
+      if (existing !== null) { existing.remove(); return; }
+      const full = document.createElement('div');
+      full.className = 'search-hit-full';
+      full.textContent = hit.body;
+      item.append(full);
+    });
+    searchResults.append(item);
+  }
+}
+
+/** M4.3 (D17-4): the tray tooltip follows the GUI state — the renderer owns
+ *  the counts, the main process owns the tray. Reported on every change to
+ *  either list. */
+function reportTray(): void {
+  const pending = pendingCount([...deliveryState.rows.values()]);
+  const approvals = visibleApprovals(approvalState).length;
+  preload?.reportTrayCounts(pending, approvals);
 }
 
 /** M4.1 (N4): the local Dismiss on a card the relay cannot answer. Purely
@@ -246,6 +325,7 @@ function appendMessage(message: GuiMessage): void {
   shown.add(message.id);
   const row = document.createElement('div');
   row.className = `msg ${message.source}`;
+  row.id = message.id; // M4.3: search results scroll to it by id
   const sender = document.createElement('div');
   sender.className = 'sender';
   sender.textContent = SENDER_LABELS[message.source] ?? message.source;
@@ -364,6 +444,7 @@ function updatePendingBadge(): void {
   if (pendingBadge === null) return;
   const count = pendingCount([...deliveryState.rows.values()]);
   pendingBadge.textContent = count === 0 ? '' : `${count} pending`;
+  reportTray(); // M4.3: the tray tooltip rides every count change
 }
 
 /** Send one frame if the engine link is up; report whether it went out (M4.1:
@@ -417,6 +498,35 @@ function handleFrame(frame: Frame): void {
       autoSendDelaySec: typeof frame.autoSendDelaySec === 'number' ? frame.autoSendDelaySec : 10,
     };
     renderSettings();
+    return;
+  }
+  if (type === 'search_result') {
+    // M4.3: the pure state machine drops stale requestIds; a live one
+    // re-renders the panel.
+    const next = applySearchResult(searchState, frame);
+    if (next !== null) {
+      searchState = next;
+      renderSearchPanel();
+      console.log(`[relay-gui] search results: ${next.results.length} of ${next.total}`);
+    }
+    return;
+  }
+  if (type === 'export_result') {
+    // M4.3: hand the finished Markdown to the save dialog — the one narrow
+    // file API — and show where it landed.
+    if (typeof frame.requestId === 'string' && frame.requestId === pendingExport) {
+      const markdown = typeof frame.markdown === 'string' ? frame.markdown : '';
+      const count = typeof frame.messageCount === 'number' ? frame.messageCount : 0;
+      pendingExport = null;
+      void Promise.resolve(preload?.saveExport(markdown)).then((path) => {
+        if (exportNote !== null) {
+          exportNote.textContent = path === null || path === undefined
+            ? 'Export cancelled'
+            : `Saved ${count} messages: ${path}`;
+        }
+        console.log(`[relay-gui] export ${path === null || path === undefined ? 'cancelled' : `saved to ${path}`}`);
+      });
+    }
     return;
   }
   if (type === 'approval_request') {
@@ -616,6 +726,59 @@ if (autoSendDelayInput !== null) {
 if (autoSendUnitInput !== null) {
   autoSendUnitInput.disabled = true;
   autoSendUnitInput.addEventListener('change', submitDelay);
+}
+
+// M4.3: search — the panel over the transcript, engine queries over the
+// whole history. A new query supersedes an older one (requestIds); Escape
+// or Clear closes.
+const submitSearch = (): void => {
+  if (searchInput === null) return;
+  const query = searchInput.value;
+  if (!isSearchQueryValid(query)) return; // never send invalid input
+  const requestId = crypto.randomUUID();
+  searchState = startSearch(searchState, requestId, query);
+  renderSearchPanel();
+  sendFrameToEngine(searchFrame(requestId, query));
+};
+const closeSearchPanel = (): void => {
+  searchState = closeSearch(searchState);
+  renderSearchPanel();
+};
+if (searchButton !== null) {
+  searchButton.disabled = true; // until the engine connects
+  searchButton.addEventListener('click', () => {
+    if (searchPanel === null) return;
+    if (searchState.open) { closeSearchPanel(); return; }
+    searchState = startSearch(searchState, crypto.randomUUID(), '');
+    renderSearchPanel();
+    searchInput?.focus();
+  });
+}
+if (searchInput !== null) {
+  searchInput.disabled = true;
+  searchInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); submitSearch(); }
+  });
+}
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && searchState.open) closeSearchPanel();
+});
+const searchClear = document.getElementById('search-clear');
+if (searchClear !== null) {
+  searchClear.addEventListener('click', () => {
+    if (searchInput !== null) searchInput.value = '';
+    closeSearchPanel();
+  });
+}
+// M4.3: export — the engine builds the Markdown; the main process shows
+// the save dialog and writes the file. The note says where it landed.
+if (exportButton !== null) {
+  exportButton.disabled = true; // until the engine connects
+  exportButton.addEventListener('click', () => {
+    pendingExport = crypto.randomUUID();
+    if (exportNote !== null) exportNote.textContent = 'Building the export…';
+    sendFrameToEngine(exportFrame(pendingExport));
+  });
 }
 
 connect();

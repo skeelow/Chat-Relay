@@ -522,3 +522,47 @@ test('validateModeUpdate: good and bad values per field; one bad field poisons t
   assert.equal(validateModeUpdate({ mode: 'manual', turnCap: 99 }), null,
     'one invalid field ignores the whole frame');
 });
+
+// --- M4.3: the search read query ---
+
+test('searchMessages: case-insensitive; literal % and _; quotes and backslashes are safe', () => {
+  const { store, done } = freshStore('search');
+  try {
+    const plant = (body: string): void => {
+      store.insertMessage({ source: 'astra', targets: ['user'], body, hop: 0 });
+    };
+    plant('the NEEDLE is here');
+    plant('profit 100% growth');
+    plant('run at %growth speed');
+    plant('snake_case naming');
+    plant('plain body');
+    plant('quote "it" and \\ backslash');
+
+    const hits = (query: string): string[] => store.searchMessages(query, 100).messages.map((m) => m.body);
+    assert.deepEqual(hits('needle'), ['the NEEDLE is here'], 'case-insensitive');
+    assert.deepEqual(hits('100%'), ['profit 100% growth'], '% matches literally');
+    assert.deepEqual(hits('%growth'), ['run at %growth speed'], 'a leading % is literal too');
+    assert.deepEqual(hits('%'), ['run at %growth speed', 'profit 100% growth'],
+      'a bare % matches only literal percent signs — never everything');
+    assert.deepEqual(hits('snake_'), ['snake_case naming'], '_ matches literally');
+    assert.equal(hits('_').length, 1, 'an escaped _ does not match every one-character window');
+    assert.deepEqual(hits('"it" and \\'), ['quote "it" and \\ backslash'], 'a quote and a backslash in the query');
+    assert.equal(store.searchMessages('nothing', 100).total, 0, 'a miss has no results and total 0');
+  } finally { done(); }
+});
+
+test('searchMessages: limit 100, newest first, total counts past the limit', () => {
+  const { store, done } = freshStore('searchlimit');
+  try {
+    for (let i = 0; i < 120; i++) {
+      store.insertMessage({ source: 'astra', targets: ['user'], body: `matchword number ${i}`, hop: 0, sourceRef: `sr-${i}` });
+    }
+    const { messages, total } = store.searchMessages('matchword', 100);
+    assert.equal(total, 120, 'total counts every match, past the limit');
+    assert.equal(messages.length, 100, 'the newest 100 come back');
+    for (let i = 1; i < messages.length; i++) {
+      assert.equal(messages[i - 1].id > messages[i].id, true, `newest first at ${i}`);
+    }
+    assert.equal(messages[0].body, 'matchword number 119', 'the newest match leads');
+  } finally { done(); }
+});

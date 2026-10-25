@@ -36,6 +36,12 @@
 //                    autoSendDelaySec?}
 //   engine → GUI    {type:'settings_update', mode, turnCap,        M4.2: broadcast on any change
 //                    autoSend, autoSendDelaySec}
+//   GUI → engine    {type:'search', requestId, query}              M4.3: whole-history search
+//   engine → GUI    {type:'search_result', requestId, messages,   M4.3: asking socket only
+//                    total}                                          (newest 100, newest first)
+//   GUI → engine    {type:'export', requestId}                     M4.3: Markdown export
+//   engine → GUI    {type:'export_result', requestId, markdown,   M4.3: asking socket only
+//                    messageCount}
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -48,6 +54,7 @@ import {
   openStore, StoreError, validateModeUpdate,
   type Participant, type PendingDelivery, type RelayMessage, type RelayStore,
 } from './store.ts';
+import { exportMarkdown, EXPORT_CAP, type ExportDelivery } from './export.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -83,6 +90,9 @@ const AUTH_GRACE_MS = 5000;
 
 /** Messages a joining GUI receives in its snapshot (M1.5 handshake). */
 const SNAPSHOT_LIMIT = 200;
+
+/** M4.3 (D17-2): the newest matches a search returns. */
+const SEARCH_LIMIT = 100;
 
 /** M2.1: default ack window for a delivery before the row is marked failed. */
 const DEFAULT_ACK_TIMEOUT_MS = 30000;
@@ -762,6 +772,52 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] settings changed: ${JSON.stringify(settingsView())}`);
               broadcast({ type: 'settings_update', ...settingsView() });
             }
+            return;
+          }
+          case 'search': {
+            // M4.3 (D17-2): an engine query over the whole history — not a
+            // GUI filter over the snapshot's 200. GUI sockets only; the
+            // trimmed query must be 1 to 200 characters; the reply goes to
+            // the asking socket alone, newest 100 matches, newest first,
+            // with the total. Stale requestIds are the GUI's business.
+            if (!state.isGui) {
+              console.log('[engine] search from a non-GUI socket ignored');
+              return;
+            }
+            const requestId = record.requestId;
+            if (typeof requestId !== 'string' || requestId === '') {
+              console.log(`[engine] search ignored (bad requestId): ${JSON.stringify(record)}`);
+              return;
+            }
+            const query = typeof record.query === 'string' ? record.query.trim() : '';
+            if (query.length < 1 || query.length > 200) {
+              console.log(`[engine] search ignored (query length ${query.length})`);
+              return;
+            }
+            const { messages, total } = store.searchMessages(query, SEARCH_LIMIT);
+            ws.send(JSON.stringify({ type: 'search_result', requestId, messages, total }));
+            return;
+          }
+          case 'export': {
+            // M4.3 (D17-3): the engine builds the Markdown — the newest
+            // EXPORT_CAP messages, oldest first, with their delivery rows —
+            // and answers the asking socket alone. The main process does
+            // the save dialog; nothing here touches disk.
+            if (!state.isGui) {
+              console.log('[engine] export from a non-GUI socket ignored');
+              return;
+            }
+            const requestId = record.requestId;
+            if (typeof requestId !== 'string' || requestId === '') {
+              console.log(`[engine] export ignored (bad requestId): ${JSON.stringify(record)}`);
+              return;
+            }
+            const messages = store.recentMessages(EXPORT_CAP); // oldest first
+            const deliveries = store.deliveriesOf(messages.map((m) => m.id)) as ExportDelivery[];
+            const markdown = exportMarkdown(messages, deliveries, new Date().toISOString());
+            ws.send(JSON.stringify({
+              type: 'export_result', requestId, markdown, messageCount: messages.length,
+            }));
             return;
           }
           default:

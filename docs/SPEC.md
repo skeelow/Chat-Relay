@@ -125,6 +125,10 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | GUI → engine | `forward` | message id, target (codex or astra) |
 | GUI → engine | `approve` / `reject` | message id, target |
 | GUI → engine | `set_mode` | mode (manual or approve\_each, auto in M5.1), turnCap, autoSend (bool), autoSendDelaySec — any subset; GUI only; invalid frames are ignored whole |
+| GUI → engine | `search` | requestId, query (trimmed, 1–200 chars; GUI only). Case-insensitive substring over message bodies, % and _ escaped, newest 100 matches |
+| engine → GUI | `search_result` | requestId, messages (newest 100, newest first), total — the asking socket only |
+| GUI → engine | `export` | requestId (GUI only) |
+| engine → GUI | `export_result` | requestId, markdown (newest 5,000 messages, oldest first), messageCount — the asking socket only |
 | GUI → engine | `stop` | none |
 | GUI → engine | `resume` | none — clears the stopped state |
 | GUI → engine | `approval_answer` | requestId, decision (accept or decline) |

@@ -9,7 +9,7 @@
   },
   "main": "app/dist/main.cjs",
   "scripts": {
-    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts tests/gui-deliveries.test.ts tests/gui-approvals.test.ts tests/compose.test.ts tests/gui-settings.test.ts",
+    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts tests/gui-deliveries.test.ts tests/gui-approvals.test.ts tests/compose.test.ts tests/gui-settings.test.ts tests/export.test.ts tests/gui-search.test.ts tests/gui-tray-window.test.ts",
     "typecheck": "tsc --noEmit",
     "build:ext": "tsc --noEmit && node adapters/chatgpt-ext/build.mjs",
     "build:gui": "tsc --noEmit && node app/build.mjs",

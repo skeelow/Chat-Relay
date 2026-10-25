@@ -92,6 +92,35 @@
                        border: 1px solid #33373c; background: #1b1e21; color: #e6e6e6; }
     #settings-hint { color: #e3b341; font-size: 12px; }
     #settings-hint:empty { display: none; }
+    #search-btn, #export-btn { font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 999px;
+                               border: 1px solid #33373c; background: #1b1e21; color: #e6e6e6;
+                               cursor: pointer; }
+    #search-btn:disabled, #export-btn:disabled { opacity: 0.45; cursor: default; }
+    #export-note { font-size: 12px; color: #9aa0a6; max-width: 200px; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
+    #export-note:empty { display: none; }
+    #search { position: fixed; top: 52px; right: 10px; width: 360px; max-height: 68%;
+               overflow-y: auto; z-index: 30; background: #1b1e21; border: 1px solid #33373c;
+               border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px;
+               box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+    #search[hidden] { display: none; }
+    #search .search-bar { display: flex; gap: 8px; }
+    #search input[type="text"] { flex: 1; font: inherit; padding: 6px 10px; border-radius: 6px;
+                                 border: 1px solid #33373c; background: #121417; color: #e6e6e6; }
+    #search input:disabled { opacity: 0.45; }
+    #search-clear { font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 999px;
+                    border: 1px solid #33373c; background: #1b1e21; color: #e6e6e6; cursor: pointer; }
+    #search-total { font-size: 12px; color: #8b949e; }
+    #search-total:empty { display: none; }
+    .search-hit { padding: 6px 8px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+    .search-hit:hover { background: #121417; border-color: #33373c; }
+    .search-hit-meta { font-size: 11px; color: #8b949e; }
+    .search-hit-snippet { font-size: 12px; color: #e6e6e6; margin-top: 2px;
+                          overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+                          -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+    .search-hit-full { font-size: 12px; color: #e6e6e6; margin-top: 6px; white-space: pre-wrap;
+                       background: #121417; border-radius: 6px; padding: 8px; }
+    .msg.found { outline: 2px solid #2ecc71; outline-offset: 2px; }
     #approvals { display: flex; flex-direction: column; gap: 8px; padding: 8px 14px 0 14px; }
     #approvals:empty { display: none; }
     .approval-card { background: #2a2115; border: 1px solid #5c4a1e; border-radius: 8px;
@@ -114,6 +143,9 @@
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
     <button id="stop" type="button">Stop</button>
     <button id="settings-btn" type="button" disabled>Settings</button>
+    <button id="search-btn" type="button" disabled>Search</button>
+    <button id="export-btn" type="button" disabled>Export</button>
+    <span id="export-note"></span>
     <span id="mode-label"></span>
     <span id="pending"></span>
     <span id="approvals-badge"></span>
@@ -121,6 +153,14 @@
   </header>
   <div id="approvals"></div>
   <div id="banner" hidden></div>
+  <div id="search" hidden>
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Search the whole history…" disabled>
+      <button type="button" id="search-clear">Clear</button>
+    </div>
+    <div id="search-total"></div>
+    <div id="search-results"></div>
+  </div>
   <div id="settings" hidden>
     <div class="mode-choice">
       <span class="choice-stack">
