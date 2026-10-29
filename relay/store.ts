@@ -330,11 +330,25 @@ export interface DeliveryView {
     try {
       db.exec('ALTER TABLE messages RENAME TO messages_old;');
       db.exec('ALTER TABLE deliveries RENAME TO deliveries_old;');
+      // The explicitly named indexes go with the renamed tables. Drop them
+      // so SCHEMA can recreate them on the new tables (CREATE INDEX IF NOT
+      // EXISTS would be a no-op since the names already exist on messages_old).
+      db.exec('DROP INDEX IF EXISTS messages_source_ref;');
+      db.exec('DROP INDEX IF EXISTS messages_dedupe;');
       // SCHEMA carries the new CHECKs (including 'hermes'); settings and
       // adapter_state are no-ops here (CREATE TABLE IF NOT EXISTS).
       db.exec(SCHEMA);
       db.exec('INSERT INTO messages SELECT * FROM messages_old;');
-      db.exec('INSERT INTO deliveries SELECT * FROM deliveries_old;');
+      // The old deliveries table may predate the M2.1 'error' column, so
+      // column counts can differ. List columns explicitly and default error
+      // to NULL when the old table has no such column.
+      const oldDeliveryCols = db.prepare('PRAGMA table_info(deliveries_old)').all() as Array<{ name: string }>;
+      const hasErrorCol = oldDeliveryCols.some((column) => column.name === 'error');
+      if (hasErrorCol) {
+        db.exec('INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) SELECT message_id, target, status, attempts, updated_at, error FROM deliveries_old;');
+      } else {
+        db.exec('INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) SELECT message_id, target, status, attempts, updated_at, NULL FROM deliveries_old;');
+      }
       db.exec('DROP TABLE messages_old;');
       db.exec('DROP TABLE deliveries_old;');
       const violations = db.prepare('PRAGMA foreign_key_check').all() as unknown[];
@@ -368,11 +382,18 @@ export interface DeliveryView {
     | { user_version: number }
     | undefined;
   const version = versionRow?.user_version ?? 0;
-  const messagesExists = db.prepare(
-    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
-  ).get() !== undefined;
+  // Read the messages table's CREATE TABLE sql BEFORE SCHEMA runs — after
+  // SCHEMA it would always exist (CREATE TABLE IF NOT EXISTS creates it on
+  // a fresh database). A legacy database has user_version 0 AND a messages
+  // table whose CHECK constraint lacks 'hermes'. user_version alone is not
+  // enough: a fresh database also starts at 0.
+  const messagesRow = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+  ).get() as { sql: string } | undefined;
+  const messagesExists = messagesRow !== undefined;
+  const isLegacySchema = messagesExists && !messagesRow.sql.includes('hermes');
 
-  if (version === 0 && messagesExists) {
+  if (version === 0 && isLegacySchema) {
     migrateV0ToV1(db); // rebuilds messages + deliveries with the new CHECKs
     db.exec('PRAGMA user_version = 1;');
   } else {
@@ -380,6 +401,10 @@ export interface DeliveryView {
     // (CREATE TABLE IF NOT EXISTS is a no-op when the tables already exist).
     db.exec(SCHEMA);
     if (version === 0 && !messagesExists) {
+      // Brand-new database: SCHEMA created everything, mark as migrated.
+      db.exec('PRAGMA user_version = 1;');
+    } else if (version === 0 && messagesExists && !isLegacySchema) {
+      // Schema already has 'hermes' but user_version was never set; mark it.
       db.exec('PRAGMA user_version = 1;');
     }
   }

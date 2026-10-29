@@ -600,8 +600,7 @@ const OLD_SCHEMA = `
       ('captured','pending_approval','queued','delivering','delivered','failed','cancelled')),
     attempts   INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
-    error      TEXT,
-    PRIMARY KEY (message_id, target)
+    error      TEXT,\n    PRIMARY KEY (message_id, target)
   );
 
   CREATE TABLE settings (key   TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -797,6 +796,141 @@ test('store: failed migration rolls back and leaves the old database untouched',
         .run('x', 'hermes', 'h', hashBody('h'), null, 0, '2026-01-01T00:00:00Z');
       db.close();
     }, /CHECK constraint failed|constraint failed/, 'hermes still rejected after rolled-back migration');
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+// --- M6.2 migration: additional checks requested in review ---
+
+test('store: fresh database does not run the migration rebuild', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-norebuild-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Open a fresh database — no old tables exist, so the migration branch
+    // must not run; SCHEMA creates everything directly.
+    let msgId: string | null = null;
+    const fresh = openStore(dbPath);
+    try {
+      assert.equal(userVersion(dbPath), 1, 'fresh database at user_version 1');
+      assert.equal(columnCheck(dbPath, 'messages', 'source'),
+        "'user','astra','codex','hermes'", 'fresh messages CHECK includes hermes');
+      // Insert a marker and verify it survives (no rebuild wiped it).
+      const msg = fresh.insertMessage({ source: 'user', targets: ['codex'], body: 'marker', hop: 0, sourceRef: 'marker-1' });
+      msgId = msg.id;
+    } finally {
+      fresh.close(); // close fresh before opening again on the same db file
+    }
+
+    // Re-open: the marker survives, no rebuild ran.
+    const again = openStore(dbPath);
+    try {
+      assert.equal(userVersion(dbPath), 1, 're-open keeps user_version 1');
+      assert.notEqual(msgId, null, 'marker message id captured');
+      const row = again.getDelivery(msgId!, 'codex');
+      assert.equal(row?.status, 'pending_approval', 'marker delivery survived re-open');
+      // No _old tables left behind by a migration.
+      const db = new DatabaseSync(dbPath);
+      const oldTables = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_old'",
+      ).all() as Array<{ name: string }>;
+      db.close();
+      assert.deepEqual(oldTables, [], 'no _old tables from a rebuild');
+    } finally { again.close(); }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+test('store: migrated database keeps messages_source_ref and messages_dedupe indexes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-indexes-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Old-schema database WITH the error column (post-M2.1, pre-M6.2).
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_SCHEMA);
+    old.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('m-1', 'astra', 'body one', hashBody('body one'), 'ref-1', 0, '2026-01-01T00:00:00Z');
+    old.exec('PRAGMA user_version = 0;');
+    old.close();
+    assert.equal(userVersion(dbPath), 0, 'pre-migration user_version 0');
+
+    // Snapshot index definitions before migration.
+    const beforeIndexes = (() => {
+      const db = new DatabaseSync(dbPath);
+      const rows = db.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' ORDER BY name",
+      ).all() as Array<{ name: string; sql: string }>;
+      db.close();
+      return rows;
+    })();
+    const beforeNames = beforeIndexes.map((r) => r.name);
+
+    // Migrate.
+    const store = openStore(dbPath);
+    try {
+      assert.equal(userVersion(dbPath), 1, 'migrated to user_version 1');
+
+      // Indexes exist after migration with the same names.
+      const afterIndexes = (() => {
+        const db = new DatabaseSync(dbPath);
+        const rows = db.prepare(
+          "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' ORDER BY name",
+        ).all() as Array<{ name: string; sql: string }>;
+        db.close();
+        return rows;
+      })();
+      const afterNames = afterIndexes.map((r) => r.name);
+      assert.ok(afterNames.includes('messages_source_ref'), 'messages_source_ref exists after migration');
+      assert.ok(afterNames.includes('messages_dedupe'), 'messages_dedupe exists after migration');
+
+      // The duplicate source_ref rule is still enforced (unique partial index works).
+      expectStoreError('duplicate', () =>
+        store.insertMessage({ source: 'codex', targets: ['user'], body: 'dup', hop: 0, sourceRef: 'ref-1' }),
+      );
+
+      // hermes inserts work after migration.
+      const hmsg = store.insertMessage({ source: 'hermes', targets: ['user'], body: 'hermes ok', hop: 0 });
+      store.insertDelivery(hmsg.id, 'hermes');
+      assert.equal(store.getDelivery(hmsg.id, 'hermes')?.status, 'pending_approval');
+    } finally { store.close(); }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+test('store: error column survives migration when the old table lacks it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-noerror-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Pre-M2.1 old schema: deliveries table WITHOUT the error column.
+    const OLD_NO_ERROR = OLD_SCHEMA.replace(
+      '    error      TEXT,\n    PRIMARY KEY (message_id, target)',
+      '    PRIMARY KEY (message_id, target)',
+    );
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_NO_ERROR);
+    old.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('m-1', 'astra', 'body one', hashBody('body one'), null, 0, '2026-01-01T00:00:00Z');
+    old.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at) VALUES (?,?,?,?,?)')
+      .run('m-1', 'codex', 'queued', 2, '2026-01-01T01:00:00Z');
+    old.exec('PRAGMA user_version = 0;');
+    old.close();
+    assert.equal(userVersion(dbPath), 0, 'pre-M2.1 old database at user_version 0');
+
+    // Migrate — the error column must be added and the delivery preserved.
+    const store = openStore(dbPath);
+    try {
+      assert.equal(userVersion(dbPath), 1, 'migrated to user_version 1');
+      const row = store.getDelivery('m-1', 'codex');
+      assert.equal(row?.status, 'queued', 'delivery row preserved across migration');
+      assert.equal(row?.error, null, 'error column exists and is null for preserved rows');
+      // The error column is writable after migration.
+      store.markStatus('m-1', 'codex', 'failed', 'post-migration failure');
+      assert.equal(store.getDelivery('m-1', 'codex')?.error, 'post-migration failure');
+    } finally { store.close(); }
   } finally {
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
   }
