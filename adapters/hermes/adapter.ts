@@ -33,7 +33,11 @@ export const ECHO_WINDOW_MS = 10 * 60 * 1000;
 
 export const DEFAULT_PROFILE = 'claude';
 export const DEFAULT_MAX_TURNS = 6;
-export const DEFAULT_RUN_BUDGET_SEC = 300;
+export const DEFAULT_MAX_RUN_SEC = 300;
+// Hard wall-clock extra beyond maxRunSec, in seconds (production: 30).
+// `--run-budget` is deliberately NOT sent to Hermes: real Hermes rejects it
+// together with `--format stream-json` (exit 2). The wall-clock kill below
+// is the enforcement (decision D31, review F1).
 const TIMEOUT_EXTRA_SEC = 30;
 
 // A profile name may only contain safe characters. Anything else fails closed.
@@ -53,13 +57,16 @@ export interface BuildArgvOpts {
   profile: string;
   queryFile: string;
   maxTurns: number;
-  runBudget: number;
+  maxRunSec: number;
   resume?: string | null;
 }
 
 /** Exact argv for one Hermes run, element 0 being the executable. Matches
  *  `hermes -p <profile> chat --query-file <file> --format stream-json
- *  -t memory,session_search --max-turns <N> --run-budget <S> [--resume <id>]`.
+ *  -t memory,session_search --max-turns <N> [--resume <id>]`.
+ *  `--run-budget` is intentionally omitted: real Hermes rejects it together
+ *  with `--format stream-json` (exit 2). The adapter's wall-clock kill
+ *  (maxRunSec + TIMEOUT_EXTRA_SEC) is the enforcement (decision D31).
  *  The adapter spawns spawn(argv[0], argv.slice(1)) (prefixing `node` for a
  *  .ts/.js fake executable in tests). */
 export function buildArgv(opts: BuildArgvOpts): string[] {
@@ -74,7 +81,6 @@ export function buildArgv(opts: BuildArgvOpts): string[] {
     '--format', 'stream-json',
     '-t', MODE_A_TOOLSETS,
     '--max-turns', String(opts.maxTurns),
-    '--run-budget', String(opts.runBudget),
   ];
   if (opts.resume) argv.push('--resume', opts.resume);
   return argv;
@@ -97,8 +103,8 @@ export interface HermesAdapterOptions {
   executable: string;
   profile?: string;
   maxTurns?: number;
-  runBudget?: number;
-  /** Hard wall-clock extra beyond run-budget, in seconds (production: 30). */
+  maxRunSec?: number;
+  /** Hard wall-clock extra beyond maxRunSec, in seconds (production: 30). */
   timeoutExtraSec?: number;
   cwd?: string;
   sendFrame: (frame: unknown) => void;
@@ -117,7 +123,7 @@ export class HermesAdapter {
   private readonly sendFrame: (frame: unknown) => void;
   private readonly profile: string;
   private readonly maxTurns: number;
-  private readonly runBudget: number;
+  private readonly maxRunSec: number;
   private readonly cwd: string;
   private readonly startMs: number;
 
@@ -125,6 +131,9 @@ export class HermesAdapter {
   /** The Hermes session id we resume; null until the first result arrives,
    *  and cleared to null by config {threadId: null}. */
   private knownSessionId: string | null = null;
+  /** Set to true once the engine's first `config` frame has arrived. Until
+   *  then, deliveries fail with "waiting for engine config" (review F4). */
+  private configReceived = false;
   private busy = false;
   private current: Run | null = null;
   private readonly timeoutExtraSec: number;
@@ -137,7 +146,7 @@ export class HermesAdapter {
     this.sendFrame = options.sendFrame;
     this.profile = options.profile ?? DEFAULT_PROFILE;
     this.maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
-    this.runBudget = options.runBudget ?? DEFAULT_RUN_BUDGET_SEC;
+    this.maxRunSec = options.maxRunSec ?? DEFAULT_MAX_RUN_SEC;
     this.timeoutExtraSec = options.timeoutExtraSec ?? 30;
     this.cwd = options.cwd ?? defaultCwd();
     this.startMs = options.startMs ?? Date.now();
@@ -152,6 +161,7 @@ export class HermesAdapter {
   /** Engine sent config {threadId} after hello. Store it as the resume id;
    *  null means the engine cleared the session (a fresh session next). */
   handleConfig(threadId: string | null): void {
+    this.configReceived = true; // the engine has announced its thread (F4)
     if (threadId === null || threadId === '') {
       this.knownSessionId = null;
       return;
@@ -160,10 +170,15 @@ export class HermesAdapter {
   }
 
   /** Deliver one message. Fails at once with "Hermes is busy" if a run is
-   *  already active (never queued). */
+   *  already active (never queued). Until the engine's first `config` frame
+   *  has arrived, fails with "waiting for engine config" (review F4). */
   deliver(messageId: string, text: string): Promise<void> {
     if (this.busy) {
       this.fail(messageId, 'Hermes is busy');
+      return Promise.resolve();
+    }
+    if (!this.configReceived) {
+      this.fail(messageId, 'waiting for engine config');
       return Promise.resolve();
     }
     this.busy = true;
@@ -189,36 +204,63 @@ export class HermesAdapter {
       let settled = false;
       let timedOut = false;
       let interrupted = false;
+      let stdoutOversized = false;
+      let startError: string | null = null;
       let stdoutBuf = '';
       let stderrBuf = '';
       let resultEvent: { session_id?: unknown; exit_code?: unknown; text?: unknown } | null = null;
       const resumeId = this.knownSessionId; // the id we asked to resume, if any
 
       const promptFile = join(this.cwd, `prompt-${this.startMs}-${++this.runNumber}.txt`);
-      writeFileSync(promptFile, text, 'utf8');
+      let child: ChildProcess;
+      try {
+        // F3: wrap setup (prompt file, argv build, spawn) in try/catch so a
+        // setup error never leaves the adapter wedged with busy=true.
+        writeFileSync(promptFile, text, 'utf8');
+        const argv = buildArgv({
+          executable: this.executable,
+          profile: this.profile,
+          queryFile: promptFile,
+          maxTurns: this.maxTurns,
+          maxRunSec: this.maxRunSec,
+          resume: resumeId,
+        });
+        child = spawnCommand(argv, this.cwd);
+      } catch (err) {
+        this.busy = false;
+        try { unlinkSync(promptFile); } catch { /* the prompt file must always be deleted */ }
+        this.sendFrame({ type: 'status', status: 'idle' });
+        this.fail(messageId, String(err));
+        resolve();
+        return;
+      }
 
-      const argv = buildArgv({
-        executable: this.executable,
-        profile: this.profile,
-        queryFile: promptFile,
-        maxTurns: this.maxTurns,
-        runBudget: this.runBudget,
-        resume: resumeId,
-      });
-      const child = spawnCommand(argv, this.cwd);
       this.current = { child, requestInterrupt: () => { interrupted = true; killTree(child, 'interrupt'); } };
 
-      const timeoutMs = this.runBudget * 1000 + this.timeoutExtraSec * 1000;
+      const timeoutMs = this.maxRunSec * 1000 + this.timeoutExtraSec * 1000;
       const timer = setTimeout(() => {
         timedOut = true;
         killTree(child, 'timeout');
       }, timeoutMs);
       timer.unref?.();
 
-      child.stdout?.on('data', (chunk) => { stdoutBuf += chunk.toString(); });
+      const MAX_STDOUT_BYTES = 8 * 1024 * 1024; // C2
+
+      child.stdout?.on('data', (chunk) => {
+        stdoutBuf += chunk.toString();
+        if (stdoutBuf.length > MAX_STDOUT_BYTES) {
+          stdoutOversized = true;
+          killTree(child, 'output too large');
+        }
+      });
       child.stderr?.on('data', (chunk) => {
         stderrBuf += chunk.toString();
         if (stderrBuf.length > 2048) stderrBuf = stderrBuf.slice(-2048);
+      });
+
+      child.on('error', () => {
+        // C1: the executable could not be started (e.g. missing hermes.exe).
+        startError = 'Hermes could not be started';
       });
 
       const finish = (): void => {
@@ -231,7 +273,11 @@ export class HermesAdapter {
         this.sendFrame({ type: 'status', status: 'idle' });
 
         let error: string | null = null;
-        if (interrupted) {
+        if (startError) {
+          error = startError; // C1: "Hermes could not be started"
+        } else if (stdoutOversized) {
+          error = 'Hermes output too large'; // C2
+        } else if (interrupted) {
           error = 'Stopped';
         } else if (timedOut) {
           error = 'Hermes timed out';
@@ -259,8 +305,10 @@ export class HermesAdapter {
           }
         }
 
+        // F2: plain failure text here. Only the two session-mismatch cases in
+        // succeed() use the "could not resume session X" wording.
         if (error) {
-          this.fail(messageId, error, resumeId);
+          this.fail(messageId, error);
         } else {
           const deliveredBody = deliveredBodyOf(text);
           this.succeed(messageId, resultEvent!, this.runNumber, resumeId, deliveredBody);
@@ -269,9 +317,6 @@ export class HermesAdapter {
       };
 
       child.on('close', finish);
-      child.on('error', () => {
-        // e.g. executable missing — treat as a failed run once close fires.
-      });
     });
   }
 
@@ -286,18 +331,15 @@ export class HermesAdapter {
     const body = typeof result.text === 'string' ? result.text.trim() : '';
 
     // A failed resume (resumed but got a different session, or none) is a
-    // failed delivery, never a fresh session.
+    // failed delivery, never a fresh session. Only these two cases use the
+    // resume wording (review F2).
     if (resumeId !== null) {
       if (sessionId === null) {
-        this.fail(messageId, `Hermes could not resume session ${resumeId}: no session id returned`, resumeId);
+        this.failResume(messageId, resumeId, 'no session id returned');
         return;
       }
       if (sessionId !== resumeId) {
-        this.fail(
-          messageId,
-          `Hermes could not resume session ${resumeId}: Hermes started session ${sessionId} instead`,
-          resumeId,
-        );
+        this.failResume(messageId, resumeId, `Hermes started session ${sessionId} instead`);
         return;
       }
     }
@@ -337,10 +379,19 @@ export class HermesAdapter {
     this.sendFrame({ type: 'delivered', messageId });
   }
 
-  private fail(messageId: string, error: string, resumeId?: string | null): void {
-    if (resumeId) {
-      error = `Hermes could not resume session ${resumeId}: ${error}. Nothing was sent to a new session.`;
-    }
+  /** F2: the "could not resume session X … Nothing was sent to a new session"
+   *  wording, used only for the two session-mismatch cases, exactly once. */
+  private failResume(messageId: string, resumeId: string, reason: string): void {
+    this.sendFrame({
+      type: 'failed',
+      messageId,
+      error: `Hermes could not resume session ${resumeId}: ${reason}. Nothing was sent to a new session.`,
+    });
+  }
+
+  /** F2: plain failure text — no resume wording, ever. Used for "Stopped",
+   *  "Hermes timed out", "Hermes exited with code N", and so on. */
+  private fail(messageId: string, error: string): void {
     this.sendFrame({ type: 'failed', messageId, error });
   }
 }

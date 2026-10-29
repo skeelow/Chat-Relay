@@ -81,6 +81,13 @@ function run(): void {
     return;
   }
 
+  if (mode === 'huge-output') {
+    // Produce more than 8 MB of stdout to trip the adapter's output cap.
+    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init' }) + '\n');
+    process.stdout.write(JSON.stringify({ type: 'text', text: 'x'.repeat(9_000_000) }) + '\n');
+    return;
+  }
+
   if (mode === 'garbage') {
     process.stdout.write('{ not valid json ever');
     return;

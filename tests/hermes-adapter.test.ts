@@ -66,17 +66,22 @@ function pidIsAlive(pid: string): boolean {
   }
 }
 
-function makeAdapter(opts: Partial<HermesAdapterOptions> = {}): { adapter: HermesAdapter; frames: unknown[] } {
+function makeAdapter(opts: Partial<HermesAdapterOptions> & { configured?: boolean } = {}): { adapter: HermesAdapter; frames: unknown[] } {
+  const { configured = true, ...adapterOpts } = opts;
   const frames: unknown[] = [];
   const adapter = new HermesAdapter({
     executable: FAKE,
     sendFrame: (f) => frames.push(f),
-    runBudget: 1,
+    maxRunSec: 1,
     timeoutExtraSec: 1, // keep the timeout test fast (production default is 30s)
     cwd: TMP,
     startMs: 1_700_000_000_000,
-    ...opts,
+    ...adapterOpts,
   });
+  adapter.start();
+  if (configured) {
+    adapter.handleConfig(null); // simulate the engine's config frame (fresh session)
+  }
   return { adapter, frames };
 }
 
@@ -90,11 +95,11 @@ test('buildArgv: exact argv for the first run (no --resume)', () => {
     profile: 'claude',
     queryFile: 'q.txt',
     maxTurns: 6,
-    runBudget: 300,
+    maxRunSec: 300,
   });
   assert.deepEqual(argv, [
     FAKE, '-p', 'claude', 'chat', '--query-file', 'q.txt', '--format', 'stream-json',
-    '-t', MODE_A_TOOLSETS, '--max-turns', '6', '--run-budget', '300',
+    '-t', MODE_A_TOOLSETS, '--max-turns', '6',
   ]);
 });
 
@@ -104,7 +109,7 @@ test('buildArgv: resumed run appends --resume <id>', () => {
     profile: 'claude',
     queryFile: 'q.txt',
     maxTurns: 6,
-    runBudget: 300,
+    maxRunSec: 300,
     resume: 'sess-1',
   });
   assert.equal(argv.indexOf('--resume'), argv.length - 2);
@@ -117,10 +122,10 @@ test('buildArgv: every forbidden flag is absent; MODE_A_TOOLSETS present exactly
     profile: 'claude',
     queryFile: 'q.txt',
     maxTurns: 6,
-    runBudget: 300,
+    maxRunSec: 300,
     resume: 'sess-1',
   });
-  for (const banned of ['--yolo', '--source', '--ignore-user-config', '--safe-mode', '--accept-hooks', '-q', '--query']) {
+  for (const banned of ['--yolo', '--source', '--ignore-user-config', '--safe-mode', '--accept-hooks', '-q', '--query', '--run-budget']) {
     assert.ok(!argv.includes(banned), `${banned} must never appear in argv`);
   }
   const toolsetCount = argv.filter((v) => v === MODE_A_TOOLSETS).length;
@@ -138,7 +143,7 @@ test('buildArgv: the relay text is never an argv element', () => {
     profile: 'claude',
     queryFile: 'q.txt',
     maxTurns: 6,
-    runBudget: 300,
+    maxRunSec: 300,
   });
   assert.ok(!argv.includes(tricky));
   for (const chunk of tricky.split('\n')) assert.ok(!argv.includes(chunk));
@@ -146,13 +151,13 @@ test('buildArgv: the relay text is never an argv element', () => {
 
 test('buildArgv: profile validation fails closed', () => {
   assert.throws(() => buildArgv({
-    executable: FAKE, profile: 'bad/profile', queryFile: 'q.txt', maxTurns: 6, runBudget: 300,
+    executable: FAKE, profile: 'bad/profile', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300,
   }));
   assert.throws(() => buildArgv({
-    executable: FAKE, profile: 'evil;rm', queryFile: 'q.txt', maxTurns: 6, runBudget: 300,
+    executable: FAKE, profile: 'evil;rm', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300,
   }));
   assert.doesNotThrow(() => buildArgv({
-    executable: FAKE, profile: 'claude_2', queryFile: 'q.txt', maxTurns: 6, runBudget: 300,
+    executable: FAKE, profile: 'claude_2', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300,
   }));
 });
 
@@ -404,7 +409,7 @@ test('sourceRef is unique per run and across restarts', async () => {
 test('static guard: no --yolo, --source or shell: true in adapter source outside comments', () => {
   const src = readFileSync(join(process.cwd(), 'adapters', 'hermes', 'adapter.ts'), 'utf8');
   const stripped = stripComments(src);
-  for (const banned of ['--yolo', '--source', 'shell: true']) {
+  for (const banned of ['--yolo', '--source', '--run-budget', 'shell: true']) {
     assert.ok(!stripped.includes(banned), `${banned} must not appear in the adapter source outside comments`);
   }
 });
@@ -449,6 +454,131 @@ test('resolveHermes: resolves the real hermes executable', () => {
 test('defaultCwd: the relay hermes-cwd folder', () => {
   const cwd = defaultCwd();
   assert.ok(cwd.includes('RelayChat') && cwd.endsWith('hermes-cwd'));
+});
+
+test('F2: interrupt on a resumed run fails with plain "Stopped" (no "resume")', async () => {
+  clearControl();
+  setControl('normal', { text: 'reply one' });
+  const { adapter, frames } = makeAdapter();
+  adapter.start();
+  await adapter.deliver('m-1', 'first'); // establishes session local-sess
+  frames.length = 0;
+
+  setControl('hang');
+  const p1 = adapter.deliver('m-2', 'hanging'); // resumed run
+  await new Promise((r) => setTimeout(r, 150));
+  adapter.handleInterrupt();
+  await p1;
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-2');
+  assert.equal(String(failed.error), 'Stopped');
+  assert.ok(!String(failed.error).includes('resume'), 'interrupt error must not mention resume');
+});
+
+test('F2: timeout on a resumed run fails with plain "Hermes timed out" (no "resume")', async () => {
+  clearControl();
+  setControl('normal', { text: 'reply one' });
+  const { adapter, frames } = makeAdapter();
+  adapter.start();
+  await adapter.deliver('m-1', 'first'); // establishes session local-sess
+  frames.length = 0;
+
+  setControl('hang');
+  await adapter.deliver('m-2', 'long answer'); // resumed run, times out
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-2');
+  assert.ok(String(failed.error).includes('Hermes timed out'));
+  assert.ok(!String(failed.error).includes('resume'), 'timeout error must not mention resume');
+});
+
+test('F2: mismatch resume error contains the wording exactly once', async () => {
+  clearControl();
+  setControl('normal', { text: 'reply one' });
+  const { adapter, frames } = makeAdapter();
+  adapter.start();
+  await adapter.deliver('m-1', 'first'); // establishes session local-sess
+  frames.length = 0;
+
+  setControl('diff-session', { sessionId: 'other-sess', text: 'reply two' });
+  await adapter.deliver('m-2', 'second');
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-2');
+  const text = String(failed.error);
+  assert.equal(text, `Hermes could not resume session local-sess: Hermes started session other-sess instead. Nothing was sent to a new session.`);
+  // Wording appears exactly once (not doubled).
+  assert.equal(text.split('Hermes could not resume session').length, 2);
+});
+
+test('F3: setup error (unwritable cwd) fails with a plain message and resets busy', async () => {
+  clearControl();
+  setControl('normal');
+  const unwritableCwd = join(TMP, 'unwritable-cwd');
+  writeFileSync(unwritableCwd, 'not a directory', 'utf8'); // cwd is a file, not a dir
+  const { adapter, frames } = makeAdapter({ cwd: unwritableCwd });
+  adapter.start();
+  await adapter.deliver('m-1', 'x');
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-1');
+  assert.ok(String(failed.error).length > 0, 'plain error message');
+  assert.ok(!String(failed.error).includes('resume'), 'setup error must not mention resume');
+  // Busy was reset — a second deliver is not rejected as "busy".
+  frames.length = 0;
+  setControl('normal', { text: 'reply' });
+  await adapter.deliver('m-2', 'x'); // this one will try to spawn the fake in TMP cwd? No — cwd is still unwritable.
+  // Actually the second deliver will also fail with a setup error, not "busy".
+  const failed2 = lastFrameOfType(frames, 'failed');
+  assert.equal(failed2?.messageId, 'm-2');
+  assert.ok(!String(failed2?.error).includes('Hermes is busy'), 'adapter is not wedged');
+});
+
+test('F4: deliver before config fails with "waiting for engine config", no process starts', async () => {
+  clearControl();
+  setControl('normal', { text: 'reply' });
+  const { adapter, frames } = makeAdapter({ configured: false }); // no config frame yet
+  // Delete any stale argv file so we can detect whether a process started.
+  try { unlinkSync(argvFile); } catch { /* ignore */ }
+  await adapter.deliver('m-1', 'x');
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-1');
+  assert.equal(String(failed.error), 'waiting for engine config');
+  assert.equal(frames.filter((f) => (f as { type?: string }).type === 'thinking').length, 0, 'no thinking status');
+  // No process was spawned: the fake never wrote argv.
+  assert.equal(existsSync(argvFile), false);
+});
+
+test('F4: after config {threadId: null}, a delivery starts a fresh session (no --resume)', async () => {
+  clearControl();
+  setControl('normal', { text: 'reply one' });
+  const { adapter, frames } = makeAdapter({ configured: false });
+  adapter.start();
+  (adapter as { handleConfig: (t: string | null) => void }).handleConfig(null);
+  await adapter.deliver('m-1', 'x');
+  const argv = readArgv();
+  assert.equal(argv.includes('--resume'), false, 'no --resume after config null');
+  assert.equal(lastFrameOfType(frames, 'captured')?.body, 'reply one');
+});
+
+test('C1: missing executable fails with "Hermes could not be started"', async () => {
+  clearControl();
+  setControl('normal');
+  const { adapter, frames } = makeAdapter({ executable: 'C:\\nonexistent\\hermes-missing.exe' });
+  adapter.start();
+  await adapter.deliver('m-1', 'x');
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-1');
+  assert.equal(String(failed.error), 'Hermes could not be started');
+});
+
+test('C2: oversized stdout (> 8 MB) fails with "Hermes output too large"', async () => {
+  clearControl();
+  setControl('huge-output');
+  // Long budget so the timeout doesn't fire before the oversized output is seen.
+  const { adapter, frames } = makeAdapter({ maxRunSec: 30, timeoutExtraSec: 1 });
+  adapter.start();
+  await adapter.deliver('m-1', 'x');
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.equal(failed.messageId, 'm-1');
+  assert.equal(String(failed.error), 'Hermes output too large');
 });
 
 // Cleanup the temp dir once all tests in this file are done.
