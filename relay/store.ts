@@ -317,12 +317,12 @@ export interface DeliveryView {
 
 /**
  * One-time migration: user_version 0 (old CHECKs without 'hermes') → 1.
-   * Rebuilds messages and deliveries inside a single transaction with foreign
-   * keys off, then runs PRAGMA foreign_key_check; a non-empty result rolls
-   * back and throws, so the engine refuses to start on a corrupt migration.
-   * Row counts and every column of every row are preserved.
-   */
-  function migrateV0ToV1(db: DatabaseSync): void {
+ * Rebuilds messages and deliveries inside a single transaction with foreign
+ * keys off, then runs PRAGMA foreign_key_check; a non-empty result rolls
+ * back and throws, so the engine refuses to start on a corrupt migration.
+ * Row counts and every column of every row are preserved.
+*/
+function migrateV0ToV1(db: DatabaseSync): void {
     // PRAGMA foreign_keys cannot change inside a transaction: switch it off
     // before BEGIN and back on after COMMIT/ROLLBACK.
     db.exec('PRAGMA foreign_keys = OFF;');
@@ -381,36 +381,36 @@ export interface DeliveryView {
     }
   }
 
-  export function openStore(dbPath: string = 'relay.db'): RelayStore {
+export function openStore(dbPath: string = 'relay.db'): RelayStore {
     const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA foreign_keys = ON;');
 
-  // --- one-time schema migration (user_version) ---------------------------
-  // New databases are created with the new CHECKs (which include 'hermes')
-  // and user_version = 1. An existing database at user_version 0 still has
-  // the old CHECKs ('user','astra','codex' only); SQLite cannot ALTER a
-  // CHECK, so we rebuild messages and deliveries in one transaction. A
-  // failed migration rolls back and the engine refuses to start (the error
-  // propagates out of openStore).
-  const versionRow = db.prepare('PRAGMA user_version').get() as
+// --- one-time schema migration (user_version) ---------------------------
+// New databases are created with the new CHECKs (which include 'hermes')
+// and user_version = 1. An existing database at user_version 0 still has
+// the old CHECKs ('user','astra','codex' only); SQLite cannot ALTER a
+// CHECK, so we rebuild messages and deliveries in one transaction. A
+// failed migration rolls back and the engine refuses to start (the error
+// propagates out of openStore).
+const versionRow = db.prepare('PRAGMA user_version').get() as
     | { user_version: number }
     | undefined;
-  const version = versionRow?.user_version ?? 0;
-  // Read the messages table's CREATE TABLE sql BEFORE SCHEMA runs — after
-  // SCHEMA it would always exist (CREATE TABLE IF NOT EXISTS creates it on
-  // a fresh database). A legacy database has user_version 0 AND a messages
-  // table whose CHECK constraint lacks 'hermes'. user_version alone is not
-  // enough: a fresh database also starts at 0.
-  const messagesRow = db.prepare(
+const version = versionRow?.user_version ?? 0;
+// Read the messages table's CREATE TABLE sql BEFORE SCHEMA runs — after
+// SCHEMA it would always exist (CREATE TABLE IF NOT EXISTS creates it on
+// a fresh database). A legacy database has user_version 0 AND a messages
+// table whose CHECK constraint lacks 'hermes'. user_version alone is not
+// enough: a fresh database also starts at 0.
+const messagesRow = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
-  ).get() as { sql: string } | undefined;
-  const messagesExists = messagesRow !== undefined;
-  const isLegacySchema = messagesExists && !messagesRow.sql.includes('hermes');
+).get() as { sql: string } | undefined;
+const messagesExists = messagesRow !== undefined;
+const isLegacySchema = messagesExists && !messagesRow.sql.includes('hermes');
 
-  if (version === 0 && isLegacySchema) {
+if (version === 0 && isLegacySchema) {
     migrateV0ToV1(db); // rebuilds messages + deliveries with the new CHECKs
     db.exec('PRAGMA user_version = 1;');
-  } else {
+} else {
     // Fresh database, or already migrated: create with the new CHECKs
     // (CREATE TABLE IF NOT EXISTS is a no-op when the tables already exist).
     db.exec(SCHEMA);
@@ -421,7 +421,7 @@ export interface DeliveryView {
       // Schema already has 'hermes' but user_version was never set; mark it.
       db.exec('PRAGMA user_version = 1;');
     }
-  }
+}
 
   // M2.1: relay.db files created before the error column cannot be extended
   // by CREATE TABLE IF NOT EXISTS — add the column once, keeping old files valid.
@@ -435,11 +435,16 @@ export interface DeliveryView {
   const now = (): string => new Date().toISOString();
 
   const isDuplicate = (source: Participant, contentHash: string, sourceRef?: string): boolean => {
-    const cutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString();
-    const recent =
-      db.prepare('SELECT 1 FROM messages WHERE source = ? AND content_hash = ? AND created_at >= ? LIMIT 1')
-        .get(source, contentHash, cutoff);
-    if (recent !== undefined) return true;
+    // For Hermes, the per-run source_ref is the duplicate guard: identical
+    // short replies (e.g. "OK", "Done.") are legitimate and must not be
+    // dropped by the content-hash rule. Astra and Codex keep the full rule.
+    if (source !== 'hermes' || sourceRef === undefined) {
+      const cutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString();
+      const recent =
+        db.prepare('SELECT 1 FROM messages WHERE source = ? AND content_hash = ? AND created_at >= ? LIMIT 1')
+          .get(source, contentHash, cutoff);
+      if (recent !== undefined) return true;
+    }
     if (sourceRef !== undefined) {
       const known = db.prepare('SELECT 1 FROM messages WHERE source_ref = ? LIMIT 1').get(sourceRef);
       if (known !== undefined) return true;

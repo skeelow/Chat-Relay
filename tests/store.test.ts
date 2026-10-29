@@ -1000,3 +1000,51 @@ test('store: migrated database indexes equal fresh database indexes', () => {
     try { rmSync(freshDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
   }
 });
+
+// N1: Hermes duplicate rule uses source_ref only (identical short replies are legitimate)
+test('store: hermes with sourceRef — duplicate guard is sourceRef only', () => {
+  const { store, done } = freshStore('n1-hermes-sourceref');
+  try {
+    // Two identical Hermes replies with different sourceRef are both stored:
+    const m1 = store.insertMessage({ source: 'hermes', targets: ['user'], body: 'OK', hop: 0, sourceRef: 'run-1' });
+    const m2 = store.insertMessage({ source: 'hermes', targets: ['user'], body: 'OK', hop: 0, sourceRef: 'run-2' });
+    assert.notEqual(m1.id, m2.id, 'two hermes replies with different sourceRef are both stored');
+    assert.equal(store.pendingDeliveries().length, 2, 'two deliveries (one to user per message)');
+
+    // The same sourceRef twice is rejected as a duplicate:
+    expectStoreError('duplicate', () =>
+      store.insertMessage({ source: 'hermes', targets: ['user'], body: 'OK', hop: 0, sourceRef: 'run-1' }),
+    );
+  } finally { done(); }
+});
+
+test('store: hermes without sourceRef — content-hash duplicate rule still applies', () => {
+  const { store, done } = freshStore('n1-hermes-nosourceref');
+  try {
+    store.insertMessage({ source: 'hermes', targets: ['user'], body: 'OK', hop: 0 });
+    // Identical text without sourceRef is still rejected:
+    expectStoreError('duplicate', () =>
+      store.insertMessage({ source: 'hermes', targets: ['user'], body: 'OK', hop: 0 }),
+    );
+  } finally { done(); }
+});
+
+test('store: astra duplicate rule unchanged — identical text within 10 minutes rejected', () => {
+  const { store, done } = freshStore('n1-astra');
+  try {
+    store.insertMessage({ source: 'astra', targets: ['user'], body: 'same text', hop: 0 });
+    expectStoreError('duplicate', () =>
+      store.insertMessage({ source: 'astra', targets: ['user'], body: 'same text', hop: 0 }),
+    );
+  } finally { done(); }
+});
+
+test('store: codex duplicate rule unchanged — identical text within 10 minutes rejected', () => {
+  const { store, done } = freshStore('n1-codex');
+  try {
+    store.insertMessage({ source: 'codex', targets: ['user'], body: 'same text', hop: 0 });
+    expectStoreError('duplicate', () =>
+      store.insertMessage({ source: 'codex', targets: ['user'], body: 'same text', hop: 0 }),
+    );
+  } finally { done(); }
+});

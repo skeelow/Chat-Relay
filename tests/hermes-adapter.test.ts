@@ -7,17 +7,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, unlinkSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execSync } from 'node:child_process';
+import { WebSocket } from 'ws';
 import {
   HermesAdapter,
   buildArgv,
+  connectToEngine,
   MODE_A_TOOLSETS,
   defaultCwd,
   resolveHermes,
   type HermesAdapterOptions,
 } from '../adapters/hermes/adapter.ts';
+import { startEngine, type EngineHandle } from '../relay/engine.ts';
 
 const FAKE = join(process.cwd(), 'tests', 'fake-hermes.ts');
 const TMP = mkdtempSync(join(tmpdir(), 'relay-hermes-test-'));
@@ -579,6 +583,128 @@ test('C2: oversized stdout (> 8 MB) fails with "Hermes output too large"', async
   const failed = lastFrameOfType(frames, 'failed');
   assert.equal(failed.messageId, 'm-1');
   assert.equal(String(failed.error), 'Hermes output too large');
+});
+
+// N0 integration: real engine + real HermesAdapter + fake-hermes, hello and
+// delivery flow end to end. This test must fail on the pre-fix code because
+// main() waited for a server auth reply that never comes.
+test('N0 integration: real engine delivers to hermes via connectToEngine', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-n0-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+
+  // Write a token file the engine will use (it's already created by startEngine,
+  // but we write our own so we know the value).
+  const token = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  writeFileSync(tokenPath, token, 'utf8');
+
+  const engine = await startEngine({ port: 0, dbPath, tokenPath });
+  const url = `ws://127.0.0.1:${engine.port}`;
+
+  try {
+    // Fake hermes: normal mode, a known session id, and a short reply.
+    clearControl();
+    setControl('normal', { sessionId: 'sess-n0-1', text: 'OK' });
+
+    // Real HermesAdapter with the fake executable.
+    const adapter = new HermesAdapter({
+      executable: FAKE,
+      sendFrame: () => { /* bound by connectToEngine */ },
+      maxRunSec: 1,
+      timeoutExtraSec: 1,
+      cwd: TMP,
+    });
+
+    // connectToEngine binds the adapter's sendFrame to the socket and sends
+    // auth + hello immediately on open (no waiting for a server auth reply).
+    connectToEngine(url, token, adapter);
+
+    // --- GUI client -------------------------------------------------------
+    const gui = new WebSocket(url);
+    const guiFrames: unknown[] = [];
+    let guiFrameResolve: ((v: unknown) => void) | null = null;
+    let guiAuthenticated = false;
+
+    const guiNextFrame = (timeoutMs = 10000): Promise<unknown> =>
+      new Promise((resolve, reject) => {
+        if (guiFrames.length > 0) { resolve(guiFrames.shift()); return; }
+        guiFrameResolve = resolve;
+        setTimeout(() => reject(new Error('gui frame timeout')), timeoutMs);
+      });
+
+    gui.onopen = () => {
+      gui.send(JSON.stringify({ type: 'auth', token }));
+      setTimeout(() => { guiAuthenticated = true; }, 300);
+    };
+    gui.onmessage = (event) => {
+      try { guiFrames.push(JSON.parse(String(event.data))); } catch {}
+      if (guiFrameResolve) { const r = guiFrameResolve; guiFrameResolve = null; r(guiFrames[guiFrames.length - 1]); }
+    };
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.ok(guiAuthenticated, 'GUI authenticated');
+
+    // gui_hello to get the snapshot (includes adapter statuses).
+    gui.send(JSON.stringify({ type: 'gui_hello' }));
+    const snapshot = (await guiNextFrame()) as { type: string; statuses: Record<string, string> };
+    assert.equal(snapshot.type, 'snapshot');
+    assert.equal(snapshot.statuses.hermes, 'idle', 'hermes status is idle after hello');
+
+    // Send a message to hermes.
+    gui.send(JSON.stringify({ type: 'send', body: 'Remember the code word PLUM-18.', targets: ['hermes'] }));
+
+    // delivery_update (delivering) — proves config was received and the deliver went out.
+    let delivering: unknown = null;
+    for (let i = 0; i < 10; i++) {
+      const f = await guiNextFrame(3000);
+      const ft = f as { type?: string; target?: string; status?: string };
+      if (ft.type === 'delivery_update' && ft.target === 'hermes' && ft.status === 'delivering') {
+        delivering = f;
+        break;
+      }
+    }
+    assert.ok(delivering, 'delivery to hermes reached delivering (config was received)');
+
+    // transcript_update with a hermes capture — the adapter stored the reply.
+    let captured: unknown = null;
+    for (let i = 0; i < 10; i++) {
+      const f = await guiNextFrame(3000);
+      const ft = f as { type?: string; message?: { source?: string; body?: string; sourceRef?: string } };
+      if (ft.type === 'transcript_update' && ft.message?.source === 'hermes') {
+        captured = f;
+        break;
+      }
+    }
+    assert.ok(captured, 'hermes capture stored in transcript');
+    const capMsg = (captured as { message: { source: string; body: string; sourceRef?: string } }).message;
+    assert.equal(capMsg.source, 'hermes');
+    assert.ok(capMsg.sourceRef, 'capture carries a sourceRef');
+
+    // delivery_update (delivered) — the adapter acknowledged delivery.
+    let delivered: unknown = null;
+    for (let i = 0; i < 10; i++) {
+      const f = await guiNextFrame(3000);
+      const ft = f as { type?: string; target?: string; status?: string };
+      if (ft.type === 'delivery_update' && ft.target === 'hermes' && ft.status === 'delivered') {
+        delivered = f;
+        break;
+      }
+    }
+    assert.ok(delivered, 'delivery to hermes ended delivered');
+
+    // hermes_session_id is stored in settings.
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'hermes_session_id'").get() as { value: string } | undefined;
+    db.close();
+    assert.ok(row?.value, 'hermes_session_id stored in settings');
+    assert.equal(row.value, 'sess-n0-1', 'hermes_session_id matches the fake hermes session id');
+
+    gui.close();
+    adapter.close();
+  } finally {
+    engine.stop();
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
 });
 
 // Cleanup the temp dir once all tests in this file are done.

@@ -120,7 +120,7 @@ interface Run {
 /** One Hermes run per deliver. Only one run at a time. */
 export class HermesAdapter {
   private readonly executable: string;
-  private readonly sendFrame: (frame: unknown) => void;
+  private sendFrame: (frame: unknown) => void;
   private readonly profile: string;
   private readonly maxTurns: number;
   private readonly maxRunSec: number;
@@ -150,6 +150,11 @@ export class HermesAdapter {
     this.timeoutExtraSec = options.timeoutExtraSec ?? 30;
     this.cwd = options.cwd ?? defaultCwd();
     this.startMs = options.startMs ?? Date.now();
+  }
+
+  /** Rebind the frame sender to a live socket (used by connectToEngine). */
+  bindSendFrame(send: (frame: unknown) => void): void {
+    this.sendFrame = send;
   }
 
   start(): void {
@@ -461,56 +466,49 @@ function readToken(tokenPath: string): string | null {
   } catch { return null; }
 }
 
+export function connectToEngine(
+  url: string,
+  token: string,
+  adapter: HermesAdapter,
+  WebSocketCtor: typeof WebSocket = WebSocket,
+): WebSocket {
+  const ws = new WebSocketCtor(url);
+  const send = (frame: unknown): void => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+  };
+  adapter.bindSendFrame(send);
+  ws.onopen = () => {
+    // Send auth and start the adapter at once — the engine never sends an
+    // auth reply, so we must not wait for one (the Codex adapter sends auth
+    // and hello together on open).
+    ws.send(JSON.stringify({ type: 'auth', token }));
+    adapter.start();
+  };
+  ws.onmessage = (event) => {
+    let frame: unknown;
+    try { frame = JSON.parse(String(event.data)); } catch { return; }
+    const rec = frame as Record<string, unknown>;
+    if (rec.type === 'config') adapter.handleConfig(typeof rec.threadId === 'string' ? rec.threadId : null);
+    else if (rec.type === 'deliver') {
+      if (typeof rec.messageId === 'string' && typeof rec.text === 'string') {
+        void adapter.deliver(rec.messageId, rec.text);
+      }
+    } else if (rec.type === 'interrupt') {
+      adapter.handleInterrupt();
+    }
+  };
+  ws.onclose = () => {
+    adapter.close(); // kill any running tree so no orphaned hermes.exe remains
+  };
+  ws.onerror = () => { /* onclose handles retry */ };
+  return ws;
+}
+
 async function main(): Promise<void> {
   const { engineUrl, tokenPath, profile } = parseArgs(process.argv.slice(2));
   const executable = resolveHermes();
-  // sendFrame is a mutable holder so it can be bound to the socket after auth.
-  const sendHolder: { send: (frame: unknown) => void } = { send: () => { /* no socket yet */ } };
-  const adapter = new HermesAdapter({ executable, profile, sendFrame: (f) => sendHolder.send(f) });
-  let ws: WebSocket | null = null;
-
-  const connect = (): void => {
-    const token = readToken(tokenPath);
-    if (token === null) {
-      console.error(`[hermes-adapter] token file not found: ${tokenPath} — will keep retrying`);
-      setTimeout(connect, 2000);
-      return;
-    }
-    ws = new WebSocket(engineUrl);
-    let authenticated = false;
-    ws.onopen = () => { ws!.send(JSON.stringify({ type: 'auth', token })); };
-    ws.onmessage = (event) => {
-      let frame: unknown;
-      try { frame = JSON.parse(String(event.data)); } catch { return; }
-      const rec = frame as Record<string, unknown>;
-      if (!authenticated) {
-        if (rec.type === 'auth') {
-          authenticated = true;
-          sendHolder.send = (frame) => {
-            if (ws !== null && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
-          };
-          adapter.start(); // hello + idle, now that we're authenticated
-        }
-        return;
-      }
-      if (rec.type === 'config') adapter.handleConfig(typeof rec.threadId === 'string' ? rec.threadId : null);
-      else if (rec.type === 'deliver') {
-        if (typeof rec.messageId === 'string' && typeof rec.text === 'string') {
-          void adapter.deliver(rec.messageId, rec.text);
-        }
-      } else if (rec.type === 'interrupt') {
-        adapter.handleInterrupt();
-      }
-    };
-    ws.onclose = () => {
-      ws = null;
-      adapter.close(); // kill any running tree so no orphaned hermes.exe remains
-      if (!process.exitCode) setTimeout(connect, 2000);
-    };
-    ws.onerror = () => { /* onclose handles retry */ };
-  };
-
-  connect();
+  const adapter = new HermesAdapter({ executable, profile, sendFrame: () => { /* bound by connectToEngine */ } });
+  connectToEngine(engineUrl, readToken(tokenPath) ?? '', adapter);
   process.on('SIGINT', () => { adapter.close(); process.exit(0); });
   process.on('SIGTERM', () => { adapter.close(); process.exit(0); });
 }
