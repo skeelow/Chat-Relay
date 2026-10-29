@@ -112,6 +112,10 @@ export function sendButton(
   return { show: false, label: '', target };
 }
 
+/** Display name per sender/target. Moved here from renderer.ts (M6.3c) so the
+ *  pure AI footer (footer.ts) can build the held notice without the DOM. */
+export const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', hermes: 'Hermes', user: 'You' };
+
 /** The label shown on each per-target send button. */
 const SEND_LABEL: Record<Target, string> = {
   astra: 'Send to ChatGPT',

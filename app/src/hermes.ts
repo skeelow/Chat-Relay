@@ -32,14 +32,9 @@ export function hermesModeBadge(mode: string | undefined): ModeBadge {
   }
 }
 
-/** The pill label for a Hermes status: known statuses are capitalised,
- *  anything else is shown raw — never guessed. */
+/** The pill label for a Hermes status. M6.3c (m6.3b C1): lowercase, matching
+ *  the Astra and Codex pills (setPill shows those raw, '_' → ' '); an unknown
+ *  status is shown raw — never guessed. */
 export function hermesStatusLabel(status: string): string {
-  const capitals: Record<string, string> = {
-    idle: 'Idle',
-    thinking: 'Thinking',
-    disconnected: 'Disconnected',
-    failed: 'Failed',
-  };
-  return capitals[status] ?? status;
+  return status.replaceAll('_', ' ');
 }

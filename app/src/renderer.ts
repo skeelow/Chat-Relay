@@ -24,6 +24,7 @@ import {
   type ApprovalView,
 } from './approvals.ts';
 import {
+  SENDER_LABELS,
   applyClick,
   applyDeliveryUpdate,
   applySnapshotDeliveries,
@@ -37,7 +38,6 @@ import {
   pendingCount,
   rejectFrame,
   resumeFrame,
-  sendButtons,
   stopButtonLabel,
   stopFrame,
   userFooterTargets,
@@ -56,9 +56,10 @@ import {
 } from './settings.ts';
 import {
   applyCountdownFrame, autoSendControlsEnabled, countdownHeaderText, emptyCountdownState,
-  heldNotice, heldNoticeHelp, pendingDecision, tickCountdowns, type CountdownState,
+  tickCountdowns, type CountdownState,
 } from './countdown.ts';
 import { summaryLine, type SessionSummary } from './summary.ts';
+import { aiFooterLines } from './footer.ts';
 
 const ENGINE_URL = 'ws://127.0.0.1:8787';
 const RECONNECT_MS = 2000;
@@ -156,8 +157,6 @@ function renderSessionSummary(): void {
   sessionSummaryEl.textContent = line.text;
   sessionSummaryEl.classList.toggle('attention', line.approvalsEmphasised);
 }
-
-const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', hermes: 'Hermes', user: 'You' };
 
 function engineState(label: string, on: boolean): void {
   if (engineLabel !== null) engineLabel.textContent = label;
@@ -480,67 +479,30 @@ function renderDelivery(messageId: string): void {
   const rowsForThisMessage = [...deliveryState.rows.values()].filter(
     (row) => row.messageId === messageId,
   );
-  const entries = sendButtons(source, rowsForThisMessage);
-  for (const entry of entries) {
-    const target = entry.target;
-    const key = deliveryKey(messageId, target);
-    const delivery = deliveryState.rows.get(key);
-    const view = delivery === undefined
-      ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
-      : deliveryStatusView(delivery, target);
-    // Nothing to show for this target: no send button and no actions.
-    if (!entry.show && view.actions.length === 0) continue;
-
-    const line = document.createElement('div');
-    line.className = 'delivery-line';
-
-    // Status label: held notice (never on Hermes per D29), then view label.
-    const held = heldNotices.get(messageId);
-    let label = view.label;
-    if (held !== undefined && target !== 'hermes') {
-      label = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-    }
-    // M5.1 (D18 GUI): while a countdown runs on a pending item, labels read
-    // Sending in Ns / Send now / Cancel. D29: no countdown on a Hermes line.
-    const countdownSeconds = countdownState.secondsLeft[key];
-    const hasCountdown =
-      countdownSeconds !== undefined && view.actions.includes('approve') && target !== 'hermes';
-    const decision = pendingDecision(hasCountdown, countdownSeconds ?? 0);
-    if (hasCountdown) {
-      label = decision.label;
-    }
-
+  const held = heldNotices.get(messageId);
+  // M6.3c (m6.3b M1+S1): the AI footer's lines and buttons are decided by the
+  // pure aiFooterLines (app/src/footer.ts) so they are testable; this only
+  // renders them. A line is skipped only when it has nothing to show, so the
+  // queued/delivering/delivered and final-failed rows keep their status label.
+  const lines = aiFooterLines(source, rowsForThisMessage, {
+    messageId,
+    countdownSeconds: countdownState.secondsLeft,
+    held: held === undefined ? undefined : { cap: held.cap },
+  });
+  for (const line of lines) {
+    const lineEl = document.createElement('div');
+    lineEl.className = 'delivery-line';
     const status = document.createElement('span');
     status.className = 'line-status';
-    status.textContent = label; // textContent only — error text included
-    line.append(status);
-
+    status.textContent = line.label; // textContent only — error text included
+    lineEl.append(status);
     const actions = document.createElement('span');
     actions.className = 'line-actions';
-
-    // Forward button: Send to X / Send again (from sendButtons).
-    if (entry.show) {
-      appendActionButton(actions, { action: 'forward', label: entry.label }, messageId, target);
+    for (const button of line.buttons) {
+      appendActionButton(actions, { action: button.action, label: button.label }, messageId, line.target);
     }
-
-    // Approve/Reject buttons for pending rows.
-    for (const action of view.actions) {
-      if (action === 'approve') {
-        appendActionButton(actions, {
-          action,
-          label: hasCountdown ? decision.approveLabel : 'Approve',
-        }, messageId, target);
-      } else if (action === 'reject') {
-        appendActionButton(actions, {
-          action,
-          label: hasCountdown ? decision.rejectLabel : 'Reject',
-        }, messageId, target);
-      }
-      // 'forward' in the table is the failed case — sendButtons shows it as Send again.
-    }
-
-    line.append(actions);
-    footer.actions.append(line);
+    lineEl.append(actions);
+    footer.actions.append(lineEl);
   }
 }
 

@@ -103,6 +103,7 @@
         return { label: delivery.status, actions: [] };
     }
   }
+  var SENDER_LABELS = { astra: "Astra", codex: "Codex", hermes: "Hermes", user: "You" };
   var SEND_LABEL = {
     astra: "Send to ChatGPT",
     codex: "Send to Codex",
@@ -221,13 +222,7 @@
     }
   }
   function hermesStatusLabel(status) {
-    const capitals = {
-      idle: "Idle",
-      thinking: "Thinking",
-      disconnected: "Disconnected",
-      failed: "Failed"
-    };
-    return capitals[status] ?? status;
+    return status.replaceAll("_", " ");
   }
 
   // app/src/search.ts
@@ -373,6 +368,41 @@
     };
   }
 
+  // app/src/footer.ts
+  function aiFooterLines(source, rows, ctx) {
+    const lines = [];
+    for (const entry of sendButtons(source, rows)) {
+      const target = entry.target;
+      const key = deliveryKey(ctx.messageId, target);
+      const delivery = rows.find((row) => row.target === target);
+      const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
+      let label = view.label;
+      if (ctx.held !== void 0 && target !== "hermes") {
+        label = `${heldNotice(ctx.held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+      }
+      const countdownSeconds = ctx.countdownSeconds[key];
+      const hasCountdown = countdownSeconds !== void 0 && view.actions.includes("approve") && target !== "hermes";
+      const decision = pendingDecision(hasCountdown, countdownSeconds ?? 0);
+      if (hasCountdown) {
+        label = decision.label;
+      }
+      const buttons = [];
+      if (entry.show) {
+        buttons.push({ action: "forward", label: entry.label });
+      }
+      for (const action of view.actions) {
+        if (action === "approve") {
+          buttons.push({ action, label: hasCountdown ? decision.approveLabel : "Approve" });
+        } else if (action === "reject") {
+          buttons.push({ action, label: hasCountdown ? decision.rejectLabel : "Reject" });
+        }
+      }
+      if (label === "" && buttons.length === 0) continue;
+      lines.push({ target, label, buttons });
+    }
+    return lines;
+  }
+
   // app/src/renderer.ts
   var ENGINE_URL = "ws://127.0.0.1:8787";
   var RECONNECT_MS = 2e3;
@@ -433,7 +463,6 @@
     sessionSummaryEl.textContent = line.text;
     sessionSummaryEl.classList.toggle("attention", line.approvalsEmphasised);
   }
-  var SENDER_LABELS = { astra: "Astra", codex: "Codex", hermes: "Hermes", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
     if (dot !== null) dot.className = on ? "on" : "off";
@@ -701,50 +730,26 @@
     const rowsForThisMessage = [...deliveryState.rows.values()].filter(
       (row) => row.messageId === messageId
     );
-    const entries = sendButtons(source, rowsForThisMessage);
-    for (const entry of entries) {
-      const target = entry.target;
-      const key = deliveryKey(messageId, target);
-      const delivery = deliveryState.rows.get(key);
-      const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
-      if (!entry.show && view.actions.length === 0) continue;
-      const line = document.createElement("div");
-      line.className = "delivery-line";
-      const held = heldNotices.get(messageId);
-      let label = view.label;
-      if (held !== void 0 && target !== "hermes") {
-        label = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-      }
-      const countdownSeconds = countdownState.secondsLeft[key];
-      const hasCountdown = countdownSeconds !== void 0 && view.actions.includes("approve") && target !== "hermes";
-      const decision = pendingDecision(hasCountdown, countdownSeconds ?? 0);
-      if (hasCountdown) {
-        label = decision.label;
-      }
+    const held = heldNotices.get(messageId);
+    const lines = aiFooterLines(source, rowsForThisMessage, {
+      messageId,
+      countdownSeconds: countdownState.secondsLeft,
+      held: held === void 0 ? void 0 : { cap: held.cap }
+    });
+    for (const line of lines) {
+      const lineEl = document.createElement("div");
+      lineEl.className = "delivery-line";
       const status = document.createElement("span");
       status.className = "line-status";
-      status.textContent = label;
-      line.append(status);
+      status.textContent = line.label;
+      lineEl.append(status);
       const actions = document.createElement("span");
       actions.className = "line-actions";
-      if (entry.show) {
-        appendActionButton(actions, { action: "forward", label: entry.label }, messageId, target);
+      for (const button of line.buttons) {
+        appendActionButton(actions, { action: button.action, label: button.label }, messageId, line.target);
       }
-      for (const action of view.actions) {
-        if (action === "approve") {
-          appendActionButton(actions, {
-            action,
-            label: hasCountdown ? decision.approveLabel : "Approve"
-          }, messageId, target);
-        } else if (action === "reject") {
-          appendActionButton(actions, {
-            action,
-            label: hasCountdown ? decision.rejectLabel : "Reject"
-          }, messageId, target);
-        }
-      }
-      line.append(actions);
-      footer.actions.append(line);
+      lineEl.append(actions);
+      footer.actions.append(lineEl);
     }
   }
   function updatePendingBadge() {
