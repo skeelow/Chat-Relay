@@ -6,6 +6,7 @@
 // deliveries or a delivery_update, mapped through the per-target tables.
 // M3.1 (G2): rows are keyed `${messageId}:${target}` — one message can carry
 // a delivery to each AI. M3.1 (G1): a snapshot clears every pending click.
+import type { Target } from './compose.ts';
 
 /** A delivery row as the engine reports it (snapshot deliveries / delivery_update). */
 export interface DeliveryRow {
@@ -33,7 +34,6 @@ export function deliveryStatusView(
   delivery: DeliveryRow,
   target: string,
 ): { label: string; actions: DeliveryAction[] } {
-  const toAstra = target === 'astra';
   switch (delivery.status) {
     case 'pending_approval':
       return {
@@ -44,13 +44,31 @@ export function deliveryStatusView(
       };
     case 'queued':
       return {
-        label: toAstra ? 'Approved, waiting for the ChatGPT extension' : 'Approved, waiting for Codex adapter',
+        label: target === 'astra'
+          ? 'Approved, waiting for the ChatGPT extension'
+          : target === 'codex'
+            ? 'Approved, waiting for Codex adapter'
+            : 'Approved, waiting for Hermes',
         actions: [],
       };
     case 'delivering':
-      return { label: toAstra ? 'Typing into ChatGPT…' : 'Sending to Codex…', actions: [] };
+      return {
+        label: target === 'astra'
+          ? 'Typing into ChatGPT…'
+          : target === 'codex'
+            ? 'Sending to Codex…'
+            : 'Hermes is working…',
+        actions: [],
+      };
     case 'delivered':
-      return { label: toAstra ? 'Typed into ChatGPT — click Send there' : 'Sent to Codex', actions: [] };
+      return {
+        label: target === 'astra'
+          ? 'Typed into ChatGPT — click Send there'
+          : target === 'codex'
+            ? 'Sent to Codex'
+            : 'Hermes replied',
+        actions: [],
+      };
     case 'failed':
       if (delivery.attempts >= 3) {
         return { label: `Failed after 3 attempts: ${delivery.error ?? 'unknown error'}`, actions: [] };
@@ -94,6 +112,48 @@ export function sendButton(
   return { show: false, label: '', target };
 }
 
+/** The label shown on each per-target send button. */
+const SEND_LABEL: Record<Target, string> = {
+  astra: 'Send to ChatGPT',
+  codex: 'Send to Codex',
+  hermes: 'Send to Hermes',
+};
+
+/** The targets offered to the source AI, in label order: the "other" AIs. */
+function otherTargets(source: string): Target[] {
+  if (source === 'astra') return ['codex', 'hermes'];
+  if (source === 'codex') return ['astra', 'hermes'];
+  if (source === 'hermes') return ['astra', 'codex'];
+  return []; // user (or anything else) — no send buttons
+}
+
+/** One per-target send button entry: show/hide plus label and target. */
+export interface SendButtonEntry {
+  show: boolean;
+  label: string;
+  target: Target;
+}
+
+/** M6.3a: one send-button entry per other AI for this message.
+ *
+ * The same rules as today's `sendButton` apply per entry: shown when there is
+ * no delivery row for that target; "Send again" after a failure with fewer
+ * than 3 attempts; hidden after 3 failed attempts or when a row is in any
+ * other state. `sendButton` and `targetFor` are unchanged.
+ */
+export function sendButtons(source: string, rowsForThisMessage: DeliveryRow[]): SendButtonEntry[] {
+  return otherTargets(source).map((target) => {
+    const delivery = rowsForThisMessage.find((row) => row.target === target);
+    const plain = SEND_LABEL[target];
+    if (delivery === undefined) return { show: true, label: plain, target };
+    if (delivery.status === 'failed' && delivery.attempts >= 3) {
+      return { show: false, label: '', target };
+    }
+    if (delivery.status === 'failed') return { show: true, label: 'Send again', target };
+    return { show: false, label: '', target };
+  });
+}
+
 /** Header count: how many rows wait for the user's approval, across targets. */
 export function pendingCount(rows: DeliveryRow[]): number {
   return rows.filter((row) => row.status === 'pending_approval').length;
@@ -101,7 +161,10 @@ export function pendingCount(rows: DeliveryRow[]): number {
 
 /**
  * M4.1: the targets a user message has delivery rows for, in a stable order
- * (astra first) — one footer line per target. Empty until the rows arrive.
+ * (astra, codex) — one footer line per target. Empty until the rows arrive.
+ * Hermes footer lines are rendered in part b (screen work); here the pure
+ * helpers already accept `hermes` for deliveryStatusView, sendButtons and the
+ * frames.
  */
 export function userFooterTargets(messageId: string, rows: DeliveryRow[]): Array<'astra' | 'codex'> {
   const order: Array<'astra' | 'codex'> = ['astra', 'codex'];
@@ -158,15 +221,15 @@ export function applyClick(state: DeliveryUiState, key: string): DeliveryUiState
 
 // --- the exact frames the GUI sends (SPEC protocol table) ---
 
-export function forwardFrame(messageId: string, target: 'codex' | 'astra'): { type: 'forward'; messageId: string; target: 'codex' | 'astra' } {
+export function forwardFrame(messageId: string, target: Target): { type: 'forward'; messageId: string; target: Target } {
   return { type: 'forward', messageId, target };
 }
 
-export function approveFrame(messageId: string, target: 'codex' | 'astra'): { type: 'approve'; messageId: string; target: 'codex' | 'astra' } {
+export function approveFrame(messageId: string, target: Target): { type: 'approve'; messageId: string; target: Target } {
   return { type: 'approve', messageId, target };
 }
 
-export function rejectFrame(messageId: string, target: 'codex' | 'astra'): { type: 'reject'; messageId: string; target: 'codex' | 'astra' } {
+export function rejectFrame(messageId: string, target: Target): { type: 'reject'; messageId: string; target: Target } {
   return { type: 'reject', messageId, target };
 }
 

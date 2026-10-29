@@ -71,7 +71,6 @@
 
   // app/src/deliveries.ts
   function deliveryStatusView(delivery, target) {
-    const toAstra = target === "astra";
     switch (delivery.status) {
       case "pending_approval":
         return {
@@ -80,13 +79,19 @@
         };
       case "queued":
         return {
-          label: toAstra ? "Approved, waiting for the ChatGPT extension" : "Approved, waiting for Codex adapter",
+          label: target === "astra" ? "Approved, waiting for the ChatGPT extension" : target === "codex" ? "Approved, waiting for Codex adapter" : "Approved, waiting for Hermes",
           actions: []
         };
       case "delivering":
-        return { label: toAstra ? "Typing into ChatGPT\u2026" : "Sending to Codex\u2026", actions: [] };
+        return {
+          label: target === "astra" ? "Typing into ChatGPT\u2026" : target === "codex" ? "Sending to Codex\u2026" : "Hermes is working\u2026",
+          actions: []
+        };
       case "delivered":
-        return { label: toAstra ? "Typed into ChatGPT \u2014 click Send there" : "Sent to Codex", actions: [] };
+        return {
+          label: target === "astra" ? "Typed into ChatGPT \u2014 click Send there" : target === "codex" ? "Sent to Codex" : "Hermes replied",
+          actions: []
+        };
       case "failed":
         if (delivery.attempts >= 3) {
           return { label: `Failed after 3 attempts: ${delivery.error ?? "unknown error"}`, actions: [] };
@@ -174,11 +179,13 @@
 
   // app/src/compose.ts
   var COMPOSE_BODY_CAP = 2e4;
-  var PREFIX = /^\s*@(?<tag>astra|codex|both)\b[,;:\s]*/i;
+  var PREFIX = /^\s*@(?<tag>astra|codex|both|hermes|all)\b[,;:\s]*/i;
   var TARGETS_OF = {
     astra: ["astra"],
     codex: ["codex"],
-    both: ["astra", "codex"]
+    both: ["astra", "codex"],
+    hermes: ["hermes"],
+    all: ["astra", "codex", "hermes"]
   };
   function parseCompose(text, selector) {
     const match = PREFIX.exec(text);

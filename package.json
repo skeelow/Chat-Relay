@@ -9,7 +9,7 @@
   },
   "main": "app/dist/main.cjs",
   "scripts": {
-    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts tests/gui-deliveries.test.ts tests/gui-approvals.test.ts tests/compose.test.ts tests/gui-settings.test.ts tests/export.test.ts tests/gui-search.test.ts tests/gui-tray-window.test.ts tests/gui-countdown.test.ts tests/gui-summary.test.ts tests/hermes-adapter.test.ts tests/hermes-engine.test.ts tests/preflight.test.ts",
+    "test": "node --test --test-force-exit tests/store.test.ts tests/engine.test.ts tests/codex-adapter.test.ts tests/chatgpt-ext.test.ts tests/gui-deliveries.test.ts tests/gui-approvals.test.ts tests/compose.test.ts tests/gui-settings.test.ts tests/export.test.ts tests/gui-search.test.ts tests/gui-tray-window.test.ts tests/gui-countdown.test.ts tests/gui-hermes.test.ts tests/gui-summary.test.ts tests/hermes-adapter.test.ts tests/hermes-engine.test.ts tests/preflight.test.ts",
     "typecheck": "tsc --noEmit",
     "preflight": "node scripts/preflight.mjs",
     "smoke:hermes": "node scripts/smoke-hermes.ts",

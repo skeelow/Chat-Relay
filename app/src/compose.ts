@@ -14,8 +14,11 @@ export const COMPOSE_BODY_CAP = 20000;
 export interface ComposeSend {
   ok: true;
   body: string;
-  targets: Array<'astra' | 'codex'>;
+  targets: Target[];
 }
+
+/** A GUI send target: Astra, Codex or Hermes. */
+export type Target = 'astra' | 'codex' | 'hermes';
 
 /** Why the text cannot be sent (the box keeps its text either way). */
 export type ComposeRefusal = { ok: false; reason: 'empty' | 'too-long' };
@@ -23,12 +26,14 @@ export type ComposeRefusal = { ok: false; reason: 'empty' | 'too-long' };
 /** The @-prefix: the tag must end at a word boundary, so a mid-sentence
  *  mention (@codex later, …) and a glued word (@astrahello) are plain text.
  *  Separators right after the tag (", hi", ": hi") are part of the prefix. */
-const PREFIX = /^\s*@(?<tag>astra|codex|both)\b[,;:\s]*/i;
+const PREFIX = /^\s*@(?<tag>astra|codex|both|hermes|all)\b[,;:\s]*/i;
 
-const TARGETS_OF: Record<string, Array<'astra' | 'codex'>> = {
+const TARGETS_OF: Record<string, Target[]> = {
   astra: ['astra'],
   codex: ['codex'],
   both: ['astra', 'codex'],
+  hermes: ['hermes'],
+  all: ['astra', 'codex', 'hermes'],
 };
 
 /**
