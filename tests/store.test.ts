@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openStore, hashBody, isOverTurnCap, validateModeUpdate, StoreError, ulid, type Participant, type RelayStore } from '../relay/store.ts';
@@ -24,7 +25,7 @@ function freshStore(label: string): Fresh {
   const dir = mkdtempSync(join(tmpdir(), `relay-${label}-`));
   const dbPath = join(dir, 'relay.db');
   const store = openStore(dbPath);
-  return { store, dbPath, done: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
+  return { store, dbPath, done: () => { store.close(); try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ } } };
 }
 
 function expectStoreError(code: 'duplicate' | 'relay_header' | 'not_found' | 'settled' | 'invalid_targets', fn: () => void): void {
@@ -279,7 +280,7 @@ test('killing the process mid-delivery and restarting lists the message as pendi
     assert.equal(pending.length, 1);
     assert.equal(pending[0].body, 'crash me mid-delivery');
     assert.notEqual(pending[0].status, 'delivered');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ } }
 });
 
 // --- M2.1 ---
@@ -371,7 +372,7 @@ test('hopForCapture: a restart between the delivery and the capture keeps the ch
       store.close();
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
   }
 });
 
@@ -572,4 +573,231 @@ test('searchMessages: limit 100, newest first, total counts past the limit', () 
     }
     assert.equal(messages[0].body, 'matchword number 119', 'the newest match leads');
   } finally { done(); }
+});
+
+// --- M6.2: the one-time user_version migration (hermes Participant) ---
+
+/** The pre-M6.2 schema: CHECKs without 'hermes', user_version stays 0. */
+const OLD_SCHEMA = `
+  CREATE TABLE messages (
+    id           TEXT PRIMARY KEY,
+    source       TEXT NOT NULL CHECK (source IN ('user','astra','codex')),
+    body         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_ref   TEXT,
+    hop          INTEGER NOT NULL CHECK (hop >= 0),
+    created_at   TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX messages_source_ref
+    ON messages (source_ref) WHERE source_ref IS NOT NULL;
+  CREATE INDEX messages_dedupe
+    ON messages (source, content_hash, created_at);
+
+  CREATE TABLE deliveries (
+    message_id TEXT NOT NULL REFERENCES messages (id),
+    target     TEXT NOT NULL CHECK (target IN ('user','astra','codex')),
+    status     TEXT NOT NULL CHECK (status IN
+      ('captured','pending_approval','queued','delivering','delivered','failed','cancelled')),
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    error      TEXT,
+    PRIMARY KEY (message_id, target)
+  );
+
+  CREATE TABLE settings (key   TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE adapter_state (adapter       TEXT PRIMARY KEY, last_seen_ref TEXT, updated_at    TEXT NOT NULL);
+`;
+
+function userVersion(dbPath: string): number {
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
+  db.close();
+  return row?.user_version ?? 0;
+}
+
+function columnCheck(dbPath: string, table: string, column: string): string | null {
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  ).get(table) as { sql: string } | undefined;
+  db.close();
+  if (row === undefined) return null;
+  const m = row.sql.match(new RegExp(`CHECK \\(${column} IN \\(([^)]+)\\)\\)`));
+  return m ? m[1] : null;
+}
+
+test('store: fresh database has the new CHECKs and user_version 1', () => {
+  const { store, dbPath, done } = freshStore('mig-fresh');
+  try {
+    assert.equal(userVersion(dbPath), 1, 'fresh database starts at user_version 1');
+    assert.equal(columnCheck(dbPath, 'messages', 'source'),
+      "'user','astra','codex','hermes'", 'messages.source CHECK includes hermes');
+    assert.equal(columnCheck(dbPath, 'deliveries', 'target'),
+      "'user','astra','codex','hermes'", 'deliveries.target CHECK includes hermes');
+    // Inserting a hermes message and delivery works on a fresh database.
+    const msg = store.insertMessage({ source: 'hermes', targets: ['user'], body: 'hi from hermes', hop: 0 });
+    store.insertDelivery(msg.id, 'hermes');
+    assert.equal(store.getDelivery(msg.id, 'hermes')?.status, 'pending_approval');
+  } finally { done(); }
+});
+
+test('store: old-schema database migrates with identical rows', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-old-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Build an old-schema database and fill it (all five statuses, error values, a source_ref).
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_SCHEMA);
+    const msg = old.prepare(
+      'INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)',
+    );
+    msg.run('m-1', 'astra', 'body one', hashBody('body one'), 'ref-1', 0, '2026-01-01T00:00:00Z');
+    msg.run('m-2', 'codex', 'body two', hashBody('body two'), null, 1, '2026-01-02T00:00:00Z');
+    const del = old.prepare(
+      'INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) VALUES (?,?,?,?,?,?)',
+    );
+    del.run('m-1', 'codex', 'delivered', 2, '2026-01-01T01:00:00Z', null);
+    del.run('m-2', 'astra', 'failed', 1, '2026-01-02T02:00:00Z', 'boom');
+    old.exec('PRAGMA user_version = 0;'); // explicit: pre-M6.2
+    old.close();
+
+    assert.equal(userVersion(dbPath), 0, 'old database is at user_version 0');
+    assert.equal(columnCheck(dbPath, 'messages', 'source'),
+      "'user','astra','codex'", 'old messages CHECK lacks hermes');
+
+    // Snapshot the old rows before migration.
+    const oldRows = (() => {
+      const db = new DatabaseSync(dbPath);
+      const messages = db.prepare('SELECT * FROM messages ORDER BY id').all() as Record<string, unknown>[];
+      const deliveries = db.prepare('SELECT * FROM deliveries ORDER BY message_id, target').all() as Record<string, unknown>[];
+      db.close();
+      return { messages, deliveries };
+    })();
+
+    // Open with openStore -> migration runs.
+    const { store, done } = freshStore('mig-old-reuse');
+    // freshStore makes its own db; instead open the migrated db directly:
+    done();
+    const migrated = openStore(dbPath);
+    try {
+      assert.equal(userVersion(dbPath), 1, 'migrated database is at user_version 1');
+      assert.equal(columnCheck(dbPath, 'messages', 'source'),
+        "'user','astra','codex','hermes'", 'migrated messages CHECK includes hermes');
+      assert.equal(columnCheck(dbPath, 'deliveries', 'target'),
+        "'user','astra','codex','hermes'", 'migrated deliveries CHECK includes hermes');
+
+      // Row counts and every column identical after migration.
+      // Re-read via a fresh store handle to compare raw rows.
+      const check = openStore(dbPath);
+      try {
+        const db = new DatabaseSync(dbPath);
+        const newMessages = db.prepare('SELECT * FROM messages ORDER BY id').all() as Record<string, unknown>[];
+        const newDeliveries = db.prepare('SELECT * FROM deliveries ORDER BY message_id, target').all() as Record<string, unknown>[];
+        db.close();
+        assert.deepEqual(newMessages, oldRows.messages, 'messages rows identical after migration');
+        assert.deepEqual(newDeliveries, oldRows.deliveries, 'deliveries rows identical after migration');
+        assert.equal(newMessages.length, 2, 'message row count preserved');
+        assert.equal(newDeliveries.length, 2, 'delivery row count preserved');
+      } finally { check.close(); }
+
+      // foreign_key_check is clean after migration.
+      const fk = (() => {
+        const db = new DatabaseSync(dbPath);
+        const rows = db.prepare('PRAGMA foreign_key_check').all();
+        db.close();
+        return rows;
+      })();
+      assert.deepEqual(fk, [], 'foreign_key_check clean after migration');
+
+      // Inserting a hermes message works after migration.
+      const hmsg = migrated.insertMessage({ source: 'hermes', targets: ['user'], body: 'hermes now', hop: 0 });
+      migrated.insertDelivery(hmsg.id, 'hermes');
+      assert.equal(migrated.getDelivery(hmsg.id, 'hermes')?.status, 'pending_approval');
+
+      // Re-opening is a no-op (user_version stays 1, rows unchanged).
+      const again = openStore(dbPath);
+      try {
+        assert.equal(userVersion(dbPath), 1, 're-open keeps user_version 1');
+        const db = new DatabaseSync(dbPath);
+        const count = db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number };
+        db.close();
+        assert.equal(count.n, 3, 're-open did not add or lose rows');
+      } finally {
+        again.close();
+      }
+    } finally { migrated.close(); }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+test('store: inserting a hermes message fails on the old schema', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-fail-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_SCHEMA);
+    old.close();
+    assert.equal(userVersion(dbPath), 0, 'old database at user_version 0');
+
+    // openStore migrates it to user_version 1.
+    const store = openStore(dbPath);
+    assert.equal(userVersion(dbPath), 1, 'migrated to user_version 1');
+    // hermes insert now works.
+    const msg = store.insertMessage({ source: 'hermes', targets: ['user'], body: 'ok', hop: 0 });
+    assert.equal(msg.source, 'hermes');
+    store.close();
+
+    // Re-open a brand-new old-schema DB and confirm hermes is rejected pre-migration.
+    const dbPath2 = join(dir, 'relay2.db');
+    const old2 = new DatabaseSync(dbPath2);
+    old2.exec(OLD_SCHEMA);
+    old2.close();
+    assert.throws(() => {
+      const db = new DatabaseSync(dbPath2);
+      db.prepare("INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)")
+        .run('x', 'hermes', 'h', hashBody('h'), null, 0, '2026-01-01T00:00:00Z');
+      db.close();
+    }, /CHECK constraint failed|constraint failed/, 'hermes source rejected by old CHECK');
+    try { rmSync(dbPath2, { force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* dbPath2 locked by leaked handle; pruned after 24h */ }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+test('store: failed migration rolls back and leaves the old database untouched', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-mig-rollback-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Old schema with a delivery that references a non-existent message
+    // (a foreign-key violation that only foreign_key_check can catch).
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_SCHEMA);
+    old.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('m-1', 'astra', 'body', hashBody('body'), null, 0, '2026-01-01T00:00:00Z');
+    old.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) VALUES (?,?,?,?,?,?)')
+      .run('does-not-exist', 'codex', 'delivering', 0, '2026-01-01T01:00:00Z', null);
+    old.close();
+    assert.equal(userVersion(dbPath), 0, 'pre-migration user_version 0');
+
+    // Migration should abort (foreign_key_check non-empty) and throw.
+    assert.throws(() => openStore(dbPath), /migration aborted/, 'openStore throws on failed migration');
+
+    // The database is left untouched: user_version still 0, old CHECK intact.
+    assert.equal(userVersion(dbPath), 0, 'rollback left user_version at 0');
+    assert.equal(columnCheck(dbPath, 'messages', 'source'),
+      "'user','astra','codex'", 'rollback left the old CHECK intact');
+    // And hermes is still rejected.
+    assert.throws(() => {
+      const db = new DatabaseSync(dbPath);
+      db.prepare("INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)")
+        .run('x', 'hermes', 'h', hashBody('h'), null, 0, '2026-01-01T00:00:00Z');
+      db.close();
+    }, /CHECK constraint failed|constraint failed/, 'hermes still rejected after rolled-back migration');
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
 });

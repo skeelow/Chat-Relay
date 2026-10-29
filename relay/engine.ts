@@ -91,7 +91,7 @@ export interface EngineHandle {
 }
 
 /** Adapter names are the participants they speak for; hello with anything else is rejected. */
-type AdapterName = 'codex' | 'astra';
+type AdapterName = 'codex' | 'astra' | 'hermes';
 
 const VALID_STATUSES: readonly string[] =
   ['idle', 'thinking', 'streaming', 'awaiting_approval', 'disconnected',
@@ -108,10 +108,14 @@ const SNAPSHOT_LIMIT = 200;
 const SEARCH_LIMIT = 100;
 
 /** M2.1: default ack window for a delivery before the row is marked failed. */
-const DEFAULT_ACK_TIMEOUT_MS = 30000;
+export const DEFAULT_ACK_TIMEOUT_MS = 30000;
+
+/** M6.2: Hermes runs can take up to maxRunSec + 30 s, so the ack window for
+ *  Hermes deliveries is 6 minutes. Codex and Astra stay at 30 s. */
+export const HERMES_ACK_TIMEOUT_MS = 360000;
 
 /** Display names for the relay header (SPEC: '[Relay · from <Name> · #<id> · hop <n>]'). */
-const SOURCE_NAMES: Record<Participant, string> = { user: 'You', astra: 'Astra', codex: 'Codex' };
+const SOURCE_NAMES: Record<Participant, string> = { user: 'You', astra: 'Astra', codex: 'Codex', hermes: 'Hermes' };
 
 /** M2.1 SPEC relay header — the first line of every delivered text. */
 function relayHeader(pending: { messageId: string; source: Participant; hop: number }): string {
@@ -119,7 +123,7 @@ function relayHeader(pending: { messageId: string; source: Participant; hop: num
 }
 
 function isParticipant(value: unknown): value is Participant {
-  return value === 'user' || value === 'astra' || value === 'codex';
+  return value === 'user' || value === 'astra' || value === 'codex' || value === 'hermes';
 }
 
 interface ClientState {
@@ -156,6 +160,16 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const token = loadOrCreateToken(tokenPath);
   const store = openStore(options.dbPath ?? 'relay.db');
   const ackTimeoutMs = options.deliverAckTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+  // M6.2: the ack timeout is per target. When a test sets deliverAckTimeoutMs
+  // it wins for all targets; otherwise Hermes gets 6 minutes and Codex/Astra
+  // keep 30 seconds.
+  const ackTimeoutOptionSet = options.deliverAckTimeoutMs !== undefined;
+  const ackTimeoutFor = (target: Participant): number =>
+    ackTimeoutOptionSet
+      ? ackTimeoutMs
+      : target === 'hermes'
+        ? HERMES_ACK_TIMEOUT_MS
+        : ackTimeoutMs;
   // M2.1 no-replay: nothing resumes on its own after a (re)start — every
   // in-flight delivery goes back to waiting for the user's approval.
   const resetCount = store.resetInFlightToPending();
@@ -221,7 +235,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   // reality. The 'user' entry exists only for the Participant key type —
   // no adapter registers as the user, and the snapshot reads codex/astra.
   const adapterStatuses: Record<Participant, string> = {
-    user: 'disconnected', astra: 'disconnected', codex: 'disconnected',
+    user: 'disconnected', astra: 'disconnected', codex: 'disconnected', hermes: 'disconnected',
   };
 
   // Broadcasts reach only GUIs that greeted (M1.5); authenticated sockets
@@ -308,7 +322,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     ackTimers.set(key, setTimeout(() => {
       ackTimers.delete(key);
       failDelivery(pending.messageId, pending.target, 'no confirmation from adapter');
-    }, ackTimeoutMs));
+    }, ackTimeoutFor(pending.target)));
     broadcastDeliveryUpdate(pending.messageId, pending.target);
   };
 
@@ -491,7 +505,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             // itself into an adapter — the mirror of gui_hello's guard.
             if (state.isGui) { ws.close(4400, 'GUIs cannot be adapters'); return; }
             const name = record.name;
-            if (name !== 'codex' && name !== 'astra') { ws.close(4400, 'unknown adapter'); return; }
+            if (name !== 'codex' && name !== 'astra' && name !== 'hermes') {
+              ws.close(4400, 'unknown adapter');
+              return;
+            }
             // One adapter per participant: a new connection replaces the old one.
             // Null the old socket's participant FIRST, so its close handler
             // reports nothing — it was replaced, not disconnected — and any
@@ -513,10 +530,15 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             state.status = 'idle';
             adapterStatuses[name] = 'idle';
             broadcastAdapterStatus(name, 'idle');
-            if (name === 'codex') {
-              // M2.2: the relay's dedicated thread (or null) — sent before
-              // any queued deliver so the adapter can resolve its thread.
-              ws.send(JSON.stringify({ type: 'config', threadId: store.getSetting('codex_thread_id') }));
+            if (name === 'codex' || name === 'hermes') {
+              // M2.2 / M6.2: the relay thread (or null) — sent before any
+              // queued deliver so the adapter can resolve its thread. The
+              // M6.1 hermes adapter refuses deliveries until config arrives.
+              const threadId =
+                name === 'codex'
+                  ? store.getSetting('codex_thread_id')
+                  : store.getSetting('hermes_session_id');
+              ws.send(JSON.stringify({ type: 'config', threadId }));
             }
             // M2.1: approved items waiting for this adapter go out now,
             // oldest first, each exactly once (each leaves 'queued').
@@ -567,21 +589,32 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               // with no row, cancelling every countdown — and while the
               // relay is stopped, auto creates nothing at all. approve_each
               // keeps its existing Stop behaviour (rows are not deliveries).
+              //
+              // M6.2 safety rule (D25/D29): no automatic routing into or
+              // out of Hermes. The "other AI" logic stays strictly
+              // Astra <-> Codex: a Hermes capture creates no row and no
+              // countdown in any mode, and an Astra/Codex capture never
+              // targets Hermes.
               if (message.source !== 'user' && settings.mode !== 'manual') {
-                const other: Participant = message.source === 'astra' ? 'codex' : 'astra';
-                if (settings.mode === 'auto') {
-                  if (paused) {
-                    console.log(`[engine] auto capture ${message.id} stored without routing (the relay is stopped)`);
-                  } else if (isOverTurnCap(message.hop, settings.turnCap)) {
-                    holdMessage(message.id, message.hop, settings.turnCap);
+                let other: Participant | null = null;
+                if (message.source === 'astra') other = 'codex';
+                else if (message.source === 'codex') other = 'astra';
+                // source === 'hermes': other stays null -> no row, no countdown.
+                if (other !== null) {
+                  if (settings.mode === 'auto') {
+                    if (paused) {
+                      console.log(`[engine] auto capture ${message.id} stored without routing (the relay is stopped)`);
+                    } else if (isOverTurnCap(message.hop, settings.turnCap)) {
+                      holdMessage(message.id, message.hop, settings.turnCap);
+                    } else if (store.getDelivery(message.id, other) === null) {
+                      store.insertDelivery(message.id, other);
+                      broadcastDeliveryUpdate(message.id, other);
+                      if (settings.autoSend) startCountdown(message.id, other);
+                    }
                   } else if (store.getDelivery(message.id, other) === null) {
                     store.insertDelivery(message.id, other);
                     broadcastDeliveryUpdate(message.id, other);
-                    if (settings.autoSend) startCountdown(message.id, other);
                   }
-                } else if (store.getDelivery(message.id, other) === null) {
-                  store.insertDelivery(message.id, other);
-                  broadcastDeliveryUpdate(message.id, other);
                 }
               }
             } catch (err) {
@@ -594,11 +627,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'forward': {
-            // M2.1 + M3.1: the GUI asks for a delivery row. Valid targets are
-            // codex and astra (never a message's own source, checked below).
+            // M2.1 + M6.2: the GUI asks for a delivery row. Valid targets are
+            // codex, astra and hermes (never a message's own source, checked below).
             const messageId = record.messageId;
             if (typeof messageId !== 'string') return;
-            if (record.target !== 'codex' && record.target !== 'astra') {
+            if (record.target !== 'codex' && record.target !== 'astra' && record.target !== 'hermes') {
               console.log(`[engine] forward ignored: target ${String(record.target)} is not an AI`);
               return;
             }
@@ -691,13 +724,19 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'thread': {
-            // M2.2: only the codex adapter may report the relay thread; the
-            // engine persists it for the next adapter launch (and restarts).
-            if (state.participant !== 'codex') return;
+            // M2.2 / M6.2: only the codex or hermes adapter may report the
+            // relay thread; the engine persists it for the next adapter
+            // launch (and restarts).
+            if (state.participant !== 'codex' && state.participant !== 'hermes') return;
             const threadId = record.threadId;
             if (typeof threadId !== 'string' || threadId === '') return;
-            store.setSetting('codex_thread_id', threadId);
-            console.log(`[engine] codex relay thread recorded: ${threadId}`);
+            if (state.participant === 'codex') {
+              store.setSetting('codex_thread_id', threadId);
+              console.log(`[engine] codex relay thread recorded: ${threadId}`);
+            } else {
+              store.setSetting('hermes_session_id', threadId);
+              console.log(`[engine] hermes relay thread recorded: ${threadId}`);
+            }
             return;
           }
           case 'approval_request': {
@@ -764,7 +803,11 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const messages = store.recentMessages(SNAPSHOT_LIMIT);
             ws.send(JSON.stringify({
               type: 'snapshot',
-              statuses: { codex: adapterStatuses.codex, astra: adapterStatuses.astra },
+              statuses: {
+                codex: adapterStatuses.codex,
+                astra: adapterStatuses.astra,
+                hermes: adapterStatuses.hermes,
+              },
               messages,
               // M2.1: every non-user delivery row of those messages.
               deliveries: store.deliveriesOf(messages.map((m) => m.id)),
@@ -812,8 +855,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
             clearAllCountdowns('Stop'); // M5.1 (D18-4): and every countdown — the rows stay pending
             broadcast({ type: 'pause_update', paused: true });
-            const codex = adapterSocketFor('codex');
-            if (codex !== null) codex.send(JSON.stringify({ type: 'interrupt' }));
+            // M3.2b / M6.2: Stop interrupts the active runs on both codex
+            // and hermes (best effort). Their in-flight rows were returned
+            // to pending_approval above.
+            for (const participant of ['codex', 'hermes'] as const) {
+              const sock = adapterSocketFor(participant);
+              if (sock !== null) sock.send(JSON.stringify({ type: 'interrupt' }));
+            }
             console.log(`[engine] stopped: paused until resume; ${inFlight.length} in-flight row(s) returned to pending_approval`);
             return;
           }
@@ -851,7 +899,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               return;
             }
             const targets = [...new Set(record.targets)] as unknown[];
-            if (targets.some((t) => t !== 'astra' && t !== 'codex')) {
+            if (targets.some((t) => t !== 'astra' && t !== 'codex' && t !== 'hermes')) {
               console.log(`[engine] send ignored: bad targets ${JSON.stringify(record.targets)}`);
               return;
             }

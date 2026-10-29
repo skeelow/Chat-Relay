@@ -319,8 +319,8 @@ test('snapshot: a late GUI gets the current adapter statuses and the stored mess
       messages?: Array<{ body?: string }>;
     };
     assert.equal(snapshot.type, 'snapshot');
-    assert.deepEqual(snapshot.statuses, { codex: 'thinking', astra: 'disconnected' },
-      'current statuses: codex said thinking; astra never connected');
+    assert.deepEqual(snapshot.statuses, { codex: 'thinking', astra: 'disconnected', hermes: 'disconnected' },
+      'current statuses: codex said thinking; astra and hermes never connected');
     assert.deepEqual(snapshot.messages?.map((m) => m.body), ['before the GUI joined']);
 
     // The snapshot goes to that socket only, and exactly once:
@@ -361,7 +361,7 @@ test('snapshot after a restart: stored messages in order, nothing replayed as up
         messages?: Array<{ body?: string }>;
       };
       assert.equal(snapshot.type, 'snapshot');
-      assert.deepEqual(snapshot.statuses, { codex: 'disconnected', astra: 'disconnected' },
+      assert.deepEqual(snapshot.statuses, { codex: 'disconnected', astra: 'disconnected', hermes: 'disconnected' },
         'a restart forgets adapter connections but not the stored transcript');
       assert.deepEqual(snapshot.messages?.map((m) => m.body),
         ['first stored reply', 'second stored reply'], 'stored messages, oldest first');

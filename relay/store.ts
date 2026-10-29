@@ -7,7 +7,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomInt } from 'node:crypto';
 
-export type Participant = 'user' | 'astra' | 'codex';
+export type Participant = 'user' | 'astra' | 'codex' | 'hermes';
 
 export type Status =
   | 'captured'
@@ -191,7 +191,7 @@ export interface PendingDelivery {
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
-    source       TEXT NOT NULL CHECK (source IN ('user','astra','codex')),
+    source       TEXT NOT NULL CHECK (source IN ('user','astra','codex','hermes')),
     body         TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     source_ref   TEXT,
@@ -205,7 +205,7 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS deliveries (
     message_id TEXT NOT NULL REFERENCES messages (id),
-    target     TEXT NOT NULL CHECK (target IN ('user','astra','codex')),
+    target     TEXT NOT NULL CHECK (target IN ('user','astra','codex','hermes')),
     status     TEXT NOT NULL CHECK (status IN
       ('captured','pending_approval','queued','delivering','delivered','failed','cancelled')),
     attempts   INTEGER NOT NULL DEFAULT 0,
@@ -313,14 +313,81 @@ export interface DeliveryView {
   attempts: number;
   updatedAt: string;
   error: string | null;
-}
+  }
 
-export function openStore(dbPath: string = 'relay.db'): RelayStore {
-  const db = new DatabaseSync(dbPath);
+  /**
+   * One-time migration: user_version 0 (old CHECKs without 'hermes') → 1.
+   * Rebuilds messages and deliveries inside a single transaction with foreign
+   * keys off, then runs PRAGMA foreign_key_check; a non-empty result rolls
+   * back and throws, so the engine refuses to start on a corrupt migration.
+   * Row counts and every column of every row are preserved.
+   */
+  function migrateV0ToV1(db: DatabaseSync): void {
+    // PRAGMA foreign_keys cannot change inside a transaction: switch it off
+    // before BEGIN and back on after COMMIT/ROLLBACK.
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('BEGIN;');
+    try {
+      db.exec('ALTER TABLE messages RENAME TO messages_old;');
+      db.exec('ALTER TABLE deliveries RENAME TO deliveries_old;');
+      // SCHEMA carries the new CHECKs (including 'hermes'); settings and
+      // adapter_state are no-ops here (CREATE TABLE IF NOT EXISTS).
+      db.exec(SCHEMA);
+      db.exec('INSERT INTO messages SELECT * FROM messages_old;');
+      db.exec('INSERT INTO deliveries SELECT * FROM deliveries_old;');
+      db.exec('DROP TABLE messages_old;');
+      db.exec('DROP TABLE deliveries_old;');
+      const violations = db.prepare('PRAGMA foreign_key_check').all() as unknown[];
+      if (violations.length > 0) {
+        db.exec('ROLLBACK;');
+        throw new Error(
+          `migration aborted: PRAGMA foreign_key_check returned ${violations.length} violation(s)`,
+        );
+      }
+      db.exec('COMMIT;');
+    } catch (err) {
+      try { db.exec('ROLLBACK;'); } catch { /* rollback may already have run */ }
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;');
+    }
+  }
+
+  export function openStore(dbPath: string = 'relay.db'): RelayStore {
+    const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA foreign_keys = ON;');
-  db.exec(SCHEMA);
+
+  // --- one-time schema migration (user_version) ---------------------------
+  // New databases are created with the new CHECKs (which include 'hermes')
+  // and user_version = 1. An existing database at user_version 0 still has
+  // the old CHECKs ('user','astra','codex' only); SQLite cannot ALTER a
+  // CHECK, so we rebuild messages and deliveries in one transaction. A
+  // failed migration rolls back and the engine refuses to start (the error
+  // propagates out of openStore).
+  const versionRow = db.prepare('PRAGMA user_version').get() as
+    | { user_version: number }
+    | undefined;
+  const version = versionRow?.user_version ?? 0;
+  const messagesExists = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+  ).get() !== undefined;
+
+  if (version === 0 && messagesExists) {
+    migrateV0ToV1(db); // rebuilds messages + deliveries with the new CHECKs
+    db.exec('PRAGMA user_version = 1;');
+  } else {
+    // Fresh database, or already migrated: create with the new CHECKs
+    // (CREATE TABLE IF NOT EXISTS is a no-op when the tables already exist).
+    db.exec(SCHEMA);
+    if (version === 0 && !messagesExists) {
+      db.exec('PRAGMA user_version = 1;');
+    }
+  }
+
   // M2.1: relay.db files created before the error column cannot be extended
   // by CREATE TABLE IF NOT EXISTS — add the column once, keeping old files valid.
+  // After the migration above the new deliveries table already has the column,
+  // so this is a no-op there.
   const columns = db.prepare('PRAGMA table_info(deliveries)').all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === 'error')) {
     db.exec('ALTER TABLE deliveries ADD COLUMN error TEXT');
