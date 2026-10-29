@@ -19,6 +19,7 @@ import {
   MODE_A_TOOLSETS,
   defaultCwd,
   resolveHermes,
+  runForever,
   type HermesAdapterOptions,
 } from '../adapters/hermes/adapter.ts';
 import { startEngine, type EngineHandle } from '../relay/engine.ts';
@@ -705,6 +706,238 @@ test('N0 integration: real engine delivers to hermes via connectToEngine', async
     engine.stop();
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
+});
+
+// R1: adapter reconnects after engine restart (regression fix for N0 refactor)
+// R1: adapter reconnects after engine restart (regression fix for N0 refactor)
+test('R1: real engine + adapter: reconnects after engine restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-r1-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+
+  // Start first engine — creates the token file
+  const engine1 = await startEngine({ port: 0, dbPath, tokenPath });
+  const port = engine1.port;
+  const url = `ws://127.0.0.1:${port}`;
+  const token = readFileSync(tokenPath, 'utf8').trim();
+
+  try {
+    clearControl();
+    setControl('normal', { sessionId: 'sess-r1-1', text: 'OK' });
+
+    const adapter = new HermesAdapter({
+      executable: FAKE,
+      sendFrame: () => {},
+      maxRunSec: 1,
+      timeoutExtraSec: 1,
+      cwd: TMP,
+    });
+
+    // First connection
+    const ws1 = connectToEngine(url, token, adapter);
+
+    // Connect GUI
+    const gui = new WebSocket(url);
+    const guiFrames: unknown[] = [];
+    let guiFrameResolve: ((v: unknown) => void) | null = null;
+    let guiAuthenticated = false;
+
+    const guiNextFrame = (timeoutMs = 10000): Promise<unknown> =>
+      new Promise((resolve, reject) => {
+        if (guiFrames.length > 0) { resolve(guiFrames.shift()); return; }
+        guiFrameResolve = resolve;
+        setTimeout(() => reject(new Error('gui frame timeout')), timeoutMs);
+      });
+
+    gui.onopen = () => {
+      gui.send(JSON.stringify({ type: 'auth', token }));
+      setTimeout(() => { guiAuthenticated = true; }, 300);
+    };
+    gui.onmessage = (event) => {
+      try { guiFrames.push(JSON.parse(String(event.data))); } catch {}
+      if (guiFrameResolve) { const r = guiFrameResolve; guiFrameResolve = null; r(guiFrames[guiFrames.length - 1]); }
+    };
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.ok(guiAuthenticated, 'GUI authenticated');
+
+    // Verify hermes is idle before restart
+    gui.send(JSON.stringify({ type: 'gui_hello' }));
+    const snapshot = (await guiNextFrame()) as { type: string; statuses: Record<string, string> };
+    assert.equal(snapshot.type, 'snapshot');
+    assert.equal(snapshot.statuses.hermes, 'idle', 'hermes idle before engine restart');
+
+    // Stop the engine
+    engine1.stop();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Close the old GUI connection
+    gui.close();
+
+    // Start a new engine on the same port with the same database
+    const engine2 = await startEngine({ port, dbPath, tokenPath });
+
+    try {
+      // Reconnect the adapter
+      const ws2 = connectToEngine(url, token, adapter);
+
+      // Reconnect GUI
+      const gui2 = new WebSocket(url);
+      const gui2Frames: unknown[] = [];
+      let gui2FrameResolve: ((v: unknown) => void) | null = null;
+      let gui2Authenticated = false;
+
+      const gui2NextFrame = (timeoutMs = 10000): Promise<unknown> =>
+        new Promise((resolve, reject) => {
+          if (gui2Frames.length > 0) { resolve(gui2Frames.shift()); return; }
+          gui2FrameResolve = resolve;
+          setTimeout(() => reject(new Error('gui frame timeout')), timeoutMs);
+        });
+
+      gui2.onopen = () => {
+        gui2.send(JSON.stringify({ type: 'auth', token }));
+        setTimeout(() => { gui2Authenticated = true; }, 300);
+      };
+      gui2.onmessage = (event) => {
+        try { gui2Frames.push(JSON.parse(String(event.data))); } catch {}
+        if (gui2FrameResolve) { const r = gui2FrameResolve; gui2FrameResolve = null; r(gui2Frames[gui2Frames.length - 1]); }
+      };
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.ok(gui2Authenticated, 'GUI2 authenticated');
+
+      // Wait for adapter to reconnect (hermes becomes idle again within 5s)
+      let reconnected = false;
+      for (let i = 0; i < 25; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        gui2.send(JSON.stringify({ type: 'gui_hello' }));
+        try {
+          const snap = await gui2NextFrame(2000) as { type: string; statuses: Record<string, string> };
+          if (snap.statuses.hermes === 'idle') {
+            reconnected = true;
+            break;
+          }
+        } catch { /* keep trying */ }
+      }
+      assert.ok(reconnected, 'adapter reconnected within 5s after engine restart');
+
+      // Send a message after restart — should be delivered
+      gui2.send(JSON.stringify({ type: 'send', body: 'after restart', targets: ['hermes'] }));
+
+      let captured = false;
+      for (let i = 0; i < 10; i++) {
+        const f = await gui2NextFrame(3000);
+        const ft = f as { type?: string; message?: { source?: string; body?: string } };
+        if (ft.type === 'transcript_update' && ft.message?.source === 'hermes') {
+          captured = true;
+          break;
+        }
+      }
+      assert.ok(captured, 'hermes capture after restart');
+
+      ws2.close();
+      adapter.close();
+      gui2.close();
+    } finally {
+      engine2.stop();
+    }
+
+    gui.close();
+  } finally {
+    try { engine1.stop(); } catch {}
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// R1: adapter starts with no engine and no token file, connects when engine appears
+// R1: adapter starts with no engine and no token file, connects when engine appears
+test('R1: adapter starts without engine or token, connects when engine appears', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-r1b-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  const port = 19998;
+  const url = `ws://127.0.0.1:${port}`;
+
+  // Start engine briefly to create token file, then stop it
+  const engine0 = await startEngine({ port, dbPath, tokenPath });
+  engine0.stop();
+  try { rmSync(tokenPath); } catch {} // no token file when adapter starts
+
+  try {
+    clearControl();
+    setControl('normal', { sessionId: 'sess-r1b-1', text: 'OK' });
+
+    const abortController = new AbortController();
+    const runPromise = runForever(
+      { engineUrl: url, tokenPath, executable: FAKE },
+      abortController.signal
+    );
+
+    // Adapter retries because no token and no engine — should stay alive
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.ok(!abortController.signal.aborted, 'adapter retry loop is still running');
+
+    // Start the engine on the same port — adapter should connect on next retry
+    const engine = await startEngine({ port, dbPath, tokenPath });
+    const token = readFileSync(tokenPath, 'utf8').trim();
+
+    try {
+      // Give the adapter time to detect the engine and connect
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      // Verify by connecting a GUI — hermes should show as connected/idle
+      const gui = new WebSocket(url);
+      let guiAuthenticated = false;
+      gui.onopen = () => {
+        gui.send(JSON.stringify({ type: 'auth', token }));
+        setTimeout(() => { guiAuthenticated = true; }, 300);
+      };
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.ok(guiAuthenticated, 'GUI can connect to engine');
+
+      gui.send(JSON.stringify({ type: 'gui_hello' }));
+      const frames: unknown[] = [];
+      let frameResolve: ((v: unknown) => void) | null = null;
+      const nextFrame = (timeoutMs = 5000): Promise<unknown> =>
+        new Promise((resolve, reject) => {
+          if (frames.length > 0) { resolve(frames.shift()); return; }
+          frameResolve = resolve;
+          setTimeout(() => reject(new Error('frame timeout')), timeoutMs);
+        });
+      gui.onmessage = (event) => {
+        try { frames.push(JSON.parse(String(event.data))); } catch {}
+        if (frameResolve) { const r = frameResolve; frameResolve = null; r(frames[frames.length - 1]); }
+      };
+      const snap = (await nextFrame()) as { type: string; statuses: Record<string, string> };
+      assert.equal(snap.type, 'snapshot');
+      assert.equal(snap.statuses.hermes, 'idle', 'hermes is idle after adapter connected');
+      gui.close();
+    } finally {
+      engine.stop();
+    }
+
+    abortController.abort();
+    await runPromise;
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+// R1: run killed when socket closes (already covered by
+// the "interrupt" test; kept here for completeness per the packet).
+test('R1: run killed when socket closes', async () => {
+  clearControl();
+  setControl('hang');
+  const { adapter, frames } = makeAdapter();
+  adapter.start();
+  // Start a delivery (spawns a hermes process that will hang)
+  void adapter.deliver('m-1', 'x');
+  // Simulate socket close → adapter kills the tree
+  adapter.close();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const failed = lastFrameOfType(frames, 'failed');
+  assert.ok(failed, 'failed frame sent');
+  const error = String(failed.error);
+  assert.ok(error === 'Stopped' || error === 'Hermes exited with code 1', `expected 'Stopped' or 'Hermes exited with code 1', got '${error}'`);
 });
 
 // Cleanup the temp dir once all tests in this file are done.

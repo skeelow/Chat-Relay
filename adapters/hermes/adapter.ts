@@ -136,6 +136,7 @@ export class HermesAdapter {
   private configReceived = false;
   private busy = false;
   private current: Run | null = null;
+  private interrupted = false;
   private readonly timeoutExtraSec: number;
 
   /** Delivered-body hashes remembered inside the echo window (10 min). */
@@ -197,9 +198,15 @@ export class HermesAdapter {
     this.current.requestInterrupt();
   }
 
-  /** Kill any running tree so no orphaned hermes.exe remains on exit. */
+  /** Kill any running tree so no orphaned hermes.exe remains on exit.
+   *  Also reset busy/current so a reconnected adapter can accept new deliveries. */
   close(): void {
-    if (this.current !== null) killTree(this.current.child, 'adapter exit');
+    if (this.current !== null) {
+      killTree(this.current.child, 'adapter exit');
+      this.current = null;
+      this.interrupted = true;
+    }
+    this.busy = false;
   }
 
   // --- one run ---
@@ -504,13 +511,86 @@ export function connectToEngine(
   return ws;
 }
 
+export interface RunForeverOptions {
+  engineUrl: string;
+  tokenPath: string;
+  executable: string;
+  profile?: string;
+  maxTurns?: number;
+  maxRunSec?: number;
+  timeoutExtraSec?: number;
+  cwd?: string;
+  startMs?: number;
+}
+
+export async function runForever(
+  options: RunForeverOptions,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const adapter = new HermesAdapter({
+    executable: options.executable,
+    profile: options.profile,
+    maxTurns: options.maxTurns,
+    maxRunSec: options.maxRunSec,
+    timeoutExtraSec: options.timeoutExtraSec,
+    cwd: options.cwd,
+    // Bound by connectToEngine on each successful connection.
+    sendFrame: () => { /* no socket yet */ },
+    startMs: options.startMs,
+  });
+
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+  try {
+    while (!abortSignal?.aborted) {
+      let token: string | null = null;
+      if (existsSync(options.tokenPath)) {
+        try {
+          token = readFileSync(options.tokenPath, 'utf8').trim();
+        } catch (err) {
+          console.error(`[hermes-adapter] error reading token file: ${err}`);
+          token = null;
+        }
+      } else {
+        console.error(`[hermes-adapter] token file does not exist: ${options.tokenPath}`);
+      }
+      if (token === null) {
+        console.error(`[hermes-adapter] token file not found: ${options.tokenPath} — retrying in 2s`);
+        await sleep(2000);
+        continue;
+      }
+
+      const ws = connectToEngine(options.engineUrl, token, adapter);
+      await new Promise<void>((resolve) => {
+        const originalOnClose = ws.onclose;
+        ws.onclose = () => {
+          (originalOnClose as () => void)?.();
+          resolve();
+        };
+        if (abortSignal?.aborted) {
+          ws.close();
+          resolve();
+        }
+      });
+
+      if (abortSignal?.aborted) break;
+      await sleep(2000);
+    }
+  } finally {
+    adapter.close();
+  }
+}
+
 async function main(): Promise<void> {
   const { engineUrl, tokenPath, profile } = parseArgs(process.argv.slice(2));
   const executable = resolveHermes();
-  const adapter = new HermesAdapter({ executable, profile, sendFrame: () => { /* bound by connectToEngine */ } });
-  connectToEngine(engineUrl, readToken(tokenPath) ?? '', adapter);
-  process.on('SIGINT', () => { adapter.close(); process.exit(0); });
-  process.on('SIGTERM', () => { adapter.close(); process.exit(0); });
+  const abortController = new AbortController();
+
+  process.on('SIGINT', () => abortController.abort());
+  process.on('SIGTERM', () => abortController.abort());
+
+  await runForever({ engineUrl, tokenPath, profile, executable }, abortController.signal);
+  process.exit(0);
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
