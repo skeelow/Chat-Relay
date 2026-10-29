@@ -19,6 +19,8 @@ import { runForever } from '../adapters/hermes/adapter.ts';
 
 const FAKE = join(process.cwd(), 'tests', 'fake-hermes.ts');
 const RESULTS: { n: number; ok: boolean; detail: string }[] = [];
+const VERBOSE = process.argv.includes('--verbose');
+function logVerbose(...args: any[]): void { if (VERBOSE) console.log(...args); }
 
 function check(n: number, name: string, ok: boolean, detail = '') {
   RESULTS.push({ n, ok, detail });
@@ -69,6 +71,21 @@ function setting(dbPath: string, key: string): string | null {
   } finally { db.close(); }
 }
 
+// Return true if a Windows PID is still present in the task list.
+function pidIsAlive(pid: string): boolean {
+  try {
+    const out = execSync(`tasklist /FI "PID eq ${pid}"`, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    const text = String(out);
+    return text.includes(pid) && !text.includes('No tasks');
+  } catch {
+    return false;
+  }
+}
+
 let adapterController: AbortController | null = null;
 let adapterPromise: Promise<void> | null = null;
 
@@ -110,51 +127,64 @@ function writeControl(dir: string, mode: string, sessionId = 'sess-smoke-1', tex
 async function run() {
   const t0 = Date.now();
   let overall = true;
+  let dirA: string | undefined;
+  let dirB: string | undefined;
 
   try {
     // ------------------------------------------------------------------
     // Setup A: real engine + real adapter + fake GUI (checks 1-6, 8-10).
     // ------------------------------------------------------------------
-    const dirA = mkdtempSync(join(tmpdir(), 'relay-smoke-a-'));
+    dirA = mkdtempSync(join(tmpdir(), 'relay-smoke-a-'));
     const dbPathA = join(dirA, 'relay.db');
     const tokenPathA = join(dirA, 'token');
     const engineA = await startEngine({ port: 0, dbPath: dbPathA, tokenPath: tokenPathA });
     const portA = engineA.port;
-    console.log('SMOKE-STAGE: engineA started', portA);
+    logVerbose('SMOKE-STAGE: engineA started', portA);
     const urlA = `ws://127.0.0.1:${portA}`;
     writeControl(dirA, 'normal');
     const tokenA = readFileSync(tokenPathA, 'utf8').trim();
+    const grandchildPidFile = join(dirA, 'grandchild-pid.txt');
+    process.env.FAKE_HERMES_GRANDCHILD_PID_FILE = grandchildPidFile;
 
     startAdapter(urlA, tokenPathA);
-    console.log('SMOKE-STAGE: adapter started, awaiting GUI');
+    logVerbose('SMOKE-STAGE: adapter started, awaiting GUI');
 
     const guiA = makeClient(urlA, tokenA);
     try {
       // Check 1: hermes idle within 5 s of the adapter starting.
-      console.log('SMOKE-STAGE: check 1 send gui_hello');
+      logVerbose('SMOKE-STAGE: check 1 send gui_hello');
       try {
         guiA.send({ type: 'gui_hello' });
         const snap = (await guiA.waitFor((m: any) => m.type === 'snapshot', 8000)) as any;
-        console.log('SMOKE-STAGE: check 1 got snapshot', JSON.stringify(snap.statuses));
+        logVerbose('SMOKE-STAGE: check 1 got snapshot', JSON.stringify(snap.statuses));
         check(1, 'hermes idle within 5 s of adapter starting', snap.statuses?.hermes === 'idle', `status=${snap.statuses?.hermes}`);
       } catch (err) { check(1, 'hermes idle within 5 s of adapter starting', false, String(err)); }
 
       // Check 2: config reached the adapter before the first deliver (delivering).
-      console.log('SMOKE-STAGE: check 2 send');
+      // Without config, the adapter fails the deliver immediately with
+      // "waiting for engine config". With config, it replies `status=thinking`
+      // as soon as it starts the run. So this genuinely observes config.
+      logVerbose('SMOKE-STAGE: check 2 send');
+      let configReached = false;
       try {
         guiA.send({ type: 'send', body: 'ping one', targets: ['hermes'] });
-        const du = (await guiA.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'delivering', 8000)) as any;
-        check(2, 'config reached adapter before first deliver', true, `status=${du.status}`);
+        const m = (await guiA.waitFor((x: any) =>
+          (x.type === 'status_update' && x.adapter === 'hermes' && x.status === 'thinking') ||
+          (x.type === 'delivery_update' && x.target === 'hermes' && x.status === 'failed'
+            && String(x.error ?? '').includes('waiting for engine config')), 8000)) as any;
+        configReached = m.type === 'status_update' && m.status === 'thinking';
+        check(2, 'config reached adapter before first deliver', configReached,
+          configReached ? 'thinking' : `${m.type}: ${m.error ?? m.status}`);
       } catch (err) { check(2, 'config reached adapter before first deliver', false, String(err)); }
 
       // Check 3: reply stored with source hermes, row delivered, session id stored.
-      console.log('SMOKE-STAGE: check 3 waiting capture');
+      logVerbose('SMOKE-STAGE: check 3 waiting capture');
       let hermesCaptures = 0;
       try {
         await guiA.waitFor((m: any) => m.type === 'transcript_update' && m.message?.source === 'hermes', 8000);
-        console.log('SMOKE-STAGE: check 3 got capture');
+        logVerbose('SMOKE-STAGE: check 3 got capture');
         hermesCaptures = 1;
-      } catch { console.log('SMOKE-STAGE: check 3 capture TIMEOUT'); }
+      } catch { logVerbose('SMOKE-STAGE: check 3 capture TIMEOUT'); }
       let rowDelivered = false;
       let sessionIdA = null;
       try {
@@ -187,9 +217,9 @@ async function run() {
       // Check 6: engine restart — adapter (not restarted) reconnects.
       try {
         engineA.stop();
-        console.log('SMOKE-STAGE: engineA stopped');
+        logVerbose('SMOKE-STAGE: engineA stopped');
         const engineB = await startEngine({ port: portA, dbPath: dbPathA, tokenPath: tokenPathA });
-        console.log('SMOKE-STAGE: engineB started on', portA);
+        logVerbose('SMOKE-STAGE: engineB started on', portA);
         try {
           let reconnected = false;
           const deadline = Date.now() + 8000;
@@ -258,10 +288,13 @@ async function run() {
             finally { guiSnap.close(); }
             check(8, 'auto mode: Astra/Codex rows for each other only, never Hermes, no Hermes countdown', codexRow && !hermesRow && !hermesCountdown, `codexRow=${codexRow} hermesRow=${hermesRow} hermesCountdown=${hermesCountdown}`);
 
-            // Check 9: Stop during a long fake run returns Hermes row to pending_approval, tree gone.
-            writeControl(dirA, 'hang');
+            // Check 9: Stop during a long fake run returns Hermes row to pending_approval,
+            // and the fake run's process tree is gone (no orphan). grandchild-hang mode
+            // spawns a grandchild whose pid we can assert is dead after Stop.
+            writeControl(dirA, 'grandchild-hang');
             guiB.send({ type: 'send', body: 'long run', targets: ['hermes'] });
             let rowPending = false;
+            let treeGone = false;
             try {
               await guiB.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'delivering', 5000);
               guiB.send({ type: 'stop' });
@@ -269,7 +302,14 @@ async function run() {
               rowPending = true;
             } catch { /* */ }
             writeControl(dirA, 'normal');
-            check(9, 'Stop returns Hermes row to pending_approval', rowPending, '');
+            const pid = readFileSync(grandchildPidFile, 'utf8').trim();
+            let gone = false;
+            for (let i = 0; i < 10; i++) {
+              if (!pidIsAlive(pid)) { gone = true; break; }
+              await new Promise((r) => setTimeout(r, 300));
+            }
+            treeGone = gone;
+            check(9, 'Stop returns Hermes row to pending_approval and process tree is gone', rowPending && treeGone, `rowPending=${rowPending} treeGone=${treeGone}`);
 
             // Check 10: thread frame from non-hermes socket does not change hermes_session_id.
             let sessionUnchanged = false;
@@ -303,19 +343,20 @@ async function run() {
     // Setup B: adapter started before the engine and before the token file
     // exists (check 7).
     // ------------------------------------------------------------------
-    console.log('SMOKE-STAGE: check 7');
-    const dirB = mkdtempSync(join(tmpdir(), 'relay-smoke-b-'));
+    logVerbose('SMOKE-STAGE: check 7');
+    dirB = mkdtempSync(join(tmpdir(), 'relay-smoke-b-'));
     const dbPathB = join(dirB, 'relay.db');
     const tokenPathB = join(dirB, 'token');
-    const portB = 19998;
-    const urlB = `ws://127.0.0.1:${portB}`;
 
-    // Create the token then remove it + stop the engine so the adapter starts
-    // with neither engine nor token file.
-    const engine0 = await startEngine({ port: portB, dbPath: dbPathB, tokenPath: tokenPathB });
-    console.log('SMOKE-STAGE: engine0 started', portB);
+    // Start engine0 on a free port so it creates the token file, then stop it
+    // and delete the token so the adapter starts with neither engine nor token.
+    const engine0 = await startEngine({ port: 0, dbPath: dbPathB, tokenPath: tokenPathB });
+    const portB = engine0.port;
+    const urlB = `ws://127.0.0.1:${portB}`;
+    logVerbose('SMOKE-STAGE: engine0 started', portB);
     engine0.stop();
-    console.log('SMOKE-STAGE: engine0 stopped');
+    logVerbose('SMOKE-STAGE: engine0 stopped');
+    try { unlinkSync(tokenPathB); } catch { /* token removed so adapter starts with none */ }
     writeControl(dirB, 'normal');
     const abortB = new AbortController();
     const runB = runForever({ engineUrl: urlB, tokenPath: tokenPathB, executable: FAKE }, abortB.signal);
@@ -326,7 +367,7 @@ async function run() {
 
     // start the engine; adapter should connect on next retry without restart
     const engineB2 = await startEngine({ port: portB, dbPath: dbPathB, tokenPath: tokenPathB });
-    console.log('SMOKE-STAGE: engineB2 started', portB);
+    logVerbose('SMOKE-STAGE: engineB2 started', portB);
     const tokenB = readFileSync(tokenPathB, 'utf8').trim();
     let check7ok = false;
     try {
@@ -342,7 +383,7 @@ async function run() {
     check(7, 'adapter started before engine and token connects when engine appears', check7ok, '');
 
     try { abortB.abort(); await Promise.race([runB, new Promise((r) => setTimeout(r, 6000))]).catch(() => undefined); } catch { /* */ }
-    console.log('SMOKE-STAGE: setup B done');
+    logVerbose('SMOKE-STAGE: setup B done');
     try { engineB2.stop(); } catch { /* */ }
     try { rmSync(dirB, { recursive: true, force: true, maxRetries: 5 }); } catch { /* */ }
 
@@ -351,6 +392,8 @@ async function run() {
     overall = false;
   } finally {
     try { await stopAdapter(); } catch { /* */ }
+    try { if (typeof dirA !== 'undefined') rmSync(dirA, { recursive: true, force: true, maxRetries: 5 }); } catch { /* */ }
+    try { if (typeof dirB !== 'undefined') rmSync(dirB, { recursive: true, force: true, maxRetries: 5 }); } catch { /* */ }
   }
 
   // ------------------------------------------------------------------

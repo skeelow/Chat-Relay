@@ -16,6 +16,7 @@ import {
   scopeProblems,
   isFlakyTestName,
   isBuiltFile,
+  checkRemoved,
 } from '../scripts/preflight.mjs';
 
 test('checkStatusFile: a ticked item whose [x] lacks Evidence: fails', () => {
@@ -102,4 +103,28 @@ test('isFlakyTestName: matches the known flaky restart test', () => {
     true,
   );
   assert.equal(isFlakyTestName('some other test'), false);
+});
+
+test('checkRemoved: deletion of 20 lines not named in Removed: fails', () => {
+  const r = checkRemoved([{ path: 'relay/engine.ts', deleted: 20 }], 'Removed: none');
+  assert.equal(r.pass, false);
+  assert.ok(r.lines.some((l) => l.includes('FAIL removed: relay/engine.ts deleted 20 lines')));
+});
+
+test('checkRemoved: deletion named in Removed: passes', () => {
+  const r = checkRemoved([{ path: 'relay/engine.ts', deleted: 20 }], 'Removed: relay/engine.ts (20 deleted lines) removed the stale loop');
+  assert.equal(r.pass, true);
+  assert.ok(r.lines.some((l) => l.includes('PASS removed: relay/engine.ts')));
+});
+
+test('checkRemoved: empty list with Removed: none passes', () => {
+  const r = checkRemoved([], 'Removed: none');
+  assert.equal(r.pass, true);
+  assert.ok(r.lines.some((l) => l.includes("PASS removed: no source files deleted")));
+});
+
+test('checkRemoved: empty list without none fails', () => {
+  const r = checkRemoved([], 'Removed: something else');
+  assert.equal(r.pass, false);
+  assert.ok(r.lines.some((l) => l.includes("FAIL removed: no deleted source files")));
 });

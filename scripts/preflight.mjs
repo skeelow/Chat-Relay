@@ -243,10 +243,8 @@ async function step3Tests() {
   const first = run('npm test');
   const p1 = parseTestOutput(first.stdout);
   const lines = [];
-  lines.push(
-    `PASS tests: ${p1.pass} pass / ${p1.fail} fail (${p1.tests} total)`,
-  );
   if (p1.fail === 0) {
+    lines.push(`PASS tests: ${p1.pass} pass / ${p1.fail} fail (${p1.tests} total)`);
     return { pass: true, lines };
   }
   if (p1.fail === 1 && p1.failingNames.length === 1 && isFlakyTestName(p1.failingNames[0])) {
@@ -301,16 +299,12 @@ function step5StatusFile(task) {
   return { pass: result.pass, lines };
 }
 
-function step6DeletedBehaviour(task) {
-  const diff = git(['diff', 'HEAD', '--numstat']);
-  const deleted = deletedSourceFiles(diff.stdout);
-  const path = `docs/status/${task}.md`;
-  const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  const removedLine = text.match(/^Removed:\s*(.*)$/m);
-  const removedText = removedLine ? removedLine[1] : '';
+// Exported pure function: checks that every deleted source file is named in
+// the status file's `Removed:` line. Returns {pass, lines}.
+export function checkRemoved(deletedFiles, removedText) {
   const lines = [];
   let allOk = true;
-  if (deleted.length === 0) {
+  if (deletedFiles.length === 0) {
     if (!/\bnone\b/i.test(removedText)) {
       allOk = false;
       lines.push(`FAIL removed: no deleted source files but Removed: does not say 'none'`);
@@ -318,7 +312,9 @@ function step6DeletedBehaviour(task) {
       lines.push(`PASS removed: no source files deleted (Removed: none)`);
     }
   } else {
-    for (const { path: f, deleted } of deleted) {
+    for (const entry of deletedFiles) {
+      const f = entry.path;
+      const deleted = entry.deleted;
       if (!removedText.includes(f)) {
         allOk = false;
         lines.push(`FAIL removed: ${f} deleted ${deleted} lines but not named in Removed:`);
@@ -328,6 +324,16 @@ function step6DeletedBehaviour(task) {
     }
   }
   return { pass: allOk, lines };
+}
+
+function step6DeletedBehaviour(task) {
+  const diff = git(['diff', 'HEAD', '--numstat']);
+  const deleted = deletedSourceFiles(diff.stdout);
+  const path = `docs/status/${task}.md`;
+  const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const removedLine = text.match(/^Removed:\s*(.*)$/m);
+  const removedText = removedLine ? removedLine[1] : '';
+  return checkRemoved(deleted, removedText);
 }
 
 function step7DebugLeftovers(scopeList) {
