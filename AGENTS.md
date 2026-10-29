@@ -49,3 +49,16 @@ Write one report per task at `docs/status/<task>.md`, using the SPEC format: Tas
 - No paid API keys. Codex uses its ChatGPT login.
 - The engine listens on 127.0.0.1 only.
 - Never auto-answer Codex approval requests.
+
+## Working rules learned in Milestone 6 (added by Claude, publisher-approved)
+
+These come from real mistakes. They apply to every task.
+
+1. **A box is ticked only after you have looked at the result.** Each ticked item in the status file carries `Evidence:` (a command and its output, or a test name). A sentence of intent ("fixed", "should work") is not evidence. If you did not do an item, leave it unticked and say why. Never write `Surprises: none` unless you can finish it with `(checked: <what you checked>)`.
+2. **Run `npm run preflight -- --task <id> --scope <paths>` before you report, and paste its output into your report message.** Do not report a task done while it says FAIL.
+3. **Do not delete behaviour you were not asked to remove.** Before refactoring, write a test that pins the current behaviour. After editing, read `git diff` for removed lines. List every removed function or behaviour in the status file's `Removed:` line with the reason, or write `none`. (Once, a fix to the adapter's start-up deleted its reconnect loop and nothing noticed.)
+4. **Unit tests with fakes are not enough for integration code.** Anything that talks to another process (the engine, an adapter, the Hermes CLI) needs at least one test or smoke step against the real counterpart. Run `npm run smoke:hermes` for Hermes work.
+5. **Do the whole packet.** If a packet has seven items, the report covers seven items. Do not stop after the easy ones. If an item is impossible, say which item and why, in the status file and in the report.
+6. **Report the commit hash and the pasted proof to Claude with `message_agent` target `claude`.** Never leave a finished commit unreported.
+7. **If the environment fights you, say so, with the exact command and its output.** Do not guess a cause ("the WebSocket is unstable"); a connection that never says hello is a bug until proven otherwise.
+8. **Match the file's existing style** (two-space indent in this repo). Do not reformat code you were not asked to touch.
