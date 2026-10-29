@@ -935,3 +935,68 @@ test('store: error column survives migration when the old table lacks it', () =>
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
   }
 });
+test('store: migrated database indexes equal fresh database indexes', () => {
+  // Fresh database indexes (expected after migration).
+  const freshDir = mkdtempSync(join(tmpdir(), 'relay-mig-freshidx-'));
+  const freshDbPath = join(freshDir, 'relay.db');
+  try {
+    const freshStore = openStore(freshDbPath);
+    const freshIndexes = (() => {
+      const db = new DatabaseSync(freshDbPath);
+      const rows = db.prepare(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' AND tbl_name = 'messages' ORDER BY name",
+      ).all() as Array<{ name: string; tbl_name: string; sql: string }>;
+      db.close();
+      return rows;
+    })();
+    freshStore.close();
+
+    // Old-schema database.
+    const dir = mkdtempSync(join(tmpdir(), 'relay-mig-oldidx-'));
+    const dbPath = join(dir, 'relay.db');
+    try {
+      const old = new DatabaseSync(dbPath);
+      old.exec('PRAGMA foreign_keys = OFF;');
+      old.exec(OLD_SCHEMA);
+      old.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)')
+        .run('m-1', 'astra', 'body one', hashBody('body one'), 'ref-1', 0, '2026-01-01T00:00:00Z');
+      old.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) VALUES (?,?,?,?,?,?)')
+        .run('m-1', 'codex', 'delivered', 2, '2026-01-01T01:00:00Z', null);
+      old.exec('PRAGMA user_version = 0;');
+      old.close();
+
+      assert.equal(userVersion(dbPath), 0, 'pre-migration user_version 0');
+
+      // Migrate.
+      const store = openStore(dbPath);
+      try {
+        assert.equal(userVersion(dbPath), 1, 'migrated to user_version 1');
+
+        const migratedIndexes = (() => {
+          const db = new DatabaseSync(dbPath);
+          const rows = db.prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' AND tbl_name = 'messages' ORDER BY name",
+          ).all() as Array<{ name: string; tbl_name: string; sql: string }>;
+          db.close();
+          return rows;
+        })();
+
+        // Index definitions must match the fresh database (names and SQL).
+        assert.deepEqual(
+          migratedIndexes.map((i) => ({ name: i.name, sql: i.sql })),
+          freshIndexes.map((i) => ({ name: i.name, sql: i.sql })),
+          'migrated indexes must equal fresh database indexes',
+        );
+
+        // Duplicate source_ref is rejected after migration.
+        expectStoreError('duplicate', () =>
+          store.insertMessage({ source: 'codex', targets: ['user'], body: 'dup', hop: 0, sourceRef: 'ref-1' }),
+        );
+      } finally { store.close(); }
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+    }
+  } finally {
+    try { rmSync(freshDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});

@@ -55,6 +55,7 @@ relay-chat/
   relay/store.ts          SQLite access
   adapters/codex/         spawns codex app-server
   adapters/chatgpt-ext/   Manifest V3 extension
+  adapters/hermes/         Hermes conversation adapter (Milestone 6.2)
   app/                    Electron GUI and tray
   tests/
 ```
@@ -89,7 +90,7 @@ A captured message's `hop` is assigned by the engine when it stores the capture:
 | --- | --- | --- |
 | `messages` | id, source, body, content\_hash, source\_ref, hop, created\_at | One row per captured message |
 | `deliveries` | message\_id, target, status, attempts, updated\_at | One row per message per target |
-| `settings` | key, value | Relay mode, AI turn cap, auto-send on/off, auto-send delay (seconds), Codex thread id, Hermes session id | One-time schema migration (`PRAGMA user_version` 0 → 1) adds `hermes` to the `source`/`target` CHECKs |
+|| `settings` | key, value | Relay mode, AI turn cap, auto-send on/off, auto-send delay (seconds), Codex thread id, Hermes session id. One-time schema migration (`PRAGMA user_version` 0 → 1) adds `hermes` to the `source`/`target` CHECKs ||
 | `adapter_state` | adapter, last\_seen\_ref, updated\_at | Lets adapters resume without replaying |
 
 Duplicate rule: same `source` and `content_hash` within 10 minutes, or a `source_ref` already stored, is rejected.

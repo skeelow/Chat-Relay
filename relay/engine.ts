@@ -170,6 +170,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       : target === 'hermes'
         ? HERMES_ACK_TIMEOUT_MS
         : ackTimeoutMs;
+  // Hermes deliveries stay `delivering` until the run finishes (up to about six
+  // minutes), so Stop and restart behaviour must account for the long window.
   // M2.1 no-replay: nothing resumes on its own after a (re)start — every
   // in-flight delivery goes back to waiting for the user's approval.
   const resetCount = store.resetInFlightToPending();

@@ -313,10 +313,10 @@ export interface DeliveryView {
   attempts: number;
   updatedAt: string;
   error: string | null;
-  }
+}
 
-  /**
-   * One-time migration: user_version 0 (old CHECKs without 'hermes') → 1.
+/**
+ * One-time migration: user_version 0 (old CHECKs without 'hermes') → 1.
    * Rebuilds messages and deliveries inside a single transaction with foreign
    * keys off, then runs PRAGMA foreign_key_check; a non-empty result rolls
    * back and throws, so the engine refuses to start on a corrupt migration.
@@ -331,13 +331,27 @@ export interface DeliveryView {
       db.exec('ALTER TABLE messages RENAME TO messages_old;');
       db.exec('ALTER TABLE deliveries RENAME TO deliveries_old;');
       // The explicitly named indexes go with the renamed tables. Drop them
-      // so SCHEMA can recreate them on the new tables (CREATE INDEX IF NOT
+      // so SCHEMA recreates them on the new tables (CREATE INDEX IF NOT
       // EXISTS would be a no-op since the names already exist on messages_old).
       db.exec('DROP INDEX IF EXISTS messages_source_ref;');
       db.exec('DROP INDEX IF EXISTS messages_dedupe;');
       // SCHEMA carries the new CHECKs (including 'hermes'); settings and
       // adapter_state are no-ops here (CREATE TABLE IF NOT EXISTS).
       db.exec(SCHEMA);
+      // Verify both indexes exist on the new messages table before committing.
+      // If the rebuild lost them, roll back and throw — a silent loss of the
+      // unique source_ref guarantee is unacceptable.
+      const indexNames = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND name NOT LIKE 'sqlite_%'"
+      ).all() as Array<{ name: string }>;
+      const haveSourceRef = indexNames.some((i) => i.name === 'messages_source_ref');
+      const haveDedupe = indexNames.some((i) => i.name === 'messages_dedupe');
+      if (!haveSourceRef || !haveDedupe) {
+        db.exec('ROLLBACK;');
+        throw new Error(
+          `migration aborted: messages indexes missing after rebuild (source_ref=${haveSourceRef}, dedupe=${haveDedupe})`,
+        );
+      }
       db.exec('INSERT INTO messages SELECT * FROM messages_old;');
       // The old deliveries table may predate the M2.1 'error' column, so
       // column counts can differ. List columns explicitly and default error
