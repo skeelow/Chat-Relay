@@ -103,27 +103,34 @@
         return { label: delivery.status, actions: [] };
     }
   }
-  function targetFor(source) {
-    if (source === "astra") return "codex";
-    if (source === "codex") return "astra";
-    return null;
+  var SEND_LABEL = {
+    astra: "Send to ChatGPT",
+    codex: "Send to Codex",
+    hermes: "Send to Hermes"
+  };
+  function otherTargets(source) {
+    if (source === "astra") return ["codex", "hermes"];
+    if (source === "codex") return ["astra", "hermes"];
+    if (source === "hermes") return ["astra", "codex"];
+    return [];
   }
-  function sendButton(source, delivery) {
-    const target = targetFor(source);
-    if (target === null) return { show: false, label: "", target: null };
-    const plain = source === "astra" ? "Send to Codex" : "Send to ChatGPT";
-    if (delivery === void 0) return { show: true, label: plain, target };
-    if (delivery.status === "failed" && delivery.attempts >= 3) {
+  function sendButtons(source, rowsForThisMessage) {
+    return otherTargets(source).map((target) => {
+      const delivery = rowsForThisMessage.find((row) => row.target === target);
+      const plain = SEND_LABEL[target];
+      if (delivery === void 0) return { show: true, label: plain, target };
+      if (delivery.status === "failed" && delivery.attempts >= 3) {
+        return { show: false, label: "", target };
+      }
+      if (delivery.status === "failed") return { show: true, label: "Send again", target };
       return { show: false, label: "", target };
-    }
-    if (delivery.status === "failed") return { show: true, label: "Send again", target };
-    return { show: false, label: "", target };
+    });
   }
   function pendingCount(rows) {
     return rows.filter((row) => row.status === "pending_approval").length;
   }
   function userFooterTargets(messageId, rows) {
-    const order = ["astra", "codex"];
+    const order = ["astra", "codex", "hermes"];
     return order.filter((target) => rows.some((row) => row.messageId === messageId && row.target === target));
   }
   function deliveryKey(messageId, target) {
@@ -195,6 +202,32 @@
     if (rest.length > COMPOSE_BODY_CAP) return { ok: false, reason: "too-long" };
     const choice = tag ?? (selector in TARGETS_OF ? selector : "both");
     return { ok: true, body: rest, targets: TARGETS_OF[choice] };
+  }
+
+  // app/src/hermes.ts
+  function hermesModeBadge(mode) {
+    switch (mode) {
+      case void 0:
+      case "A":
+        return { text: "Conversation: no tools", tone: "safe" };
+      case "B":
+        return { text: "Supervised: asks first", tone: "caution" };
+      case "C":
+        return { text: "Work: tools on, no time limit", tone: "warning" };
+      case "D":
+        return { text: "Full access", tone: "danger" };
+      default:
+        return { text: `Unknown mode (${mode})`, tone: "danger" };
+    }
+  }
+  function hermesStatusLabel(status) {
+    const capitals = {
+      idle: "Idle",
+      thinking: "Thinking",
+      disconnected: "Disconnected",
+      failed: "Failed"
+    };
+    return capitals[status] ?? status;
   }
 
   // app/src/search.ts
@@ -362,6 +395,7 @@
   var settingsHint = document.getElementById("settings-hint");
   var modeLabelEl = document.getElementById("mode-label");
   var modeManualInput = document.getElementById("mode-manual");
+  var hermesModeChip = document.getElementById("hermes-mode");
   var modeApproveInput = document.getElementById("mode-approve-each");
   var modeAutoInput = document.getElementById("mode-auto");
   var turnCapInput = document.getElementById("turn-cap");
@@ -399,7 +433,7 @@
     sessionSummaryEl.textContent = line.text;
     sessionSummaryEl.classList.toggle("attention", line.approvalsEmphasised);
   }
-  var SENDER_LABELS = { astra: "Astra", codex: "Codex", user: "You" };
+  var SENDER_LABELS = { astra: "Astra", codex: "Codex", hermes: "Hermes", user: "You" };
   function engineState(label, on) {
     if (engineLabel !== null) engineLabel.textContent = label;
     if (dot !== null) dot.className = on ? "on" : "off";
@@ -575,7 +609,9 @@
     if (pill === null) return;
     pill.dataset.status = status;
     const statusEl = pill.querySelector(".status");
-    if (statusEl !== null) statusEl.textContent = status.replaceAll("_", " ");
+    if (statusEl !== null) {
+      statusEl.textContent = adapter === "hermes" ? hermesStatusLabel(status) : status.replaceAll("_", " ");
+    }
     console.log(`[relay-gui] pill ${adapter}: ${status}`);
   }
   function appendMessage(message) {
@@ -595,7 +631,7 @@
     body.className = "body";
     body.textContent = message.body;
     row.append(sender, body);
-    if (targetFor(message.source) !== null || message.source === "user") {
+    if (message.source === "user" || message.source === "astra" || message.source === "codex" || message.source === "hermes") {
       const footer = document.createElement("div");
       footer.className = "delivery";
       const status = document.createElement("div");
@@ -638,58 +674,78 @@
     footer.status.textContent = "";
     footer.actions.textContent = "";
     if (footer.source === "user") {
-      for (const target2 of userFooterTargets(messageId, [...deliveryState.rows.values()])) {
-        const delivery2 = deliveryState.rows.get(deliveryKey(messageId, target2));
-        if (delivery2 === void 0) continue;
-        const view2 = deliveryStatusView(delivery2, target2);
+      for (const target of userFooterTargets(messageId, [...deliveryState.rows.values()])) {
+        const delivery = deliveryState.rows.get(deliveryKey(messageId, target));
+        if (delivery === void 0) continue;
+        const view = deliveryStatusView(delivery, target);
         const line = document.createElement("div");
         line.className = "delivery-line";
         const status = document.createElement("span");
         status.className = "line-status";
-        status.textContent = view2.label;
+        status.textContent = view.label;
         line.append(status);
         const actions = document.createElement("span");
         actions.className = "line-actions";
         line.append(actions);
         footer.actions.append(line);
-        for (const action of view2.actions) {
+        for (const action of view.actions) {
           appendActionButton(actions, {
             action,
             label: action === "approve" ? "Approve" : action === "reject" ? "Reject" : "Send again"
-          }, messageId, target2);
+          }, messageId, target);
         }
       }
       return;
     }
-    const target = targetFor(footer.source);
-    if (target === null) return;
-    const key = deliveryKey(messageId, target);
-    const delivery = deliveryState.rows.get(key);
-    const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
-    const held = heldNotices.get(messageId);
-    if (held !== void 0) {
-      footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-    } else {
-      footer.status.textContent = view.label;
-    }
-    const buttons = [];
-    const send = sendButton(footer.source, delivery);
-    if (send.show) buttons.push({ action: "forward", label: send.label });
-    const countdownSeconds = countdownState.secondsLeft[key];
-    const decision = pendingDecision(
-      countdownSeconds !== void 0 && view.actions.includes("approve"),
-      countdownSeconds ?? 0
+    const source = footer.source;
+    const rowsForThisMessage = [...deliveryState.rows.values()].filter(
+      (row) => row.messageId === messageId
     );
-    if (held !== void 0 && view.label === "") {
-      footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-    } else if (countdownSeconds !== void 0 && view.actions.includes("approve")) {
-      footer.status.textContent = decision.label;
+    const entries = sendButtons(source, rowsForThisMessage);
+    for (const entry of entries) {
+      const target = entry.target;
+      const key = deliveryKey(messageId, target);
+      const delivery = deliveryState.rows.get(key);
+      const view = delivery === void 0 ? { label: "", actions: [] } : deliveryStatusView(delivery, target);
+      if (!entry.show && view.actions.length === 0) continue;
+      const line = document.createElement("div");
+      line.className = "delivery-line";
+      const held = heldNotices.get(messageId);
+      let label = view.label;
+      if (held !== void 0 && target !== "hermes") {
+        label = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+      }
+      const countdownSeconds = countdownState.secondsLeft[key];
+      const hasCountdown = countdownSeconds !== void 0 && view.actions.includes("approve") && target !== "hermes";
+      const decision = pendingDecision(hasCountdown, countdownSeconds ?? 0);
+      if (hasCountdown) {
+        label = decision.label;
+      }
+      const status = document.createElement("span");
+      status.className = "line-status";
+      status.textContent = label;
+      line.append(status);
+      const actions = document.createElement("span");
+      actions.className = "line-actions";
+      if (entry.show) {
+        appendActionButton(actions, { action: "forward", label: entry.label }, messageId, target);
+      }
+      for (const action of view.actions) {
+        if (action === "approve") {
+          appendActionButton(actions, {
+            action,
+            label: hasCountdown ? decision.approveLabel : "Approve"
+          }, messageId, target);
+        } else if (action === "reject") {
+          appendActionButton(actions, {
+            action,
+            label: hasCountdown ? decision.rejectLabel : "Reject"
+          }, messageId, target);
+        }
+      }
+      line.append(actions);
+      footer.actions.append(line);
     }
-    for (const action of view.actions) {
-      if (action === "approve") buttons.push({ action, label: decision.approveLabel });
-      else if (action === "reject") buttons.push({ action, label: decision.rejectLabel });
-    }
-    for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
   }
   function updatePendingBadge() {
     if (pendingBadge === null) return;
@@ -710,6 +766,7 @@
       const statuses = frame.statuses ?? {};
       setPill("astra", statuses.astra ?? "disconnected");
       setPill("codex", statuses.codex ?? "disconnected");
+      setPill("hermes", statuses.hermes ?? "disconnected");
       const messages = frame.messages ?? [];
       deliveryState = applySnapshotDeliveries(deliveryState, frame.deliveries ?? []);
       for (const message of messages) appendMessage(message);
@@ -1066,5 +1123,10 @@
     countdownState = tickCountdowns(countdownState);
     renderCountdownFooters();
   }, 1e3);
+  var hermesBadge = hermesModeBadge(void 0);
+  if (hermesModeChip !== null) {
+    hermesModeChip.textContent = hermesBadge.text;
+    hermesModeChip.className = `chip tone-${hermesBadge.tone}`;
+  }
   connect();
 })();

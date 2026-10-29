@@ -39,6 +39,7 @@
     .msg { max-width: 78%; padding: 8px 12px; border-radius: 10px;
            background: #1b1e21; border: 1px solid #2a2e33; }
     .msg.user { align-self: flex-end; background: #1e2a1e; }
+    .msg.hermes { border-left: 4px solid #8b5cf6; }
     .msg .sender { font-size: 11px; font-weight: 600; color: #9aa0a6;
                    margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
     .msg .body { white-space: pre-wrap; word-break: break-word; }
@@ -75,6 +76,11 @@
                     cursor: pointer; }
     #settings-btn:disabled { opacity: 0.45; cursor: default; }
     #mode-label { font-size: 12px; color: #9aa0a6; }
+    #hermes-mode { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid #33373c; color: #e6e6e6; }
+    #hermes-mode.tone-safe { background: #1e2a1e; color: #2ecc71; border-color: #2ecc71; }
+    #hermes-mode.tone-caution { background: #2a2115; color: #e3b341; border-color: #e3b341; }
+    #hermes-mode.tone-warning { background: #2a1e15; color: #f0883e; border-color: #f0883e; }
+    #hermes-mode.tone-danger { background: #2a1515; color: #eb9c9c; border-color: #eb9c9c; }
     #settings { padding: 12px 14px; border-bottom: 1px solid #26292d;
                 display: flex; flex-direction: column; gap: 12px; font-size: 13px; }
     #settings[hidden] { display: none; }
@@ -147,6 +153,8 @@
     <span class="title">Relay Chat</span>
     <span class="pill" id="pill-astra"><span class="name">Astra</span><span class="status">disconnected</span></span>
     <span class="pill" id="pill-codex"><span class="name">Codex</span><span class="status">disconnected</span></span>
+    <span class="pill" id="pill-hermes"><span class="name">Hermes</span><span class="status">disconnected</span></span>
+    <span id="hermes-mode" class="chip"></span>
     <button id="stop" type="button">Stop</button>
     <button id="settings-btn" type="button" disabled>Settings</button>
     <button id="search-btn" type="button" disabled>Search</button>
@@ -202,11 +210,13 @@
   <div id="session-summary"></div>
   <div id="compose">
     <textarea id="compose-text" rows="2"
-      placeholder="Write to the room — start with @astra, @codex or @both to pick a target; Enter sends, Shift+Enter is a newline"></textarea>
+      placeholder="Write to the room — start with @astra, @codex, @hermes or @all to pick a target; Enter sends, Shift+Enter is a newline"></textarea>
     <select id="compose-target" title="Who receives this message">
       <option value="both">@both</option>
       <option value="astra">@Astra</option>
       <option value="codex">@Codex</option>
+      <option value="hermes">@Hermes</option>
+      <option value="all">@All</option>
     </select>
     <button id="compose-send" type="button">Send</button>
   </div>

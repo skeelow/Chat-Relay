@@ -268,6 +268,12 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 - [ ] With auto-send ticked at 10 s, a message is delivered 10 s after it becomes ready, and Cancel during the countdown marks it `cancelled` with nothing delivered
 - [ ] Stop, Pause, the turn cap, unticking the box, or a restart during a countdown leaves the item pending and delivers nothing
 
+### Milestone 6 — Hermes
+
+1. M6.1 Hermes participant: the engine accepts `hermes` as a participant and send/forward target.
+2. M6.2 Hermes adapter: reconnects on engine restart without losing state.
+3. M6.3 GUI: the room shows a Hermes pill and mode chip; `@hermes` and `@all` are compose targets; an AI message offers a send button for each other AI.
+
 ## Review checkpoints and status reports
 
 Bring Claude in at three points only; everything else is judged by the acceptance checks.

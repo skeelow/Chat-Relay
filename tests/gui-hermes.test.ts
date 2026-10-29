@@ -159,13 +159,13 @@ test('targetFor unchanged: user maps to nothing', () => {
   assert.equal(targetFor('user'), null);
 });
 
-test('userFooterTargets order is astra, codex', () => {
+test('userFooterTargets order is astra, codex, hermes', () => {
   const rows = [
     row('m1', 'hermes', 'queued'),
     row('m1', 'codex', 'queued'),
     row('m1', 'astra', 'queued'),
   ];
-  assert.deepEqual(userFooterTargets('m1', rows), ['astra', 'codex']);
+  assert.deepEqual(userFooterTargets('m1', rows), ['astra', 'codex', 'hermes']);
 });
 
 test('frame builders accept hermes', () => {
@@ -186,7 +186,7 @@ test('hermesModeBadge: mode B', () => {
 });
 
 test('hermesModeBadge: mode C', () => {
-  assert.deepEqual(hermesModeBadge('C'), { text: 'Mission: autonomous, time-limited', tone: 'warning' });
+  assert.deepEqual(hermesModeBadge('C'), { text: 'Work: tools on, no time limit', tone: 'warning' });
 });
 
 test('hermesModeBadge: mode D', () => {
@@ -198,11 +198,11 @@ test('hermesModeBadge: unknown mode is never guessed safe', () => {
   assert.deepEqual(hermesModeBadge('auto'), { text: 'Unknown mode (auto)', tone: 'danger' });
 });
 
-test('hermesStatusLabel: known statuses are plain', () => {
-  assert.equal(hermesStatusLabel('idle'), 'idle');
-  assert.equal(hermesStatusLabel('thinking'), 'thinking');
-  assert.equal(hermesStatusLabel('disconnected'), 'disconnected');
-  assert.equal(hermesStatusLabel('failed'), 'failed');
+test('hermesStatusLabel: known statuses are capitalised', () => {
+  assert.equal(hermesStatusLabel('idle'), 'Idle');
+  assert.equal(hermesStatusLabel('thinking'), 'Thinking');
+  assert.equal(hermesStatusLabel('disconnected'), 'Disconnected');
+  assert.equal(hermesStatusLabel('failed'), 'Failed');
 });
 
 test('hermesStatusLabel: unknown status shown raw', () => {

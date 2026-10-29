@@ -14,9 +14,6 @@ export interface ModeBadge {
   tone: BadgeTone;
 }
 
-/** The known Hermes statuses shown as a plain pill label. */
-const HERMES_STATUSES = ['idle', 'thinking', 'disconnected', 'failed'];
-
 /** The badge text and tone for a Hermes mode. Unknown modes are never
  *  guessed safe — they show raw and tone `danger`. */
 export function hermesModeBadge(mode: string | undefined): ModeBadge {
@@ -27,7 +24,7 @@ export function hermesModeBadge(mode: string | undefined): ModeBadge {
     case 'B':
       return { text: 'Supervised: asks first', tone: 'caution' };
     case 'C':
-      return { text: 'Mission: autonomous, time-limited', tone: 'warning' };
+      return { text: 'Work: tools on, no time limit', tone: 'warning' };
     case 'D':
       return { text: 'Full access', tone: 'danger' };
     default:
@@ -35,9 +32,14 @@ export function hermesModeBadge(mode: string | undefined): ModeBadge {
   }
 }
 
-/** The pill label for a Hermes status: known statuses are plain, anything
- *  else is shown raw — never guessed. */
+/** The pill label for a Hermes status: known statuses are capitalised,
+ *  anything else is shown raw — never guessed. */
 export function hermesStatusLabel(status: string): string {
-  if (HERMES_STATUSES.includes(status)) return status;
-  return status;
+  const capitals: Record<string, string> = {
+    idle: 'Idle',
+    thinking: 'Thinking',
+    disconnected: 'Disconnected',
+    failed: 'Failed',
+  };
+  return capitals[status] ?? status;
 }

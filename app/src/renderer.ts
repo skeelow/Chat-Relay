@@ -37,15 +37,15 @@ import {
   pendingCount,
   rejectFrame,
   resumeFrame,
-  sendButton,
+  sendButtons,
   stopButtonLabel,
   stopFrame,
-  targetFor,
   userFooterTargets,
   type DeliveryRow,
   type DeliveryUiState,
 } from './deliveries.ts';
-import { parseCompose } from './compose.ts';
+import { parseCompose, type Target } from './compose.ts';
+import { hermesModeBadge, hermesStatusLabel } from './hermes.ts';
 import {
   applySearchResult, closeSearch, emptySearchState, exportFrame, isSearchQueryValid,
   searchFrame, startSearch, type SearchState,
@@ -66,7 +66,7 @@ const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
 interface GuiMessage {
   id: string;
-  source: 'user' | 'astra' | 'codex';
+  source: 'user' | 'astra' | 'codex' | 'hermes';
   targets: string[];
   body: string;
   contentHash: string;
@@ -103,6 +103,7 @@ const settingsPanel = document.getElementById('settings');
 const settingsHint = document.getElementById('settings-hint');
 const modeLabelEl = document.getElementById('mode-label');
 const modeManualInput = document.getElementById('mode-manual') as HTMLInputElement | null;
+const hermesModeChip = document.getElementById('hermes-mode');
 const modeApproveInput = document.getElementById('mode-approve-each') as HTMLInputElement | null;
 const modeAutoInput = document.getElementById('mode-auto') as HTMLInputElement | null;
 const turnCapInput = document.getElementById('turn-cap') as HTMLInputElement | null;
@@ -156,7 +157,7 @@ function renderSessionSummary(): void {
   sessionSummaryEl.classList.toggle('attention', line.approvalsEmphasised);
 }
 
-const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', user: 'You' };
+const SENDER_LABELS: Record<string, string> = { astra: 'Astra', codex: 'Codex', hermes: 'Hermes', user: 'You' };
 
 function engineState(label: string, on: boolean): void {
   if (engineLabel !== null) engineLabel.textContent = label;
@@ -363,7 +364,11 @@ function setPill(adapter: string, status: string): void {
   if (pill === null) return;
   pill.dataset.status = status; // raw value — the CSS keys on it (S1)
   const statusEl = pill.querySelector('.status');
-  if (statusEl !== null) statusEl.textContent = status.replaceAll('_', ' ');
+  if (statusEl !== null) {
+    statusEl.textContent = adapter === 'hermes'
+      ? hermesStatusLabel(status)
+      : status.replaceAll('_', ' ');
+  }
   console.log(`[relay-gui] pill ${adapter}: ${status}`);
 }
 
@@ -386,7 +391,7 @@ function appendMessage(message: GuiMessage): void {
   row.append(sender, body);
   // M2.3 + M3.1: every AI message carries its delivery status and actions.
   // M4.1: user messages carry a footer too — one line per target.
-  if (targetFor(message.source) !== null || message.source === 'user') {
+  if (message.source === 'user' || message.source === 'astra' || message.source === 'codex' || message.source === 'hermes') {
     const footer = document.createElement('div');
     footer.className = 'delivery';
     const status = document.createElement('div');
@@ -409,7 +414,7 @@ function appendActionButton(
   container: HTMLElement,
   spec: { action: 'forward' | 'approve' | 'reject'; label: string },
   messageId: string,
-  target: 'codex' | 'astra',
+  target: Target,
 ): void {
   const key = deliveryKey(messageId, target);
   const clickPending = deliveryState.pendingClicks.has(key);
@@ -471,40 +476,72 @@ function renderDelivery(messageId: string): void {
     }
     return;
   }
-  const target = targetFor(footer.source);
-  if (target === null) return;
-  const key = deliveryKey(messageId, target);
-  const delivery = deliveryState.rows.get(key);
-  const view = delivery === undefined
-    ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
-    : deliveryStatusView(delivery, target);
-  // M5.1 (D18-5): a held message shows the turn-cap notice instead of an
-  // empty footer — and its manual Send to X button keeps working.
-  const held = heldNotices.get(messageId);
-  if (held !== undefined) {
-    footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-  } else {
-    footer.status.textContent = view.label; // textContent only — error text included
+  const source = footer.source as Target;
+  const rowsForThisMessage = [...deliveryState.rows.values()].filter(
+    (row) => row.messageId === messageId,
+  );
+  const entries = sendButtons(source, rowsForThisMessage);
+  for (const entry of entries) {
+    const target = entry.target;
+    const key = deliveryKey(messageId, target);
+    const delivery = deliveryState.rows.get(key);
+    const view = delivery === undefined
+      ? { label: '', actions: [] as Array<'forward' | 'approve' | 'reject'> }
+      : deliveryStatusView(delivery, target);
+    // Nothing to show for this target: no send button and no actions.
+    if (!entry.show && view.actions.length === 0) continue;
+
+    const line = document.createElement('div');
+    line.className = 'delivery-line';
+
+    // Status label: held notice (never on Hermes per D29), then view label.
+    const held = heldNotices.get(messageId);
+    let label = view.label;
+    if (held !== undefined && target !== 'hermes') {
+      label = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
+    }
+    // M5.1 (D18 GUI): while a countdown runs on a pending item, labels read
+    // Sending in Ns / Send now / Cancel. D29: no countdown on a Hermes line.
+    const countdownSeconds = countdownState.secondsLeft[key];
+    const hasCountdown =
+      countdownSeconds !== undefined && view.actions.includes('approve') && target !== 'hermes';
+    const decision = pendingDecision(hasCountdown, countdownSeconds ?? 0);
+    if (hasCountdown) {
+      label = decision.label;
+    }
+
+    const status = document.createElement('span');
+    status.className = 'line-status';
+    status.textContent = label; // textContent only — error text included
+    line.append(status);
+
+    const actions = document.createElement('span');
+    actions.className = 'line-actions';
+
+    // Forward button: Send to X / Send again (from sendButtons).
+    if (entry.show) {
+      appendActionButton(actions, { action: 'forward', label: entry.label }, messageId, target);
+    }
+
+    // Approve/Reject buttons for pending rows.
+    for (const action of view.actions) {
+      if (action === 'approve') {
+        appendActionButton(actions, {
+          action,
+          label: hasCountdown ? decision.approveLabel : 'Approve',
+        }, messageId, target);
+      } else if (action === 'reject') {
+        appendActionButton(actions, {
+          action,
+          label: hasCountdown ? decision.rejectLabel : 'Reject',
+        }, messageId, target);
+      }
+      // 'forward' in the table is the failed case — sendButtons shows it as Send again.
+    }
+
+    line.append(actions);
+    footer.actions.append(line);
   }
-  const buttons: Array<{ action: 'forward' | 'approve' | 'reject'; label: string }> = [];
-  const send = sendButton(footer.source, delivery);
-  if (send.show) buttons.push({ action: 'forward', label: send.label });
-  // M5.1 (D18 GUI): while a countdown runs on a pending item, the labels
-  // read Sending in Ns / Send now / Cancel — the frames stay approve/reject.
-  const countdownSeconds = countdownState.secondsLeft[key];
-  const decision = pendingDecision(
-    countdownSeconds !== undefined && view.actions.includes('approve'), countdownSeconds ?? 0);
-  if (held !== undefined && view.label === '') {
-    footer.status.textContent = `${heldNotice(held.cap, SENDER_LABELS[target] ?? target)} ${heldNoticeHelp()}`;
-  } else if (countdownSeconds !== undefined && view.actions.includes('approve')) {
-    footer.status.textContent = decision.label;
-  }
-  for (const action of view.actions) {
-    if (action === 'approve') buttons.push({ action, label: decision.approveLabel });
-    else if (action === 'reject') buttons.push({ action, label: decision.rejectLabel });
-    // 'forward' in the table is the failed case — sendButton shows it as Send again.
-  }
-  for (const spec of buttons) appendActionButton(footer.actions, spec, messageId, target);
 }
 
 /** M2.3 + M3.1: "N pending" in the header — pending_approval rows, all targets. */
@@ -531,6 +568,7 @@ function handleFrame(frame: Frame): void {
     const statuses = (frame.statuses ?? {}) as Record<string, string>;
     setPill('astra', statuses.astra ?? 'disconnected');
     setPill('codex', statuses.codex ?? 'disconnected');
+    setPill('hermes', statuses.hermes ?? 'disconnected');
     const messages = (frame.messages ?? []) as GuiMessage[];
     // M3.1: no codex filter — every delivery row seeds the state (keyed
     // messageId:target), and a snapshot clears every pending click (G1).
@@ -932,5 +970,14 @@ setInterval(() => {
   countdownState = tickCountdowns(countdownState);
   renderCountdownFooters();
 }, 1000);
+
+// Hermes mode chip — the engine does not report a mode yet, so it always
+// shows "Conversation: no tools" with a safe tone. Updated here in case the
+// engine ever reports a mode in a later milestone.
+const hermesBadge = hermesModeBadge(undefined);
+if (hermesModeChip !== null) {
+  hermesModeChip.textContent = hermesBadge.text;
+  hermesModeChip.className = `chip tone-${hermesBadge.tone}`;
+}
 
 connect();

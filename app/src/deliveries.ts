@@ -161,13 +161,11 @@ export function pendingCount(rows: DeliveryRow[]): number {
 
 /**
  * M4.1: the targets a user message has delivery rows for, in a stable order
- * (astra, codex) — one footer line per target. Empty until the rows arrive.
- * Hermes footer lines are rendered in part b (screen work); here the pure
- * helpers already accept `hermes` for deliveryStatusView, sendButtons and the
- * frames.
+ * (astra, codex, hermes) — one footer line per target. Empty until the rows
+ * arrive.
  */
-export function userFooterTargets(messageId: string, rows: DeliveryRow[]): Array<'astra' | 'codex'> {
-  const order: Array<'astra' | 'codex'> = ['astra', 'codex'];
+export function userFooterTargets(messageId: string, rows: DeliveryRow[]): Target[] {
+  const order: Target[] = ['astra', 'codex', 'hermes'];
   return order.filter((target) => rows.some((row) => row.messageId === messageId && row.target === target));
 }
 
