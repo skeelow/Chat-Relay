@@ -27,24 +27,52 @@ import {
   SENDER_LABELS,
   applyClick,
   applyDeliveryUpdate,
+  applyKillDelivery,
   applySnapshotDeliveries,
   approveDisabledTitle,
   approveFrame,
   deliveryKey,
   deliveryStatusView,
   emptyDeliveryState,
-  forwardFrame,
+  finishKillWait,
+  hermesInFlight,
+  isKillHotkey,
+  killConfirmation,
+  killFrame,
   pauseBannerText,
   pendingCount,
   rejectFrame,
   resumeFrame,
+  startKillWait,
   stopButtonLabel,
   stopFrame,
   userFooterTargets,
   type DeliveryRow,
   type DeliveryUiState,
+  type KillWaitState,
 } from './deliveries.ts';
 import { parseCompose, type Target } from './compose.ts';
+import {
+  DEFAULT_PERM,
+  PERM_CHOICES,
+  PERM_NOTE,
+  choosePerm,
+  forwardFrameWithPerm,
+  permAfterSend,
+  permChoiceView,
+  sendFrameWithPerm,
+  type Perm,
+} from './perm.ts';
+import {
+  AUDIT_LIMIT,
+  applyAuditResult,
+  auditFrame,
+  auditRows,
+  closeAudit,
+  emptyAuditState,
+  openAudit,
+  type AuditUiState,
+} from './audit.ts';
 import { hermesModeBadge, hermesStatusLabel } from './hermes.ts';
 import {
   applySearchResult, closeSearch, emptySearchState, exportFrame, isSearchQueryValid,
@@ -120,6 +148,20 @@ const exportButton = document.getElementById('export-btn') as HTMLButtonElement 
 const exportNote = document.getElementById('export-note');
 const countdownCountEl = document.getElementById('countdown-count');
 const sessionSummaryEl = document.getElementById('session-summary');
+// M6.4d: the permission picker, the Kill control and the audit panel.
+const permButtons = PERM_CHOICES.map((choice) => ({
+  choice,
+  button: document.getElementById(`perm-${choice.value}`) as HTMLButtonElement | null,
+}));
+const permNoteEl = document.getElementById('perm-note');
+const killButton = document.getElementById('kill') as HTMLButtonElement | null;
+const killNoteEl = document.getElementById('kill-note');
+const auditButton = document.getElementById('audit-btn') as HTMLButtonElement | null;
+const auditPanel = document.getElementById('audit');
+const auditTotalEl = document.getElementById('audit-total');
+const auditListEl = document.getElementById('audit-rows');
+const auditRefreshButton = document.getElementById('audit-refresh') as HTMLButtonElement | null;
+const auditCloseButton = document.getElementById('audit-close') as HTMLButtonElement | null;
 
 // M2.3 + M3.1: delivery state — rows keyed messageId:target (G2), clicks
 // waiting for their own update. All transitions live in deliveries.ts (pure).
@@ -144,6 +186,95 @@ let countdownState: CountdownState = emptyCountdownState();
 const heldNotices = new Map<string, { hop: number; cap: number }>();
 // M5.2: the session summary — server-fed only; the line is live-view only.
 let sessionSummary: SessionSummary | null = null;
+// M6.4d: the picked Hermes permission — never sticky, reset after every send.
+let pickerPerm: Perm = DEFAULT_PERM;
+// M6.4d: the Kill round-trip — after the click the engine's reply (returned
+// rows + the pause_update) fills the confirmation line.
+let killWait: KillWaitState = { awaiting: false, returned: 0 };
+// M6.4d: the audit panel — the engine answers; only the current requestId shows.
+let auditState: AuditUiState = emptyAuditState();
+
+/** M6.4d: paint the picker — the chosen mode carries its colour and label. */
+function renderPermPicker(): void {
+  for (const { choice, button } of permButtons) {
+    if (button === null) continue;
+    const selected = choice.value === pickerPerm;
+    const view = permChoiceView(choice.value);
+    button.className = selected ? `perm-choice chosen tone-${view.tone}` : 'perm-choice';
+    button.setAttribute('aria-pressed', String(selected));
+  }
+  if (permNoteEl !== null) permNoteEl.textContent = PERM_NOTE;
+}
+
+/** M6.4d: the picker resets to Conversation after a Hermes send/forward. */
+function resetPermAfterSend(): void {
+  const before = pickerPerm;
+  pickerPerm = permAfterSend(pickerPerm);
+  if (before !== pickerPerm) console.log(`[relay-gui] perm picker reset to ${pickerPerm} after send`);
+  renderPermPicker();
+}
+
+/** M6.4d: arm the Kill button while a Hermes delivery is in flight. */
+function renderKillUi(): void {
+  if (killButton === null) return;
+  killButton.classList.toggle('armed', hermesInFlight([...deliveryState.rows.values()]));
+}
+
+/** M6.4d: the Kill click — the existing frame; the engine's reply confirms. */
+function sendKill(): void {
+  if (!engineOnline || killWait.awaiting) return;
+  if (sendFrameToEngine(killFrame())) {
+    killWait = startKillWait();
+    if (killNoteEl !== null) killNoteEl.textContent = 'Kill sent — waiting for the engine…';
+    console.log('[relay-gui] kill sent');
+  }
+}
+
+/** M6.4d: show what the engine's reply says was stopped. */
+function showKillConfirmation(): void {
+  const line = killConfirmation(killWait.returned);
+  if (killNoteEl !== null) killNoteEl.textContent = line;
+  console.log(`[relay-gui] ${line}`);
+}
+
+/** M6.4d: ask the engine for the recent audit rows (opens or refreshes). */
+function requestAuditRows(): void {
+  const requestId = crypto.randomUUID();
+  auditState = openAudit(auditState, requestId);
+  renderAuditPanel();
+  sendFrameToEngine(auditFrame(requestId));
+}
+
+/** M6.4d: rebuild the audit panel — time, perm, event, detail (textContent
+ *  only; the store keeps no message bodies, so there is none to show). */
+function renderAuditPanel(): void {
+  if (auditPanel !== null) auditPanel.hidden = !auditState.open;
+  if (auditListEl === null) return;
+  auditListEl.textContent = '';
+  if (!auditState.open) return;
+  const rows = auditRows(auditState.entries);
+  if (auditTotalEl !== null) {
+    auditTotalEl.textContent = rows.length === 0
+      ? 'No audit rows yet.'
+      : `${rows.length} row(s), newest first (cap ${AUDIT_LIMIT}).`;
+  }
+  for (const view of rows) {
+    const line = document.createElement('div');
+    line.className = 'audit-row';
+    for (const [cls, text] of [
+      ['audit-time', view.time],
+      ['audit-perm', view.perm ?? '—'],
+      ['audit-event', view.event],
+      ['audit-detail', view.detail ?? ''],
+    ] as Array<[string, string]>) {
+      const cell = document.createElement('span');
+      cell.className = cls;
+      cell.textContent = text;
+      line.append(cell);
+    }
+    auditListEl.append(line);
+  }
+}
 
 /** M5.2: the pinned session line, built only from the server's summary. */
 function renderSessionSummary(): void {
@@ -176,6 +307,14 @@ function engineState(label: string, on: boolean): void {
   if (autoSendInput !== null) autoSendInput.disabled = !on;
   if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
   if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
+  // M6.4d: Kill and the audit panel need the engine too; the picker only
+  // affects outgoing frames, so it is disabled along with the send controls.
+  if (killButton !== null) killButton.disabled = !on;
+  if (auditButton !== null) auditButton.disabled = !on;
+  if (auditRefreshButton !== null) auditRefreshButton.disabled = !on;
+  for (const { button } of permButtons) {
+    if (button !== null) button.disabled = !on;
+  }
   if (engineOnline !== on) {
     engineOnline = on;
     // Going offline disables every action button; coming back re-enables them.
@@ -432,10 +571,14 @@ function appendActionButton(
   }
   button.addEventListener('click', () => {
     deliveryState = applyClick(deliveryState, key);
-    sendFrameToEngine(spec.action === 'forward' ? forwardFrame(messageId, target)
+    // M6.4d: a Hermes forward carries the picked perm; the picker is never
+    // sticky, so it resets once the frame goes out.
+    const frame = spec.action === 'forward' ? forwardFrameWithPerm(messageId, target, pickerPerm)
       : spec.action === 'approve' ? approveFrame(messageId, target)
-      : rejectFrame(messageId, target));
+      : rejectFrame(messageId, target);
+    const wentOut = sendFrameToEngine(frame);
     console.log(`[relay-gui] ${spec.action} sent for ${messageId} → ${target}`);
+    if (spec.action === 'forward' && target === 'hermes' && wentOut) resetPermAfterSend();
     renderDelivery(messageId); // disable immediately, until the next delivery_update
   });
   container.append(button);
@@ -535,6 +678,13 @@ function handleFrame(frame: Frame): void {
     // M3.1: no codex filter — every delivery row seeds the state (keyed
     // messageId:target), and a snapshot clears every pending click (G1).
     deliveryState = applySnapshotDeliveries(deliveryState, (frame.deliveries ?? []) as DeliveryRow[]);
+    // M6.4d: a catch-up ends any unfinished Kill round-trip — the snapshot
+    // says the true state, the confirmation line follows it.
+    if (killWait.awaiting) {
+      killWait = finishKillWait(killWait);
+      showKillConfirmation();
+    }
+    renderKillUi();
     for (const message of messages) appendMessage(message);
     for (const id of messageFooters.keys()) renderDelivery(id); // G1: re-render existing footers
     updatePendingBadge();
@@ -589,6 +739,13 @@ function handleFrame(frame: Frame): void {
     // M3.2b: the only other source of the stopped state.
     paused = frame.paused === true;
     setPausedUi();
+    // M6.4d: a Kill's pause_update is the engine's answer to the kill frame —
+    // the delivery_updates before it counted what came back to pending.
+    if (killWait.awaiting && paused) {
+      killWait = finishKillWait(killWait);
+      showKillConfirmation();
+      renderKillUi();
+    }
     return;
   }
   if (type === 'settings_update') {
@@ -713,9 +870,26 @@ function handleFrame(frame: Frame): void {
       ...(typeof frame.error === 'string' ? { error: frame.error } : {}),
     };
     deliveryState = applyDeliveryUpdate(deliveryState, update);
+    // M6.4d: a row returning to pending_approval while a Kill is in flight is
+    // part of the engine's answer — what was stopped.
+    if (killWait.awaiting) {
+      killWait = applyKillDelivery(killWait, update);
+    }
     console.log(`[relay-gui] delivery ${messageId} → ${update.target}: ${update.status}`);
     renderDelivery(messageId); // no-op when the message is not on screen — the row is kept
     updatePendingBadge();
+    renderKillUi(); // M6.4d: a returning row may end the Hermes flight
+    return;
+  }
+  if (type === 'audit_result') {
+    // M6.4d: the audit panel's only source — the engine's rows, newest first,
+    // capped. A stale requestId is ignored (the state machine decides).
+    const before = auditState;
+    auditState = applyAuditResult(auditState, frame);
+    if (auditState !== before) {
+      console.log(`[relay-gui] audit rows: ${auditState.entries.length}`);
+      renderAuditPanel();
+    }
     return;
   }
 }
@@ -784,9 +958,12 @@ function submitCompose(): void {
     console.log(`[relay-gui] compose refused: ${parsed.reason} — text kept`);
     return;
   }
-  const wentOut = sendFrameToEngine({ type: 'send', body: parsed.body, targets: parsed.targets });
+  // M6.4d: the frame carries the picked Hermes perm (only when Hermes is a
+  // target); the picker is never sticky, so it resets with every send.
+  const wentOut = sendFrameToEngine(sendFrameWithPerm(parsed.body, parsed.targets, pickerPerm));
   if (wentOut) {
     composeText.value = '';
+    resetPermAfterSend();
     console.log(`[relay-gui] sent to ${parsed.targets.join(' + ')}: ${parsed.body.slice(0, 60)}`);
   } else {
     console.log('[relay-gui] send could not go out — engine link down, text kept');
@@ -932,6 +1109,60 @@ setInterval(() => {
   countdownState = tickCountdowns(countdownState);
   renderCountdownFooters();
 }, 1000);
+
+// M6.4d: the permission picker — three buttons, Conversation first. The
+// click updates the picker only; the perm leaves with the next send/forward
+// frame and the picker resets then (never sticky).
+for (const { choice, button } of permButtons) {
+  if (button === null) continue;
+  button.disabled = true; // until the engine connects
+  button.addEventListener('click', () => {
+    pickerPerm = choosePerm(pickerPerm, choice.value);
+    renderPermPicker();
+    console.log(`[relay-gui] Hermes perm picked: ${pickerPerm}`);
+  });
+}
+renderPermPicker();
+
+// M6.4d: the Kill button — visible always, harmless when nothing runs (the
+// engine answers with the stopped state anyway), armed while Hermes is in
+// flight. Ctrl+Shift+K inside the window does the same thing.
+if (killButton !== null) {
+  killButton.disabled = true; // until the engine connects
+  killButton.addEventListener('click', sendKill);
+}
+document.addEventListener('keydown', (event) => {
+  if (isKillHotkey(event)) {
+    event.preventDefault(); // the hotkey is kill, not a browser shortcut
+    sendKill();
+  }
+});
+renderKillUi();
+
+// M6.4d: the audit panel — open asks the engine for the recent rows; Refresh
+// asks again; Close hides the panel (the rows are kept until the next answer).
+if (auditButton !== null) {
+  auditButton.disabled = true; // until the engine connects
+  auditButton.addEventListener('click', () => {
+    if (auditState.open) {
+      auditState = closeAudit(auditState);
+      renderAuditPanel();
+      return;
+    }
+    requestAuditRows();
+  });
+}
+if (auditRefreshButton !== null) {
+  auditRefreshButton.disabled = true;
+  auditRefreshButton.addEventListener('click', requestAuditRows);
+}
+if (auditCloseButton !== null) {
+  auditCloseButton.addEventListener('click', () => {
+    auditState = closeAudit(auditState);
+    renderAuditPanel();
+  });
+}
+renderAuditPanel();
 
 // Hermes mode chip — the engine does not report a mode yet, so it always
 // shows "Conversation: no tools" with a safe tone. Updated here in case the

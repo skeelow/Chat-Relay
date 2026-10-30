@@ -17,6 +17,11 @@ import {
   hermesAckTimeoutMs,
 } from '../relay/engine.ts';
 import { hashBody } from '../relay/store.ts';
+// M6.4d: the GUI's frame builders are pushed through this real engine — the
+// exact JSON the picker/Kill/audit buttons send, not a hand-typed copy.
+import { forwardFrameWithPerm, sendFrameWithPerm } from '../app/src/perm.ts';
+import { killFrame } from '../app/src/deliveries.ts';
+import { AUDIT_LIMIT, auditFrame } from '../app/src/audit.ts';
 
 test('ack timeouts: Hermes 6 minutes, Codex 30 seconds', () => {
   assert.equal(HERMES_ACK_TIMEOUT_MS, 360000);
@@ -860,5 +865,51 @@ test('M6.4a kill: works when nothing is running (records audit + stopped state)'
     await pause(150);
     assert.equal(engine.store.paused(), true, 'kill enters the stopped state even when idle');
     assert.ok(engine.store.recentAudit(50).some((e) => e.event === 'kill'), 'kill audited even when idle');
+  });
+});
+
+// --- M6.4d: the GUI's builder frames, pushed through this real engine ---
+
+test('M6.4d GUI builders through the real engine: work send, kill round-trip, audit_result', async () => {
+  await withEngine('gui-builder-frames', async (_engine, url, token) => {
+    const hermes = await openHermesAdapter(url, token);
+    const gui = await openGui(url, token);
+    // 1. The picker's send frame arrives with its perm on the deliver frame.
+    gui.send(sendFrameWithPerm('builder body', ['hermes'], 'work'));
+    const deliver = await hermes.client.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.perm, 'work', 'the send perm built in the GUI reaches the adapter');
+    // 2. The Kill button's frame: in-flight row returns, engine stops, Hermes gets kill.
+    gui.send(killFrame());
+    let gotReturn = false;
+    let gotPause = false;
+    for (let i = 0; i < 6 && !(gotReturn && gotPause); i++) {
+      const m = await gui.nextMessage();
+      if (m.type === 'delivery_update' && m.status === 'pending_approval') gotReturn = true;
+      if (m.type === 'pause_update' && m.paused === true) gotPause = true;
+    }
+    assert.ok(gotReturn, "the engine's kill reply returns the in-flight row to pending_approval");
+    assert.ok(gotPause, 'the kill ends in the stopped state (the GUI confirmation follows it)');
+    const killed = await hermes.client.nextMessage();
+    assert.deepEqual(killed, { type: 'kill' }, 'the hermes adapter is told to kill its tree');
+    // 3. The audit panel's frame: the engine answers with newest-first rows.
+    gui.send(auditFrame('gui-a1'));
+    let result: { type: string; requestId: string; entries: Array<{ id: number; event: string }> } | null = null;
+    for (let i = 0; i < 8 && result === null; i++) {
+      const m = await gui.nextMessage();
+      if (m.type === 'audit_result' && m.requestId === 'gui-a1') {
+        result = m as unknown as { type: string; requestId: string; entries: Array<{ id: number; event: string }> };
+      }
+    }
+    assert.ok(result !== null, 'audit_result answers the frame built by the GUI');
+    const ids = (result as { entries: Array<{ id: number }> }).entries.map((e) => e.id);
+    assert.deepEqual([...ids].sort((a, b) => b - a), ids, 'entries come newest first');
+    assert.ok(ids.length <= AUDIT_LIMIT, 'the asked limit is respected');
+    const events = (result as { entries: Array<{ event: string }> }).entries.map((e) => e.event);
+    assert.ok(events.includes('kill'), 'the kill shows in the audit rows');
+    assert.ok(events.includes('perm_requested'), 'the work perm request shows in the audit rows');
+    // 4. The forward builder never puts a perm on a non-Hermes frame.
+    assert.deepEqual(forwardFrameWithPerm('m1', 'codex', 'work'),
+      { type: 'forward', messageId: 'm1', target: 'codex' });
   });
 });

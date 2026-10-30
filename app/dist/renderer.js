@@ -158,9 +158,6 @@
     pendingClicks.add(key);
     return { rows: state.rows, pendingClicks };
   }
-  function forwardFrame(messageId, target) {
-    return { type: "forward", messageId, target };
-  }
   function approveFrame(messageId, target) {
     return { type: "approve", messageId, target };
   }
@@ -184,6 +181,30 @@
   function resumeFrame() {
     return { type: "resume" };
   }
+  function killFrame() {
+    return { type: "kill" };
+  }
+  function isKillHotkey(event) {
+    if (event.metaKey === true || event.altKey === true) return false;
+    return event.ctrlKey === true && event.shiftKey === true && event.key.toLowerCase() === "k";
+  }
+  function hermesInFlight(rows) {
+    return rows.some((row) => row.target === "hermes" && (row.status === "queued" || row.status === "delivering"));
+  }
+  function startKillWait() {
+    return { awaiting: true, returned: 0 };
+  }
+  function applyKillDelivery(state, update) {
+    if (!state.awaiting) return state;
+    if (update.status !== "pending_approval") return state;
+    return { awaiting: true, returned: state.returned + 1 };
+  }
+  function finishKillWait(state) {
+    return { awaiting: false, returned: state.returned };
+  }
+  function killConfirmation(returned) {
+    return returned === 0 ? "Killed \u2014 nothing was in flight; the relay is stopped until you Resume" : `Killed \u2014 ${returned} in-flight row(s) returned to pending; nothing runs; the relay is stopped until you Resume`;
+  }
 
   // app/src/compose.ts
   var COMPOSE_BODY_CAP = 2e4;
@@ -203,6 +224,76 @@
     if (rest.length > COMPOSE_BODY_CAP) return { ok: false, reason: "too-long" };
     const choice = tag ?? (selector in TARGETS_OF ? selector : "both");
     return { ok: true, body: rest, targets: TARGETS_OF[choice] };
+  }
+
+  // app/src/perm.ts
+  var DEFAULT_PERM = "conversation";
+  var PERM_CHOICES = [
+    { value: "conversation", label: "Conversation", tone: "safe" },
+    { value: "work", label: "Work \u2014 tools on", tone: "warning" },
+    { value: "full", label: "Full \u2014 no blocks", tone: "danger" }
+  ];
+  var PERM_NOTE = "Each mode has its own Hermes session \u2014 to carry context across modes use memory or files.";
+  function permChoiceView(perm) {
+    const choice = PERM_CHOICES.find((c) => c.value === perm) ?? PERM_CHOICES[0];
+    return { label: choice.label, tone: choice.tone };
+  }
+  function choosePerm(current, chosen) {
+    return chosen === "conversation" || chosen === "work" || chosen === "full" ? chosen : current;
+  }
+  function permAfterSend(_current) {
+    return DEFAULT_PERM;
+  }
+  function sendFrameWithPerm(body, targets, perm) {
+    return targets.includes("hermes") ? { type: "send", body, targets, perm } : { type: "send", body, targets };
+  }
+  function forwardFrameWithPerm(messageId, target, perm) {
+    return target === "hermes" ? { type: "forward", messageId, target, perm } : { type: "forward", messageId, target };
+  }
+
+  // app/src/audit.ts
+  var AUDIT_LIMIT = 100;
+  function auditFrame(requestId, limit = AUDIT_LIMIT) {
+    return { type: "audit", requestId, limit };
+  }
+  function emptyAuditState() {
+    return { open: false, requestId: null, entries: [] };
+  }
+  function openAudit(state, requestId) {
+    return { open: true, requestId, entries: state.entries };
+  }
+  function closeAudit(state) {
+    return { ...state, open: false, requestId: null };
+  }
+  function applyAuditResult(state, frame) {
+    if (!state.open || state.requestId === null) return state;
+    if (frame.requestId !== state.requestId) return state;
+    const entries = Array.isArray(frame.entries) ? frame.entries : [];
+    const valid = entries.filter(isAuditEntry);
+    const sorted = [...valid].sort((a, b) => b.id - a.id);
+    return { ...state, entries: sorted.slice(0, AUDIT_LIMIT) };
+  }
+  function isAuditEntry(value) {
+    if (value === null || typeof value !== "object") return false;
+    const e = value;
+    return typeof e.id === "number" && typeof e.at === "string" && typeof e.actor === "string" && typeof e.event === "string" && (e.detail === null || typeof e.detail === "string");
+  }
+  function permOf(entry) {
+    if (entry.event !== "perm_requested" && entry.event !== "hermes_delivering") return null;
+    return entry.detail === "conversation" || entry.detail === "work" || entry.detail === "full" ? entry.detail : null;
+  }
+  function auditRows(entries) {
+    const sorted = entries.filter(isAuditEntry).sort((a, b) => b.id - a.id).slice(0, AUDIT_LIMIT);
+    return sorted.map((entry) => {
+      const perm = permOf(entry);
+      return {
+        time: entry.at,
+        perm,
+        event: entry.event,
+        detail: perm !== null ? null : entry.detail
+        // the perm shows once
+      };
+    });
   }
 
   // app/src/hermes.ts
@@ -441,6 +532,19 @@
   var exportNote = document.getElementById("export-note");
   var countdownCountEl = document.getElementById("countdown-count");
   var sessionSummaryEl = document.getElementById("session-summary");
+  var permButtons = PERM_CHOICES.map((choice) => ({
+    choice,
+    button: document.getElementById(`perm-${choice.value}`)
+  }));
+  var permNoteEl = document.getElementById("perm-note");
+  var killButton = document.getElementById("kill");
+  var killNoteEl = document.getElementById("kill-note");
+  var auditButton = document.getElementById("audit-btn");
+  var auditPanel = document.getElementById("audit");
+  var auditTotalEl = document.getElementById("audit-total");
+  var auditListEl = document.getElementById("audit-rows");
+  var auditRefreshButton = document.getElementById("audit-refresh");
+  var auditCloseButton = document.getElementById("audit-close");
   var deliveryState = emptyDeliveryState();
   var messageFooters = /* @__PURE__ */ new Map();
   var engineOnline = false;
@@ -452,6 +556,74 @@
   var countdownState = emptyCountdownState();
   var heldNotices = /* @__PURE__ */ new Map();
   var sessionSummary = null;
+  var pickerPerm = DEFAULT_PERM;
+  var killWait = { awaiting: false, returned: 0 };
+  var auditState = emptyAuditState();
+  function renderPermPicker() {
+    for (const { choice, button } of permButtons) {
+      if (button === null) continue;
+      const selected = choice.value === pickerPerm;
+      const view = permChoiceView(choice.value);
+      button.className = selected ? `perm-choice chosen tone-${view.tone}` : "perm-choice";
+      button.setAttribute("aria-pressed", String(selected));
+    }
+    if (permNoteEl !== null) permNoteEl.textContent = PERM_NOTE;
+  }
+  function resetPermAfterSend() {
+    const before = pickerPerm;
+    pickerPerm = permAfterSend(pickerPerm);
+    if (before !== pickerPerm) console.log(`[relay-gui] perm picker reset to ${pickerPerm} after send`);
+    renderPermPicker();
+  }
+  function renderKillUi() {
+    if (killButton === null) return;
+    killButton.classList.toggle("armed", hermesInFlight([...deliveryState.rows.values()]));
+  }
+  function sendKill() {
+    if (!engineOnline || killWait.awaiting) return;
+    if (sendFrameToEngine(killFrame())) {
+      killWait = startKillWait();
+      if (killNoteEl !== null) killNoteEl.textContent = "Kill sent \u2014 waiting for the engine\u2026";
+      console.log("[relay-gui] kill sent");
+    }
+  }
+  function showKillConfirmation() {
+    const line = killConfirmation(killWait.returned);
+    if (killNoteEl !== null) killNoteEl.textContent = line;
+    console.log(`[relay-gui] ${line}`);
+  }
+  function requestAuditRows() {
+    const requestId = crypto.randomUUID();
+    auditState = openAudit(auditState, requestId);
+    renderAuditPanel();
+    sendFrameToEngine(auditFrame(requestId));
+  }
+  function renderAuditPanel() {
+    if (auditPanel !== null) auditPanel.hidden = !auditState.open;
+    if (auditListEl === null) return;
+    auditListEl.textContent = "";
+    if (!auditState.open) return;
+    const rows = auditRows(auditState.entries);
+    if (auditTotalEl !== null) {
+      auditTotalEl.textContent = rows.length === 0 ? "No audit rows yet." : `${rows.length} row(s), newest first (cap ${AUDIT_LIMIT}).`;
+    }
+    for (const view of rows) {
+      const line = document.createElement("div");
+      line.className = "audit-row";
+      for (const [cls, text] of [
+        ["audit-time", view.time],
+        ["audit-perm", view.perm ?? "\u2014"],
+        ["audit-event", view.event],
+        ["audit-detail", view.detail ?? ""]
+      ]) {
+        const cell = document.createElement("span");
+        cell.className = cls;
+        cell.textContent = text;
+        line.append(cell);
+      }
+      auditListEl.append(line);
+    }
+  }
   function renderSessionSummary() {
     if (sessionSummaryEl === null) return;
     const line = summaryLine(sessionSummary);
@@ -481,6 +653,12 @@
     if (autoSendInput !== null) autoSendInput.disabled = !on;
     if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
     if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
+    if (killButton !== null) killButton.disabled = !on;
+    if (auditButton !== null) auditButton.disabled = !on;
+    if (auditRefreshButton !== null) auditRefreshButton.disabled = !on;
+    for (const { button } of permButtons) {
+      if (button !== null) button.disabled = !on;
+    }
     if (engineOnline !== on) {
       engineOnline = on;
       for (const id of messageFooters.keys()) renderDelivery(id);
@@ -691,8 +869,10 @@
     }
     button.addEventListener("click", () => {
       deliveryState = applyClick(deliveryState, key);
-      sendFrameToEngine(spec.action === "forward" ? forwardFrame(messageId, target) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target));
+      const frame = spec.action === "forward" ? forwardFrameWithPerm(messageId, target, pickerPerm) : spec.action === "approve" ? approveFrame(messageId, target) : rejectFrame(messageId, target);
+      const wentOut = sendFrameToEngine(frame);
       console.log(`[relay-gui] ${spec.action} sent for ${messageId} \u2192 ${target}`);
+      if (spec.action === "forward" && target === "hermes" && wentOut) resetPermAfterSend();
       renderDelivery(messageId);
     });
     container.append(button);
@@ -774,6 +954,11 @@
       setPill("hermes", statuses.hermes ?? "disconnected");
       const messages = frame.messages ?? [];
       deliveryState = applySnapshotDeliveries(deliveryState, frame.deliveries ?? []);
+      if (killWait.awaiting) {
+        killWait = finishKillWait(killWait);
+        showKillConfirmation();
+      }
+      renderKillUi();
       for (const message of messages) appendMessage(message);
       for (const id of messageFooters.keys()) renderDelivery(id);
       updatePendingBadge();
@@ -823,6 +1008,11 @@
     if (type === "pause_update") {
       paused = frame.paused === true;
       setPausedUi();
+      if (killWait.awaiting && paused) {
+        killWait = finishKillWait(killWait);
+        showKillConfirmation();
+        renderKillUi();
+      }
       return;
     }
     if (type === "settings_update") {
@@ -928,9 +1118,22 @@
         ...typeof frame.error === "string" ? { error: frame.error } : {}
       };
       deliveryState = applyDeliveryUpdate(deliveryState, update);
+      if (killWait.awaiting) {
+        killWait = applyKillDelivery(killWait, update);
+      }
       console.log(`[relay-gui] delivery ${messageId} \u2192 ${update.target}: ${update.status}`);
       renderDelivery(messageId);
       updatePendingBadge();
+      renderKillUi();
+      return;
+    }
+    if (type === "audit_result") {
+      const before = auditState;
+      auditState = applyAuditResult(auditState, frame);
+      if (auditState !== before) {
+        console.log(`[relay-gui] audit rows: ${auditState.entries.length}`);
+        renderAuditPanel();
+      }
       return;
     }
   }
@@ -989,9 +1192,10 @@
       console.log(`[relay-gui] compose refused: ${parsed.reason} \u2014 text kept`);
       return;
     }
-    const wentOut = sendFrameToEngine({ type: "send", body: parsed.body, targets: parsed.targets });
+    const wentOut = sendFrameToEngine(sendFrameWithPerm(parsed.body, parsed.targets, pickerPerm));
     if (wentOut) {
       composeText.value = "";
+      resetPermAfterSend();
       console.log(`[relay-gui] sent to ${parsed.targets.join(" + ")}: ${parsed.body.slice(0, 60)}`);
     } else {
       console.log("[relay-gui] send could not go out \u2014 engine link down, text kept");
@@ -1128,6 +1332,49 @@
     countdownState = tickCountdowns(countdownState);
     renderCountdownFooters();
   }, 1e3);
+  for (const { choice, button } of permButtons) {
+    if (button === null) continue;
+    button.disabled = true;
+    button.addEventListener("click", () => {
+      pickerPerm = choosePerm(pickerPerm, choice.value);
+      renderPermPicker();
+      console.log(`[relay-gui] Hermes perm picked: ${pickerPerm}`);
+    });
+  }
+  renderPermPicker();
+  if (killButton !== null) {
+    killButton.disabled = true;
+    killButton.addEventListener("click", sendKill);
+  }
+  document.addEventListener("keydown", (event) => {
+    if (isKillHotkey(event)) {
+      event.preventDefault();
+      sendKill();
+    }
+  });
+  renderKillUi();
+  if (auditButton !== null) {
+    auditButton.disabled = true;
+    auditButton.addEventListener("click", () => {
+      if (auditState.open) {
+        auditState = closeAudit(auditState);
+        renderAuditPanel();
+        return;
+      }
+      requestAuditRows();
+    });
+  }
+  if (auditRefreshButton !== null) {
+    auditRefreshButton.disabled = true;
+    auditRefreshButton.addEventListener("click", requestAuditRows);
+  }
+  if (auditCloseButton !== null) {
+    auditCloseButton.addEventListener("click", () => {
+      auditState = closeAudit(auditState);
+      renderAuditPanel();
+    });
+  }
+  renderAuditPanel();
   var hermesBadge = hermesModeBadge(void 0);
   if (hermesModeChip !== null) {
     hermesModeChip.textContent = hermesBadge.text;

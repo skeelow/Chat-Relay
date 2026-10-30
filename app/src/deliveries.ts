@@ -264,3 +264,62 @@ export function stopFrame(): { type: 'stop' } {
 export function resumeFrame(): { type: 'resume' } {
   return { type: 'resume' };
 }
+
+// --- M6.4d: Kill (the engine's `kill` frame — everything Stop does, plus
+// killing the Hermes process tree and interrupting Codex; harmless while
+// nothing runs, so the button is always there) ---
+
+/** The kill frame (GUI → engine, SPEC protocol table). */
+export function killFrame(): { type: 'kill' } {
+  return { type: 'kill' };
+}
+
+/** The in-window hotkey: Ctrl+Shift+K exactly (Cmd alone, or Shift+K alone,
+ *  are not it). The renderer checks the keydown event's three flags. */
+export function isKillHotkey(event: {
+  key: string; ctrlKey: boolean; shiftKey: boolean; metaKey?: boolean; altKey?: boolean;
+}): boolean {
+  if (event.metaKey === true || event.altKey === true) return false;
+  return event.ctrlKey === true && event.shiftKey === true && event.key.toLowerCase() === 'k';
+}
+
+/** Is a Hermes delivery in flight? A queued or delivering Hermes row — that
+ *  is what the Kill button is armed for. */
+export function hermesInFlight(rows: DeliveryRow[]): boolean {
+  return rows.some((row) => row.target === 'hermes'
+    && (row.status === 'queued' || row.status === 'delivering'));
+}
+
+/** The Kill round-trip: after the click the GUI waits for the engine's
+ *  reply — every in-flight row returns as a pending_approval
+ *  delivery_update, then a pause_update says the relay is stopped. The
+ *  count is what was stopped; it starts at zero with the click, so
+ *  deliveries from before never count. */
+export interface KillWaitState {
+  awaiting: boolean;
+  returned: number;
+}
+
+export function startKillWait(): KillWaitState {
+  return { awaiting: true, returned: 0 };
+}
+
+/** One delivery_update while the Kill reply is in flight: a row that has
+ *  returned to pending_approval counts as stopped. */
+export function applyKillDelivery(state: KillWaitState, update: DeliveryRow): KillWaitState {
+  if (!state.awaiting) return state;
+  if (update.status !== 'pending_approval') return state;
+  return { awaiting: true, returned: state.returned + 1 };
+}
+
+/** The pause_update (paused: true) closes the round-trip. */
+export function finishKillWait(state: KillWaitState): KillWaitState {
+  return { awaiting: false, returned: state.returned };
+}
+
+/** The confirmation line built from the engine's reply. */
+export function killConfirmation(returned: number): string {
+  return returned === 0
+    ? 'Killed — nothing was in flight; the relay is stopped until you Resume'
+    : `Killed — ${returned} in-flight row(s) returned to pending; nothing runs; the relay is stopped until you Resume`;
+}

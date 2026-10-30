@@ -280,6 +280,7 @@ Current scope: stop after Milestone 2. Milestones 3–5 wait until more coding c
 1. M6.1 Hermes participant: the engine accepts `hermes` as a participant and send/forward target.
 2. M6.2 Hermes adapter: reconnects on engine restart without losing state.
 3. M6.3 GUI: the room shows a Hermes pill and mode chip; `@hermes` and `@all` are compose targets; an AI message offers a send button for each other AI.
+4. M6.4 GUI permission picker, Kill and audit view: a three-way picker above the compose bar (Conversation / Work / Full) chooses the Hermes mode per message — Conversation is the default on every send, the picker resets after each send and is never sticky; Work and full are visibly marked by colour and label. A `send`/`forward` that involves Hermes carries the picked `perm`; frames that do not involve Hermes never carry one. Each mode has its own Hermes session (M6.4b2), and the picker shows that note: context carries across modes only through memory or files. A Kill button sits in the header, visible whenever the engine is up and armed while a Hermes delivery is in flight; Ctrl+Shift+K in the window does the same. Both send the `kill` frame and the GUI confirms from the engine's reply (the rows that came back to pending, the stopped state). The Audit button opens a panel of the newest rows from the `audit` frame (limit 100, newest first, refreshable): time, perm, event, detail — never a message body.
 
 ## Review checkpoints and status reports
 
