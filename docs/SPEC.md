@@ -115,14 +115,14 @@ JSON messages, one per frame. Adapters and the GUI authenticate with a token fro
 | Direction | `type` | Payload |
 | --- | --- | --- |
 | adapter → engine | `hello` | adapter name (`codex`, `astra` or `hermes`), version |
-| adapter → engine | `thread` | threadId — from codex or hermes only |
+| adapter → engine | `thread` | threadId, optional `perm` (`conversation` default, `work` or `full`; any other value ignores the whole frame, logged) — from codex or hermes only. On a Hermes socket the perm selects which session slot the id belongs to; a Codex socket records its one thread regardless of `perm` |
 | adapter → engine | `status` | idle, thinking, streaming, awaiting\_approval, disconnected, selectors\_stale (astra only) |
 | adapter → engine | `captured` | body, sourceRef |
 | adapter → engine | `ping` | none — keepalive, ignored by the engine |
 | adapter → engine | `approval_request` | requestId, kind, summary, method — a Codex approval surfaced |
 | engine → adapter | `deliver` | message id, text with relay header; a Hermes delivery also carries `perm` (`conversation`, `work` or `full`) |
 | adapter → engine | `delivered` / `failed` | message id, error |
-| engine → adapter | `config` | threadId (or null) — sent to codex and hermes right after `hello` |
+| engine → adapter | `config` | threadId (or null) — sent to codex and hermes right after `hello`. The Hermes config also carries `threadIds` `{ work, full }` (each the stored id or null when unset); adapters must accept the old shape without `threadIds`. Each Hermes permission mode has its own session, because Hermes fixes a session's toolsets and turn limit when it starts; switching mode continues in that mode's own session. |
 | engine → adapter | `interrupt` | none — sent to codex and hermes on Stop, and to codex on Kill; interrupts in-progress turns on the relay thread |
 | engine → adapter | `approval_answer` | requestId, decision (accept or decline) — forwarded to the codex adapter |
 | engine → adapter | `kill` | none — sent to hermes on Kill; kills the whole process tree at once (no graceful wait) and reports the row stopped, leaving no orphan process |

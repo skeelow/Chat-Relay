@@ -402,7 +402,11 @@ async function run() {
 
             // One GUI send, returning its message id (via the user-message
             // transcript_update) and waiting for the Hermes row to be delivered.
-            async function sendWorkFull(body: string, perm?: string): Promise<string[]> {
+            // M6.4b2: the fake's session id for this send (each perm gets its
+            // own Hermes session; the fake emits this id for a fresh run and
+            // keeps it identical for resumes so argv can be compared).
+            async function sendWorkFull(body: string, perm?: string, sessionId = 'sess-smoke-1'): Promise<string[]> {
+              writeControl(dirA!, 'normal', sessionId);
               try { unlinkSync(smokeArgvFile); } catch { /* fresh */ }
               const frame: any = { type: 'send', body, targets: ['hermes'] };
               if (perm !== undefined) frame.perm = perm;
@@ -417,41 +421,53 @@ async function run() {
             const yoloCount = (argv: string[]): number => argv.filter((v) => v === '--yolo').length;
 
             // Check 13: perm='work' is delivered; argv has -t with the work
-            // toolsets and no --yolo.
+            // toolsets, no --yolo, and starts its OWN fresh session (no
+            // --resume of the conversation session — that is the exit-2 case).
             let check13ok = false; let check13detail = '';
             let workArgv: string[] = [];
             try {
-              workArgv = await sendWorkFull('m64b work 13', 'work');
+              workArgv = await sendWorkFull('m64b work 13', 'work', 'sess-smoke-work');
               check13ok = workArgv.includes('-t') && workArgv[workArgv.indexOf('-t') + 1] === WORK_ARGS
-                && yoloCount(workArgv) === 0 && workArgv[workArgv.indexOf('--max-turns') + 1] === '60';
-              check13detail = `t=${workArgv[workArgv.indexOf('-t') + 1]} yolo=${yoloCount(workArgv)}`;
+                && yoloCount(workArgv) === 0 && workArgv[workArgv.indexOf('--max-turns') + 1] === '60'
+                && !workArgv.includes('--resume');
+              check13detail = `t=${workArgv[workArgv.indexOf('-t') + 1]} yolo=${yoloCount(workArgv)} resume=${workArgv.includes('--resume')}`;
             } catch (err) { check13detail = String(err); }
-            check(13, "GUI send perm='work' is delivered with -t WORK_TOOLSETS and no --yolo", check13ok, check13detail);
+            check(13, "GUI send perm='work' is delivered with -t WORK_TOOLSETS, no --yolo, a fresh own session", check13ok, check13detail);
 
-            // Check 14: perm='full' argv has --yolo exactly once and no -t.
+            // Check 14: perm='full' argv has --yolo exactly once, no -t, and
+            // starts its own fresh session.
             let check14ok = false; let check14detail = '';
             let fullArgv: string[] = [];
             try {
-              fullArgv = await sendWorkFull('m64b full 14', 'full');
+              fullArgv = await sendWorkFull('m64b full 14', 'full', 'sess-smoke-full');
               check14ok = yoloCount(fullArgv) === 1 && !fullArgv.includes('-t')
-                && fullArgv[fullArgv.indexOf('--max-turns') + 1] === '60';
-              check14detail = `yolo=${yoloCount(fullArgv)} hasT=${fullArgv.includes('-t')}`;
+                && fullArgv[fullArgv.indexOf('--max-turns') + 1] === '60'
+                && !fullArgv.includes('--resume');
+              check14detail = `yolo=${yoloCount(fullArgv)} hasT=${fullArgv.includes('-t')} resume=${fullArgv.includes('--resume')}`;
             } catch (err) { check14detail = String(err); }
-            check(14, "GUI send perm='full' has --yolo exactly once and no -t", check14ok, check14detail);
+            check(14, "GUI send perm='full' has --yolo exactly once, no -t, a fresh own session", check14ok, check14detail);
 
-            // Check 15: a default-perm send after those is conversation argv
-            // (memory,session_search, no --yolo), and the same session id was
-            // resumed across all three runs.
+            // Check 15 (M6.4b2): returning to conversation resumes the
+            // conversation session, and work resumes the work session — each
+            // perm has its own Hermes session, stored under its own key.
             let check15ok = false; let check15detail = '';
             try {
               const convArgv = await sendWorkFull('m64b default 15');
-              const resumed = [workArgv, fullArgv, convArgv].every((argv) =>
-                argv.includes('--resume') && argv[argv.indexOf('--resume') + 1] === 'sess-smoke-1');
+              const workArgv2 = await sendWorkFull('m64b work again 15', 'work', 'sess-smoke-work');
+              const convResume = convArgv[convArgv.indexOf('--resume') + 1];
+              const workResume = workArgv2[workArgv2.indexOf('--resume') + 1];
+              const keys = [
+                setting(dbPathA, 'hermes_session_id'),
+                setting(dbPathA, 'hermes_session_id_work'),
+                setting(dbPathA, 'hermes_session_id_full'),
+              ].join('/');
               check15ok = convArgv.includes('-t') && convArgv[convArgv.indexOf('-t') + 1] === 'memory,session_search'
-                && yoloCount(convArgv) === 0 && resumed;
-              check15detail = `t=${convArgv[convArgv.indexOf('-t') + 1]} yolo=${yoloCount(convArgv)} resumed=${resumed}`;
+                && yoloCount(convArgv) === 0 && convResume === 'sess-smoke-1'
+                && workArgv2[workArgv2.indexOf('-t') + 1] === WORK_ARGS && workResume === 'sess-smoke-work'
+                && keys === 'sess-smoke-1/sess-smoke-work/sess-smoke-full';
+              check15detail = `convResume=${convResume} workResume=${workResume} keys=${keys}`;
             } catch (err) { check15detail = String(err); }
-            check(15, 'after work/full a default send is conversation argv; the same session resumed across all three', check15ok, check15detail);
+            check(15, 'returning to conversation resumes the conversation session, and work resumes the work session', check15ok, check15detail);
 
             // Check 16: Kill during a hanging work run ends it, the tree is
             // gone, the row is back to pending_approval, and the audit

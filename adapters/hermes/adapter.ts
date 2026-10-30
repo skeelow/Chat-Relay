@@ -1,8 +1,13 @@
-// Relay Chat — Hermes adapter (M6.1 conversation; M6.4b work and full modes).
+// Relay Chat — Hermes adapter (M6.1 conversation; M6.4b work and full modes;
+// M6.4b2 one session per permission mode).
 //
-// One Hermes run per `deliver`. The adapter keeps one dedicated Hermes session
-// and resumes it every time: the first delivery has no --resume, every later
-// one does. A failed resume is a failed delivery, never a fresh session.
+// One Hermes run per `deliver`. The adapter keeps one dedicated Hermes
+// session per permission mode (conversation, work, full) and resumes only
+// that mode's session: Hermes fixes a session's toolsets and turn limit when
+// it starts, so a run in perm P resumes P's session (with the same -t and
+// --max-turns P always uses). A first delivery in a perm with no session
+// starts fresh (no --resume). A failed resume is a failed delivery, never a
+// fresh session.
 // The permission mode (conversation | work | full) arrives on the deliver
 // frame from the engine, chosen per message by the user in the GUI (D33).
 //
@@ -14,7 +19,7 @@
 // Frame contract (SPEC WebSocket protocol), adapter name `hermes`:
 //   adapter -> engine: hello, status (idle/thinking), captured, thread,
 //                      delivered, failed
-//   engine -> adapter: config {threadId}, deliver, interrupt
+//   engine -> adapter: config {threadId, threadIds?}, deliver, interrupt
 
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
@@ -86,8 +91,10 @@ export interface BuildArgvOpts {
  *  work: the same with `-t WORK_TOOLSETS` (Hermes's own dangerous-command
  *  block stays on — a blocked command errors and the run continues, S-PERM).
  *  full: no `-t` at all (the profile's own configured toolsets) plus the one
- *  `--yolo` that lifts the block. The same relay session is resumed across
- *  perms (`--resume` is unchanged).
+ *  `--yolo` that lifts the block. Each perm resumes only its own Hermes
+ *  session (M6.4b2): Hermes fixes a session's toolsets and turn limit when
+ *  it starts, so switching perm switches session, never overrides on a
+ *  foreign session (`--resume` itself is unchanged).
  *  `--run-budget` is intentionally omitted: real Hermes rejects it together
  *  with `--format stream-json` (exit 2). The adapter's wall-clock kill
  *  (maxRunSec + TIMEOUT_EXTRA_SEC) is the enforcement (decision D31).
@@ -164,9 +171,15 @@ export class HermesAdapter {
   private readonly startMs: number;
 
   private runNumber = 0;
-  /** The Hermes session id we resume; null until the first result arrives,
-   *  and cleared to null by config {threadId: null}. */
-  private knownSessionId: string | null = null;
+  /** M6.4b2: one Hermes session per permission mode. Each slot is the id we
+   *  resume for that mode; null until that mode's first result arrives. The
+   *  conversation slot is cleared to null by config {threadId: null}; the
+   *  work and full slots by threadIds { work|null, full|null }. */
+  private readonly sessionIds: Record<HermesPerm, string | null> = {
+    conversation: null,
+    work: null,
+    full: null,
+  };
   /** Set to true once the engine's first `config` frame has arrived. Until
    *  then, deliveries fail with "waiting for engine config" (review F4). */
   private configReceived = false;
@@ -202,15 +215,27 @@ export class HermesAdapter {
     this.sendFrame({ type: 'status', status: 'idle' });
   }
 
-  /** Engine sent config {threadId} after hello. Store it as the resume id;
-   *  null means the engine cleared the session (a fresh session next). */
-  handleConfig(threadId: string | null): void {
+  /** Engine sent config {threadId, threadIds?} after hello. Store the ids of
+   *  the modes the engine knows; null means the engine cleared that mode
+   *  (a fresh session next). M6.4b2: threadIds { work, full } is optional —
+   *  the old shape (threadId only) is accepted and leaves the work and full
+   *  slots untouched. */
+  handleConfig(threadId: string | null, threadIds?: { work?: unknown; full?: unknown } | null): void {
     this.configReceived = true; // the engine has announced its thread (F4)
     if (threadId === null || threadId === '') {
-      this.knownSessionId = null;
-      return;
+      this.sessionIds.conversation = null;
+    } else if (this.sessionIds.conversation === null) {
+      this.sessionIds.conversation = threadId;
     }
-    if (this.knownSessionId === null) this.knownSessionId = threadId;
+    if (threadIds && typeof threadIds === 'object') {
+      for (const perm of ['work', 'full'] as const) {
+        const id = threadIds[perm];
+        if (id === null) this.sessionIds[perm] = null;
+        else if (typeof id === 'string' && id !== '' && this.sessionIds[perm] === null) {
+          this.sessionIds[perm] = id;
+        }
+      }
+    }
   }
 
   /** Deliver one message. Fails at once with "Hermes is busy" if a run is
@@ -284,7 +309,7 @@ export class HermesAdapter {
       let stdoutBuf = '';
       let stderrBuf = '';
       let resultEvent: { session_id?: unknown; exit_code?: unknown; text?: unknown } | null = null;
-      const resumeId = this.knownSessionId; // the id we asked to resume, if any
+      const resumeId = this.sessionIds[perm]; // the id this perm's session resumes, if any
 
       const promptFile = join(this.cwd, `prompt-${this.startMs}-${++this.runNumber}.txt`);
       let child: ChildProcess;
@@ -387,7 +412,7 @@ export class HermesAdapter {
           this.fail(messageId, error);
         } else {
           const deliveredBody = deliveredBodyOf(text);
-          this.succeed(messageId, resultEvent!, this.runNumber, resumeId, deliveredBody);
+          this.succeed(messageId, resultEvent!, perm, this.runNumber, resumeId, deliveredBody);
         }
         resolve();
       };
@@ -399,6 +424,7 @@ export class HermesAdapter {
   private succeed(
     messageId: string,
     result: { session_id?: unknown; exit_code?: unknown; text?: unknown },
+    perm: HermesPerm,
     runNumber: number,
     resumeId: string | null,
     deliveredBody: string,
@@ -439,9 +465,13 @@ export class HermesAdapter {
       });
     }
 
-    if (sessionId !== null && sessionId !== this.knownSessionId) {
-      this.knownSessionId = sessionId;
-      this.sendFrame({ type: 'thread', threadId: sessionId });
+    if (sessionId !== null && sessionId !== this.sessionIds[perm]) {
+      this.sessionIds[perm] = sessionId;
+      // M6.4b2: the thread frame records the id in that perm's own slot. A
+      // conversation frame keeps the exact old shape (no perm).
+      const threadFrame: Record<string, unknown> = { type: 'thread', threadId: sessionId };
+      if (perm !== 'conversation') threadFrame.perm = perm;
+      this.sendFrame(threadFrame);
     }
 
     if (deliveredBody !== '') {
@@ -559,7 +589,15 @@ export function connectToEngine(
     let frame: unknown;
     try { frame = JSON.parse(String(event.data)); } catch { return; }
     const rec = frame as Record<string, unknown>;
-    if (rec.type === 'config') adapter.handleConfig(typeof rec.threadId === 'string' ? rec.threadId : null);
+    if (rec.type === 'config') {
+      const threadIds = rec.threadIds;
+      adapter.handleConfig(
+        typeof rec.threadId === 'string' ? rec.threadId : null,
+        threadIds && typeof threadIds === 'object'
+          ? threadIds as { work?: unknown; full?: unknown }
+          : undefined,
+      );
+    }
     else if (rec.type === 'deliver') {
       if (typeof rec.messageId === 'string' && typeof rec.text === 'string') {
         void adapter.deliver(rec.messageId, rec.text, typeof rec.perm === 'string' ? rec.perm : undefined);

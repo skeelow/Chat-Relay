@@ -204,7 +204,7 @@ test('hello hermes: accepts hermes, sends config {threadId: null} first', async 
   await withEngine('hello-hermes', async (_engine, url, token) => {
     const gui = await openGui(url, token);
     const { client: hermes, config } = await openHermesAdapter(url, token);
-    assert.deepEqual(config, { type: 'config', threadId: null },
+    assert.deepEqual(config, { type: 'config', threadId: null, threadIds: { work: null, full: null } },
       'config arrives right after hello, before any deliver');
     assert.deepEqual(await gui.nextMessage(), { type: 'status_update', adapter: 'hermes', status: 'idle' });
     const late = await openClient(url, token);
@@ -241,7 +241,7 @@ test('thread persistence: config null, then stored id across restart', async () 
       const token = readFileSync(tokenPath, 'utf8').trim();
       const url = `ws://127.0.0.1:${engine.port}`;
       const { client: hermes, config } = await openHermesAdapter(url, token);
-      assert.deepEqual(config, { type: 'config', threadId: null });
+      assert.deepEqual(config, { type: 'config', threadId: null, threadIds: { work: null, full: null } });
       hermes.send({ type: 'thread', threadId: 'h-1' });
       await pause(200);
       assert.equal(engine.store.getSetting('hermes_session_id'), 'h-1');
@@ -252,7 +252,7 @@ test('thread persistence: config null, then stored id across restart', async () 
       const token = readFileSync(tokenPath, 'utf8').trim();
       const url = `ws://127.0.0.1:${engine.port}`;
       const { client: hermes, config } = await openHermesAdapter(url, token);
-      assert.deepEqual(config, { type: 'config', threadId: 'h-1' },
+      assert.deepEqual(config, { type: 'config', threadId: 'h-1', threadIds: { work: null, full: null } },
         'persisted thread returned in config after restart');
       engine.stop();
     }
@@ -268,6 +268,88 @@ test('thread from a non-hermes socket is ignored', async () => {
     astra.send({ type: 'thread', threadId: 'should-not-stick' });
     await pause(300);
     assert.equal(engine.store.getSetting('hermes_session_id'), null, 'astra thread not stored as hermes session');
+  });
+});
+
+// --- M6.4b2: one Hermes session per permission mode ---
+
+test('M6.4b2 thread perm: work and full record their own keys; no perm is the conversation key', async () => {
+  await withEngine('thread-perm', async (engine, url, token) => {
+    const { client: hermes } = await openHermesAdapter(url, token);
+    hermes.send({ type: 'thread', threadId: 'h-conv' });
+    hermes.send({ type: 'thread', threadId: 'h-work', perm: 'work' });
+    hermes.send({ type: 'thread', threadId: 'h-full', perm: 'full' });
+    await pause(200);
+    assert.equal(engine.store.getSetting('hermes_session_id'), 'h-conv');
+    assert.equal(engine.store.getSetting('hermes_session_id_work'), 'h-work');
+    assert.equal(engine.store.getSetting('hermes_session_id_full'), 'h-full');
+  });
+});
+
+test('M6.4b2 thread with an invalid perm ignores the whole frame', async () => {
+  await withEngine('thread-bad-perm', async (engine, url, token) => {
+    const { client: hermes } = await openHermesAdapter(url, token);
+    hermes.send({ type: 'thread', threadId: 'h-ok', perm: 'work' });
+    await pause(200);
+    hermes.send({ type: 'thread', threadId: 'h-bad', perm: 'everything' });
+    hermes.send({ type: 'thread', threadId: 'h-bad2', perm: 7 });
+    await pause(300);
+    assert.equal(engine.store.getSetting('hermes_session_id_work'), 'h-ok', 'valid work thread stored');
+    assert.equal(engine.store.getSetting('hermes_session_id'), null, 'invalid-perm frame stored nothing');
+    assert.equal(engine.store.getSetting('hermes_session_id_full'), null);
+  });
+});
+
+test('M6.4b2 thread perm from a non-hermes socket changes nothing', async () => {
+  await withEngine('thread-perm-ignore', async (engine, url, token) => {
+    const astra = await openAdapter(url, token, 'astra');
+    astra.send({ type: 'thread', threadId: 'astra-should-not-stick', perm: 'work' });
+    const codex = await openAdapter(url, token, 'codex');
+    await pause(300);
+    assert.equal(engine.store.getSetting('hermes_session_id_work'), null);
+    assert.equal(engine.store.getSetting('hermes_session_id'), null);
+    assert.equal(engine.store.getSetting('codex_thread_id'), null);
+    codex.close();
+  });
+});
+
+test('M6.4b2 config threadIds: all three session ids survive an engine restart and are resent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-hermes-threadids-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const { client: hermes } = await openHermesAdapter(url, token);
+      hermes.send({ type: 'thread', threadId: 'pm-conv' });
+      hermes.send({ type: 'thread', threadId: 'pm-work', perm: 'work' });
+      hermes.send({ type: 'thread', threadId: 'pm-full', perm: 'full' });
+      await pause(200);
+      engine.stop();
+    }
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const { client: hermes, config } = await openHermesAdapter(url, token);
+      assert.deepEqual(config, {
+        type: 'config', threadId: 'pm-conv',
+        threadIds: { work: 'pm-work', full: 'pm-full' },
+      }, 'restart resends the conversation id and both mode session ids');
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('M6.4b2 codex config shape is unchanged (no threadIds)', async () => {
+  await withEngine('codex-config-shape', async (_engine, url, token) => {
+    const codex = await openAdapter(url, token, 'codex');
+    const config = await codex.nextMessage();
+    assert.deepEqual(config, { type: 'config', threadId: null }, 'codex gets the old config shape');
   });
 });
 

@@ -590,7 +590,21 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 name === 'codex'
                   ? store.getSetting('codex_thread_id')
                   : store.getSetting('hermes_session_id');
-              ws.send(JSON.stringify({ type: 'config', threadId }));
+              if (name === 'hermes') {
+                // M6.4b2: work and full have their own Hermes sessions
+                // (Hermes fixes a session's toolsets and turn limit when it
+                // starts). threadId stays the conversation id; threadIds
+                // carries the other two slots (null when unset).
+                ws.send(JSON.stringify({
+                  type: 'config', threadId,
+                  threadIds: {
+                    work: store.getSetting('hermes_session_id_work'),
+                    full: store.getSetting('hermes_session_id_full'),
+                  },
+                }));
+              } else {
+                ws.send(JSON.stringify({ type: 'config', threadId }));
+              }
             }
             // M2.1: approved items waiting for this adapter go out now,
             // oldest first, each exactly once (each leaves 'queued').
@@ -794,9 +808,24 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (state.participant !== 'codex' && state.participant !== 'hermes') return;
             const threadId = record.threadId;
             if (typeof threadId !== 'string' || threadId === '') return;
+            // M6.4b2: optional perm selects which Hermes session slot the id
+            // belongs to (conversation default). Any other value ignores the
+            // whole frame, logged. Codex has one thread; perm is ignored for
+            // it (valid values only, same whole-frame rule).
+            const perm = validatePerm(record.perm);
+            if (perm === null) {
+              console.log(`[engine] thread ignored: invalid perm ${JSON.stringify(record.perm)}`);
+              return;
+            }
             if (state.participant === 'codex') {
               store.setSetting('codex_thread_id', threadId);
               console.log(`[engine] codex relay thread recorded: ${threadId}`);
+            } else if (perm === 'work') {
+              store.setSetting('hermes_session_id_work', threadId);
+              console.log(`[engine] hermes work relay thread recorded: ${threadId}`);
+            } else if (perm === 'full') {
+              store.setSetting('hermes_session_id_full', threadId);
+              console.log(`[engine] hermes full relay thread recorded: ${threadId}`);
             } else {
               store.setSetting('hermes_session_id', threadId);
               console.log(`[engine] hermes relay thread recorded: ${threadId}`);

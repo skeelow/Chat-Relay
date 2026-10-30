@@ -10,7 +10,7 @@ import { mkdtempSync, writeFileSync, unlinkSync, rmSync, existsSync, readFileSyn
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { WebSocket } from 'ws';
 import {
   HermesAdapter,
@@ -226,6 +226,110 @@ test('M6.4b buildArgv: --yolo count 0/0/1, -t present/present/absent, forbidden 
     assert.equal(argv.indexOf('--resume'), argv.length - 2);
     assert.equal(argv[argv.length - 1], 'sess-1');
   }
+});
+
+// --- M6.4b2: fake-hermes enforces the real resume-policy rule ---
+// Verified against the real Hermes CLI: a resume may repeat the session's
+// launch -t and --max-turns (or omit both) but re-passing different values
+// exits 2. --yolo is NOT session policy and may be added or omitted.
+
+const RESUME_POLICY_ERROR =
+  'Error: Resume retains gateway session policy; creation overrides are unsupported on resume. ' +
+  "-t/--toolsets, --max-turns differ from this session's launch: resume without them, or start a new session to use them.";
+
+interface FakeRun { code: number; stdout: string; stderr: string }
+
+// Run tests/fake-hermes.ts directly (not through the adapter) with an
+// isolated control+state directory. The per-file FAKE_HERMES_* env vars are
+// stripped so a direct run cannot clobber the adapter tests' shared files.
+function runFake(dir: string, control: Record<string, unknown>, extraArgs: string[]): FakeRun {
+  const controlFile = join(dir, 'control.json');
+  writeFileSync(controlFile, JSON.stringify(control), 'utf8');
+  const env = { ...process.env };
+  delete env.FAKE_HERMES_ARGV_FILE;
+  delete env.FAKE_HERMES_ENV_FILE;
+  delete env.FAKE_HERMES_GRANDCHILD_PID_FILE;
+  env.FAKE_HERMES_CONTROL = controlFile;
+  const base = ['-p', 'claude', 'chat', '--query-file', join(dir, 'q.txt'), '--format', 'stream-json'];
+  const res = spawnSync(process.execPath, [FAKE, ...base, ...extraArgs], { encoding: 'utf8', env, cwd: dir });
+  return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+}
+
+function fakeResultEvent(run: FakeRun): any {
+  const lines = run.stdout.split(/\r?\n/).filter((l) => l.trim() !== '');
+  const last = lines[lines.length - 1];
+  return JSON.parse(last) as any;
+}
+
+test('M6.4b2 fake-hermes: resume with the same -t and --max-turns as the launch works', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    const launch = runFake(dir, { mode: 'normal', sessionId: 'sess-r-1' },
+      ['-t', 'memory,session_search', '--max-turns', '6']);
+    assert.equal(launch.code, 0, 'fresh launch works');
+    const resume = runFake(dir, { mode: 'normal', sessionId: 'sess-r-1' },
+      ['-t', 'memory,session_search', '--max-turns', '6', '--resume', 'sess-r-1']);
+    assert.equal(resume.code, 0, 'resume with identical overrides works');
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+});
+
+test('M6.4b2 fake-hermes: resume with a different -t exits 2 with the policy error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    runFake(dir, { mode: 'normal', sessionId: 'sess-r-2' }, ['-t', 'memory,session_search', '--max-turns', '6']);
+    const bad = runFake(dir, { mode: 'normal', sessionId: 'sess-r-2' },
+      ['-t', WORK_TOOLSETS, '--max-turns', '6', '--resume', 'sess-r-2']);
+    assert.equal(bad.code, 2, 'different -t on resume exits 2');
+    assert.ok(bad.stderr.includes(RESUME_POLICY_ERROR), `stderr carries the error line, got: ${bad.stderr}`);
+    const ev = fakeResultEvent(bad);
+    assert.equal(ev.type, 'result');
+    assert.equal(ev.exit_code, 2);
+    assert.equal(ev.error, RESUME_POLICY_ERROR, 'result event carries the same error text');
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+});
+
+test('M6.4b2 fake-hermes: resume with a different --max-turns exits 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    runFake(dir, { mode: 'normal', sessionId: 'sess-r-3' }, ['-t', 'memory,session_search', '--max-turns', '6']);
+    const bad = runFake(dir, { mode: 'normal', sessionId: 'sess-r-3' },
+      ['-t', 'memory,session_search', '--max-turns', '60', '--resume', 'sess-r-3']);
+    assert.equal(bad.code, 2, 'different --max-turns on resume exits 2');
+    assert.ok(bad.stderr.includes(RESUME_POLICY_ERROR));
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+});
+
+test('M6.4b2 fake-hermes: resume without -t or --max-turns keeps the session policy and works', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    runFake(dir, { mode: 'normal', sessionId: 'sess-r-4' }, ['-t', 'memory,session_search', '--max-turns', '6']);
+    const bare = runFake(dir, { mode: 'normal', sessionId: 'sess-r-4' }, ['--resume', 'sess-r-4']);
+    assert.equal(bare.code, 0, 'resume with neither override works');
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+});
+
+test('M6.4b2 fake-hermes: --yolo is not session policy — add or omit it on a resume freely', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    runFake(dir, { mode: 'normal', sessionId: 'sess-r-5' },
+      ['-t', 'memory,session_search', '--max-turns', '6']);
+    const withYolo = runFake(dir, { mode: 'normal', sessionId: 'sess-r-5' },
+      ['-t', 'memory,session_search', '--max-turns', '6', '--yolo', '--resume', 'sess-r-5']);
+    assert.equal(withYolo.code, 0, 'adding --yolo on a resume works');
+    const noYolo = runFake(dir, { mode: 'normal', sessionId: 'sess-r-5' },
+      ['--yolo', '--resume', 'sess-r-5']);
+    assert.equal(noYolo.code, 0, 'resume with only --yolo (overrides omitted) works');
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
+});
+
+test('M6.4b2 fake-hermes: a fresh run (no --resume) with any -t/--max-turns/--yolo works', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-fake-resume-'));
+  try {
+    const a = runFake(dir, { mode: 'normal', sessionId: 'sess-r-6a' }, ['-t', WORK_TOOLSETS, '--max-turns', '60']);
+    assert.equal(a.code, 0);
+    const b = runFake(dir, { mode: 'normal', sessionId: 'sess-r-6b' }, ['--yolo', '--max-turns', '60']);
+    assert.equal(b.code, 0);
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); }
 });
 
 test('normal run: captured once, thread, delivered, temp file deleted', async () => {
@@ -795,6 +899,166 @@ test('N0 integration: real engine delivers to hermes via connectToEngine', async
   }
 });
 
+// M6.4b2 integration: real engine + real adapter + the resume-policy enforcing
+// fake, across all three perms with an engine restart in the middle. Each
+// perm must resume only its own session, and the three ids must survive the
+// restart and be resent in the config frame.
+test('M6.4b2 integration: conv→work→full→conv→work per-mode sessions, engine restart, ids resent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-m64b2-chain-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  const token = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+  writeFileSync(tokenPath, token, 'utf8');
+
+  const adapter = new HermesAdapter({
+    executable: FAKE,
+    sendFrame: () => { /* bound by connectToEngine */ },
+    maxRunSec: 1,
+    timeoutExtraSec: 1,
+    cwd: TMP,
+  });
+
+  function settingOf(key: string): string | null {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+      return row?.value ?? null;
+    } finally { db.close(); }
+  }
+
+  function makeGui(url: string) {
+    const ws = new WebSocket(url);
+    const frames: unknown[] = [];
+    let resolve: ((v: unknown) => void) | null = null;
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
+    ws.onmessage = (event) => {
+      try { frames.push(JSON.parse(String(event.data))); } catch { /* ignore */ }
+      if (resolve) { const r = resolve; resolve = null; r(frames[frames.length - 1]); }
+    };
+    const send = (o: unknown): void => ws.send(JSON.stringify(o));
+    const next = (timeoutMs = 15000): Promise<unknown> =>
+      new Promise((res, rej) => {
+        if (frames.length > 0) { res(frames.shift()); return; }
+        resolve = res;
+        setTimeout(() => rej(new Error('gui frame timeout')), timeoutMs);
+      });
+    return { ws, send, next, opened: new Promise<void>((r) => { ws.on('open', r); }) };
+  }
+
+  async function waitIdle(gui: ReturnType<typeof makeGui>): Promise<void> {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      gui.send({ type: 'gui_hello' });
+      try {
+        const snap = await gui.next(2000) as { statuses?: Record<string, string> };
+        if (snap.statuses?.hermes === 'idle') return;
+      } catch { /* keep polling */ }
+    }
+    throw new Error('hermes never went idle');
+  }
+
+  // One GUI send; returns the argv the fake received. Throws on a failed row.
+  async function guiSend(gui: ReturnType<typeof makeGui>, body: string, perm?: string): Promise<string[]> {
+    try { unlinkSync(argvFile); } catch { /* fresh */ }
+    const frame: Record<string, unknown> = { type: 'send', body, targets: ['hermes'] };
+    if (perm !== undefined) frame.perm = perm;
+    gui.send(frame);
+    let mid = '';
+    for (;;) {
+      const ft = await gui.next() as any;
+      if (ft.type === 'transcript_update' && ft.message?.source === 'user' && ft.message?.body === body) { mid = String(ft.message.id); break; }
+    }
+    for (;;) {
+      const ft = await gui.next() as any;
+      if (ft.type === 'delivery_update' && ft.messageId === mid && ft.target === 'hermes') {
+        if (ft.status === 'delivered') break;
+        if (ft.status === 'failed') throw new Error(`delivery failed: ${ft.error}`);
+      }
+    }
+    return JSON.parse(readFileSync(argvFile, 'utf8')) as string[];
+  }
+
+  const engine1 = await startEngine({ port: 0, dbPath, tokenPath });
+  const port = engine1.port;
+  const url = `ws://127.0.0.1:${port}`;
+  let engine2: EngineHandle | null = null;
+  connectToEngine(url, token, adapter);
+  const gui1 = makeGui(url);
+  await gui1.opened;
+  await new Promise((r) => setTimeout(r, 400));
+
+  try {
+    await waitIdle(gui1);
+
+    // 1. first conversation send: fresh session.
+    clearControl();
+    setControl('normal', { sessionId: 'sess-pm-c1', text: 'c one' });
+    const a1 = await guiSend(gui1, 'chain conv 1');
+    assert.equal(a1.includes('--resume'), false, 'first conversation run is fresh');
+    assert.equal(settingOf('hermes_session_id'), 'sess-pm-c1', 'conversation id stored under the old key');
+    assert.equal(settingOf('hermes_session_id_work'), null, 'work key still unset');
+    assert.equal(settingOf('hermes_session_id_full'), null, 'full key still unset');
+
+    // 2. first work send: its own fresh session, no exit 2.
+    setControl('normal', { sessionId: 'sess-pm-w1', text: 'w one' });
+    const a2 = await guiSend(gui1, 'chain work 1', 'work');
+    assert.equal(a2.includes('--resume'), false, 'first work run does not resume the conversation session');
+    assert.equal(a2[a2.indexOf('-t') + 1], WORK_TOOLSETS);
+    assert.equal(settingOf('hermes_session_id_work'), 'sess-pm-w1', 'work id stored under hermes_session_id_work');
+
+    // 3. first full send: its own fresh session.
+    setControl('normal', { sessionId: 'sess-pm-f1', text: 'f one' });
+    const a3 = await guiSend(gui1, 'chain full 1', 'full');
+    assert.equal(a3.includes('--resume'), false, 'first full run does not resume a foreign session');
+    assert.equal(a3.filter((v) => v === '--yolo').length, 1);
+    assert.equal(a3.includes('-t'), false);
+    assert.equal(settingOf('hermes_session_id_full'), 'sess-pm-f1', 'full id stored under hermes_session_id_full');
+
+    // 4. back to conversation: resumes the CONVERSATION session with its own
+    //    launch overrides — the run the old code failed with exit 2.
+    setControl('normal', { sessionId: 'sess-pm-c1', text: 'c two' });
+    const a4 = await guiSend(gui1, 'chain conv 2');
+    assert.equal(a4[a4.indexOf('--resume') + 1], 'sess-pm-c1', 'second conversation run resumes its own id');
+    assert.equal(a4[a4.indexOf('-t') + 1], MODE_A_TOOLSETS, 'resumed with the conversation toolsets');
+
+    // 5. work again: resumes the WORK session.
+    setControl('normal', { sessionId: 'sess-pm-w1', text: 'w two' });
+    const a5 = await guiSend(gui1, 'chain work 2', 'work');
+    assert.equal(a5[a5.indexOf('--resume') + 1], 'sess-pm-w1', 'second work run resumes its own id');
+
+    // 6. engine restart mid-run: the three ids survive and are resent.
+    engine1.stop();
+    gui1.ws.close();
+    await new Promise((r) => setTimeout(r, 500));
+    engine2 = await startEngine({ port, dbPath, tokenPath });
+    connectToEngine(url, token, adapter);
+    const gui2 = makeGui(url);
+    await gui2.opened;
+    await new Promise((r) => setTimeout(r, 400));
+    await waitIdle(gui2);
+
+    assert.equal(settingOf('hermes_session_id'), 'sess-pm-c1');
+    assert.equal(settingOf('hermes_session_id_work'), 'sess-pm-w1');
+    assert.equal(settingOf('hermes_session_id_full'), 'sess-pm-f1');
+
+    setControl('normal', { sessionId: 'sess-pm-c1', text: 'c three' });
+    const a6 = await guiSend(gui2, 'chain conv 3');
+    assert.equal(a6[a6.indexOf('--resume') + 1], 'sess-pm-c1', 'after restart conversation resumes its own id');
+
+    setControl('normal', { sessionId: 'sess-pm-f1', text: 'f two' });
+    const a7 = await guiSend(gui2, 'chain full 2', 'full');
+    assert.equal(a7[a7.indexOf('--resume') + 1], 'sess-pm-f1', 'after restart full resumes its own id');
+
+    gui2.ws.close();
+  } finally {
+    adapter.close();
+    try { gui1.ws.close(); } catch { /* already closed */ }
+    try { engine1.stop(); } catch { /* already stopped */ }
+    try { engine2?.stop(); } catch { /* never started or already stopped */ }
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); } catch { /* best effort */ }
+  }
+});
+
 // R1: adapter reconnects after engine restart (regression fix for N0 refactor)
 // R1: adapter reconnects after engine restart (regression fix for N0 refactor)
 test('R1: real engine + adapter: reconnects after engine restart', async () => {
@@ -1027,11 +1291,11 @@ test('R1: run killed when socket closes', async () => {
   assert.ok(error === 'Stopped' || error === 'Hermes exited with code 1', `expected 'Stopped' or 'Hermes exited with code 1', got '${error}'`);
 });
 
-// --- M6.4b: work and full run; unknown perm fails closed ---
+// --- M6.4b / M6.4b2: work and full runs; one session per perm ---
 
 test('M6.4b: deliver perm=work runs with the work argv, no --yolo, work limits', async () => {
   clearControl();
-  setControl('normal', { text: 'work reply' });
+  setControl('normal', { sessionId: 'sess-perm-w1', text: 'work reply' });
   const { adapter, frames } = makeAdapter();
   await adapter.deliver('m-work', 'do work', 'work');
   assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-work', 'work delivery completes');
@@ -1039,22 +1303,84 @@ test('M6.4b: deliver perm=work runs with the work argv, no --yolo, work limits',
   assert.equal(argv[argv.indexOf('-t') + 1], WORK_TOOLSETS, '-t with the work toolsets');
   assert.equal(argv.filter((v) => v === '--yolo').length, 0, 'work argv has no --yolo');
   assert.equal(argv[argv.indexOf('--max-turns') + 1], '60', 'work uses maxTurns 60');
+  assert.equal(argv.includes('--resume'), false, 'M6.4b2: the first work delivery starts a fresh work session');
 });
 
-test('M6.4b: deliver perm=full runs with --yolo, no -t, and resumes the same session', async () => {
+test('M6.4b2: each perm has its own session — work and full start fresh, later runs resume only their own', async () => {
   clearControl();
-  setControl('normal', { text: 'full reply' });
   const { adapter, frames } = makeAdapter();
-  await adapter.deliver('m-work', 'work first', 'work'); // establishes session local-sess
-  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-work');
-  await adapter.deliver('m-full', 'go full', 'full');
-  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-full', 'full delivery completes');
-  const argv = readArgv();
-  assert.equal(argv.filter((v) => v === '--yolo').length, 1, 'full argv has --yolo exactly once');
-  assert.equal(argv.includes('-t'), false, 'full argv has no -t (profile toolsets)');
-  assert.equal(argv[argv.indexOf('--max-turns') + 1], '60', 'full uses maxTurns 60');
-  assert.ok(argv.includes('--resume') && argv[argv.indexOf('--resume') + 1] === 'local-sess',
-    'the same relay session is resumed across perms');
+  setControl('normal', { sessionId: 'sess-perm-c', text: 'conv reply' });
+  await adapter.deliver('m-c', 'hello');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-c', 'conversation run delivered');
+
+  setControl('normal', { sessionId: 'sess-perm-w', text: 'work reply' });
+  await adapter.deliver('m-w', 'go work', 'work');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-w', 'first work run delivered fresh');
+  assert.equal(readArgv().includes('--resume'), false, 'first work run has no --resume');
+  const workThread = frames.filter((f) => (f as { type?: string }).type === 'thread').pop() as any;
+  assert.deepEqual(workThread, { type: 'thread', threadId: 'sess-perm-w', perm: 'work' },
+    'the work thread frame carries perm=work');
+
+  setControl('normal', { sessionId: 'sess-perm-f', text: 'full reply' });
+  await adapter.deliver('m-f', 'go full', 'full');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-f', 'first full run delivered fresh');
+  const fullArgv = readArgv();
+  assert.equal(fullArgv.includes('--resume'), false, 'first full run has no --resume (own session, not work\'s)');
+  assert.equal(fullArgv.filter((v) => v === '--yolo').length, 1, 'full argv has --yolo exactly once');
+  assert.equal(fullArgv.includes('-t'), false, 'full argv has no -t (profile toolsets)');
+  assert.equal(fullArgv[fullArgv.indexOf('--max-turns') + 1], '60', 'full uses maxTurns 60');
+  const fullThread = frames.filter((f) => (f as { type?: string }).type === 'thread').pop() as any;
+  assert.deepEqual(fullThread, { type: 'thread', threadId: 'sess-perm-f', perm: 'full' },
+    'the full thread frame carries perm=full');
+
+  setControl('normal', { sessionId: 'sess-perm-w', text: 'work reply 2' });
+  await adapter.deliver('m-w2', 'work again', 'work');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-w2', 'second work run delivered');
+  const workArgv2 = readArgv();
+  assert.equal(workArgv2[workArgv2.indexOf('--resume') + 1], 'sess-perm-w',
+    'the second work run resumes the WORK session, not the conversation or full one');
+  assert.equal(workArgv2[workArgv2.indexOf('-t') + 1], WORK_TOOLSETS, 'resumed with the same work toolsets');
+
+  setControl('normal', { sessionId: 'sess-perm-c', text: 'conv reply 2' });
+  await adapter.deliver('m-c2', 'back to chat');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-c2', 'second conversation run delivered');
+  const convArgv2 = readArgv();
+  assert.equal(convArgv2[convArgv2.indexOf('--resume') + 1], 'sess-perm-c',
+    'returning to conversation resumes the CONVERSATION session');
+  assert.equal(frames.filter((f) => (f as { type?: string }).type === 'failed').length, 0,
+    'no run failed — every perm resumed only its own session');
+});
+
+test('M6.4b2: the old config shape (threadId only) is accepted and leaves the work/full slots untouched', async () => {
+  clearControl();
+  const frames: unknown[] = [];
+  const adapter = new HermesAdapter({
+    executable: FAKE, sendFrame: (f) => frames.push(f),
+    maxRunSec: 1, timeoutExtraSec: 1, cwd: TMP, startMs: 1_700_000_000_000,
+  });
+  adapter.start();
+  adapter.handleConfig('sess-old-c'); // old shape: no threadIds argument at all
+  setControl('normal', { sessionId: 'sess-old-c', text: 'old c' });
+  await adapter.deliver('m-old', 'chat'); // resumes the conversation id
+  const convArgv = readArgv();
+  assert.equal(convArgv[convArgv.indexOf('--resume') + 1], 'sess-old-c', 'threadId still drives conversation');
+  setControl('normal', { sessionId: 'sess-old-w', text: 'old w' });
+  await adapter.deliver('m-old-w', 'work', 'work'); // work slot untouched → fresh run
+  assert.equal(readArgv().includes('--resume'), false, 'old-shape config did not give work a session to resume');
+});
+
+test('M6.4b2: config threadIds seed the work/full slots; null clears them', async () => {
+  clearControl();
+  const { adapter } = makeAdapter();
+  adapter.handleConfig(null, { work: 'sess-cls-w', full: 'sess-cls-f' });
+  setControl('normal', { sessionId: 'sess-cls-w', text: 'w' });
+  await adapter.deliver('m-w', 'work', 'work');
+  assert.equal(readArgv()[readArgv().indexOf('--resume') + 1], 'sess-cls-w',
+    'a work delivery resumes the id the engine seeded (survived restart scenario)');
+  adapter.handleConfig(null, { work: null, full: null });
+  setControl('normal', { sessionId: 'sess-cls-w', text: 'w2' });
+  await adapter.deliver('m-w2', 'work 2', 'work');
+  assert.equal(readArgv().includes('--resume'), false, 'after threadIds null the work session starts fresh');
 });
 
 test('M6.4b: deliver with an unknown perm fails closed and starts no process', async () => {
