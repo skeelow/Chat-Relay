@@ -110,9 +110,18 @@ const SEARCH_LIMIT = 100;
 /** M2.1: default ack window for a delivery before the row is marked failed. */
 export const DEFAULT_ACK_TIMEOUT_MS = 30000;
 
-/** M6.2: Hermes runs can take up to maxRunSec + 30 s, so the ack window for
- *  Hermes deliveries is 6 minutes. Codex and Astra stay at 30 s. */
+/** M6.2: Hermes conversation runs take up to maxRunSec + 30 s, so the ack
+ *  window for Hermes deliveries is 6 minutes. Codex and Astra stay at 30 s. */
 export const HERMES_ACK_TIMEOUT_MS = 360000;
+
+/** M6.4b (D33): work/full runs use maxRunSec 3600 + 30 s wall-clock kill, so
+ *  their ack window is 3600 + 30 + 60 = 3690 seconds (60 s slack). */
+export const HERMES_WORK_ACK_TIMEOUT_MS = (3600 + 30 + 60) * 1000;
+
+/** M6.4b: the Hermes ack window for one perm. A missing perm is conversation. */
+export function hermesAckTimeoutMs(perm: Perm | undefined): number {
+  return perm === 'work' || perm === 'full' ? HERMES_WORK_ACK_TIMEOUT_MS : HERMES_ACK_TIMEOUT_MS;
+}
 
 /** Display names for the relay header (SPEC: '[Relay · from <Name> · #<id> · hop <n>]'). */
 const SOURCE_NAMES: Record<Participant, string> = { user: 'You', astra: 'Astra', codex: 'Codex', hermes: 'Hermes' };
@@ -161,17 +170,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const store = openStore(options.dbPath ?? 'relay.db');
   const ackTimeoutMs = options.deliverAckTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
   // M6.2: the ack timeout is per target. When a test sets deliverAckTimeoutMs
-  // it wins for all targets; otherwise Hermes gets 6 minutes and Codex/Astra
-  // keep 30 seconds.
+  // it wins for all targets; otherwise Hermes gets 6 minutes (M6.4b: 3690 s
+  // for work/full rows) and Codex/Astra keep 30 seconds.
   const ackTimeoutOptionSet = options.deliverAckTimeoutMs !== undefined;
-  const ackTimeoutFor = (target: Participant): number =>
+  const ackTimeoutFor = (target: Participant, perm?: Perm): number =>
     ackTimeoutOptionSet
       ? ackTimeoutMs
       : target === 'hermes'
-        ? HERMES_ACK_TIMEOUT_MS
+        ? hermesAckTimeoutMs(perm)
         : ackTimeoutMs;
-  // Hermes deliveries stay `delivering` until the run finishes (up to about six
-  // minutes), so Stop and restart behaviour must account for the long window.
+  // Hermes deliveries stay `delivering` until the run finishes (conversation
+  // up to about six minutes; M6.4b work/full up to about 62), so Stop and
+  // restart behaviour must account for the long window.
   // M2.1 no-replay: nothing resumes on its own after a (re)start — every
   // in-flight delivery goes back to waiting for the user's approval.
   const resetCount = store.resetInFlightToPending();
@@ -319,11 +329,18 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   /** Send one queued row to its adapter, mark it delivering, arm the ack timer. */
   const deliverTo = (ws: WebSocket, pending: PendingDelivery): void => {
     const text = `${relayHeader(pending)}\n${pending.body}`;
-    // M6.4a (D33): a Hermes delivery carries its perm, and its start is audited.
+    // M6.4a (D33): a Hermes delivery carries its perm, and its start is audited
+    // with the perm in the detail (M6.4b). A full run also audits the distinct
+    // hermes_full_started event. Still never a message body.
     const frame: Record<string, unknown> = { type: 'deliver', messageId: pending.messageId, text };
+    let perm: Perm | undefined;
     if (pending.target === 'hermes') {
-      frame.perm = store.getDeliveryPerm(pending.messageId, pending.target);
-      store.appendAudit({ actor: 'engine', event: 'hermes_delivering', target: 'hermes', messageId: pending.messageId });
+      perm = store.getDeliveryPerm(pending.messageId, pending.target);
+      frame.perm = perm;
+      store.appendAudit({ actor: 'engine', event: 'hermes_delivering', target: 'hermes', messageId: pending.messageId, detail: perm });
+      if (perm === 'full') {
+        store.appendAudit({ actor: 'engine', event: 'hermes_full_started', target: 'hermes', messageId: pending.messageId });
+      }
     }
     ws.send(JSON.stringify(frame));
     store.markStatus(pending.messageId, pending.target, 'delivering');
@@ -332,7 +349,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     ackTimers.set(key, setTimeout(() => {
       ackTimers.delete(key);
       failDelivery(pending.messageId, pending.target, 'no confirmation from adapter');
-    }, ackTimeoutFor(pending.target)));
+    }, ackTimeoutFor(pending.target, perm)));
     broadcastDeliveryUpdate(pending.messageId, pending.target);
   };
 

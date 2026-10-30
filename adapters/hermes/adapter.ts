@@ -1,8 +1,10 @@
-// Relay Chat — Hermes adapter (M6.1, Mode A conversation only).
+// Relay Chat — Hermes adapter (M6.1 conversation; M6.4b work and full modes).
 //
 // One Hermes run per `deliver`. The adapter keeps one dedicated Hermes session
 // and resumes it every time: the first delivery has no --resume, every later
 // one does. A failed resume is a failed delivery, never a fresh session.
+// The permission mode (conversation | work | full) arrives on the deliver
+// frame from the engine, chosen per message by the user in the GUI (D33).
 //
 // Usage: node adapters/hermes/adapter.ts [--engine ws://127.0.0.1:8787]
 //                                       [--token <path>] [--profile <name>]
@@ -27,6 +29,16 @@ const ADAPTER_VERSION = '0.1.0';
 // message text or environment.
 export const MODE_A_TOOLSETS = 'memory,session_search';
 
+// M6.4b (D33/S-PERM): the Work mode toolsets — the same rule applies: a
+// constant in code, never read from settings, frames, messages or environment.
+export const WORK_TOOLSETS = 'terminal,file,code_execution,web,todo,memory,session_search';
+
+// M6.4b: the three permission modes. Only a GUI frame (via the stored
+// delivery row) can select one; Full runs the profile's own toolsets with
+// Hermes's dangerous-command block lifted, Work keeps that block on (S-PERM).
+export const PERMS = ['conversation', 'work', 'full'] as const;
+export type HermesPerm = (typeof PERMS)[number];
+
 // Delivered-body echo window (10 minutes). The store keeps DUPLICATE_WINDOW_MS
 // under that name; the adapter reuses the same window for its echo drop.
 export const ECHO_WINDOW_MS = 10 * 60 * 1000;
@@ -34,6 +46,11 @@ export const ECHO_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_PROFILE = 'claude';
 export const DEFAULT_MAX_TURNS = 6;
 export const DEFAULT_MAX_RUN_SEC = 300;
+// M6.4b: limits for work and full runs. The wall-clock tree kill
+// (maxRunSec + TIMEOUT_EXTRA_SEC) stays the only hung-process guard — there
+// is no deadline on what the agent may do (D33).
+export const WORK_MAX_TURNS = 60;
+export const WORK_MAX_RUN_SEC = 3600;
 // Hard wall-clock extra beyond maxRunSec, in seconds (production: 30).
 // `--run-budget` is deliberately NOT sent to Hermes: real Hermes rejects it
 // together with `--format stream-json` (exit 2). The wall-clock kill below
@@ -59,11 +76,18 @@ export interface BuildArgvOpts {
   maxTurns: number;
   maxRunSec: number;
   resume?: string | null;
+  /** M6.4b: the permission mode of this run; default conversation. */
+  perm?: HermesPerm;
 }
 
-/** Exact argv for one Hermes run, element 0 being the executable. Matches
- *  `hermes -p <profile> chat --query-file <file> --format stream-json
- *  -t memory,session_search --max-turns <N> [--resume <id>]`.
+/** Exact argv for one Hermes run, element 0 being the executable.
+ *  conversation: `hermes -p <profile> chat --query-file <file> --format
+ *  stream-json -t memory,session_search --max-turns <N> [--resume <id>]`.
+ *  work: the same with `-t WORK_TOOLSETS` (Hermes's own dangerous-command
+ *  block stays on — a blocked command errors and the run continues, S-PERM).
+ *  full: no `-t` at all (the profile's own configured toolsets) plus the one
+ *  `--yolo` that lifts the block. The same relay session is resumed across
+ *  perms (`--resume` is unchanged).
  *  `--run-budget` is intentionally omitted: real Hermes rejects it together
  *  with `--format stream-json` (exit 2). The adapter's wall-clock kill
  *  (maxRunSec + TIMEOUT_EXTRA_SEC) is the enforcement (decision D31).
@@ -73,15 +97,22 @@ export function buildArgv(opts: BuildArgvOpts): string[] {
   if (!PROFILE_RE.test(opts.profile)) {
     throw new Error(`invalid hermes profile: ${JSON.stringify(opts.profile)}`);
   }
+  const perm = opts.perm ?? 'conversation';
   const argv: string[] = [
     opts.executable,
     '-p', opts.profile,
     'chat',
     '--query-file', opts.queryFile,
     '--format', 'stream-json',
-    '-t', MODE_A_TOOLSETS,
-    '--max-turns', String(opts.maxTurns),
   ];
+  if (perm === 'full') {
+    // M6.4b (S-PERM): the one place the flag that lifts Hermes's
+    // dangerous-command block may appear (static guard test).
+    argv.push('--yolo');
+  } else {
+    argv.push('-t', perm === 'work' ? WORK_TOOLSETS : MODE_A_TOOLSETS);
+  }
+  argv.push('--max-turns', String(opts.maxTurns));
   if (opts.resume) argv.push('--resume', opts.resume);
   return argv;
 }
@@ -104,6 +135,9 @@ export interface HermesAdapterOptions {
   profile?: string;
   maxTurns?: number;
   maxRunSec?: number;
+  /** M6.4b: limits for work and full runs (defaults WORK_MAX_TURNS / WORK_MAX_RUN_SEC). */
+  workMaxTurns?: number;
+  workMaxRunSec?: number;
   /** Hard wall-clock extra beyond maxRunSec, in seconds (production: 30). */
   timeoutExtraSec?: number;
   cwd?: string;
@@ -124,6 +158,8 @@ export class HermesAdapter {
   private readonly profile: string;
   private readonly maxTurns: number;
   private readonly maxRunSec: number;
+  private readonly workMaxTurns: number;
+  private readonly workMaxRunSec: number;
   private readonly cwd: string;
   private readonly startMs: number;
 
@@ -148,6 +184,8 @@ export class HermesAdapter {
     this.profile = options.profile ?? DEFAULT_PROFILE;
     this.maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
     this.maxRunSec = options.maxRunSec ?? DEFAULT_MAX_RUN_SEC;
+    this.workMaxTurns = options.workMaxTurns ?? WORK_MAX_TURNS;
+    this.workMaxRunSec = options.workMaxRunSec ?? WORK_MAX_RUN_SEC;
     this.timeoutExtraSec = options.timeoutExtraSec ?? 30;
     this.cwd = options.cwd ?? defaultCwd();
     this.startMs = options.startMs ?? Date.now();
@@ -177,13 +215,16 @@ export class HermesAdapter {
 
   /** Deliver one message. Fails at once with "Hermes is busy" if a run is
    *  already active (never queued). Until the engine's first `config` frame
-   *  has arrived, fails with "waiting for engine config" (review F4). */
+   *  has arrived, fails with "waiting for engine config" (review F4).
+   *  M6.4b (D33): `perm` selects the permission mode — a deliver without perm
+   *  is conversation; work and full run with their argv and limits. An
+   *  unknown perm string fails closed before anything spawns. */
   deliver(messageId: string, text: string, perm?: string): Promise<void> {
-    // M6.4a (D33): fail closed — the `work`/`full` permission modes are not
-    // built yet (M6.4b). Any non-conversation perm is refused before a process
-    // starts. A deliver without a perm behaves as 'conversation'.
-    if (perm !== undefined && perm !== 'conversation') {
-      this.fail(messageId, 'work and full modes are not available yet');
+    const mode: HermesPerm | null = perm === undefined
+      ? 'conversation'
+      : (PERMS as readonly string[]).includes(perm) ? perm as HermesPerm : null;
+    if (mode === null) {
+      this.fail(messageId, 'unknown permission mode');
       return Promise.resolve();
     }
     if (this.busy) {
@@ -196,7 +237,7 @@ export class HermesAdapter {
     }
     this.busy = true;
     this.sendFrame({ type: 'status', status: 'thinking' });
-    return this.runDelivery(messageId, text);
+    return this.runDelivery(messageId, text, mode);
   }
 
   /** Engine Stop: kill the active process tree and fail with "Stopped". */
@@ -227,7 +268,13 @@ export class HermesAdapter {
 
   // --- one run ---
 
-  private runDelivery(messageId: string, text: string): Promise<void> {
+  private runDelivery(messageId: string, text: string, perm: HermesPerm): Promise<void> {
+    // M6.4b: conversation uses maxTurns/maxRunSec (6/300 defaults); work and
+    // full use workMaxTurns/workMaxRunSec (60/3600 defaults). The wall-clock
+    // tree kill below stays the only hung-process guard (D33).
+    const limits = perm === 'conversation'
+      ? { maxTurns: this.maxTurns, maxRunSec: this.maxRunSec }
+      : { maxTurns: this.workMaxTurns, maxRunSec: this.workMaxRunSec };
     return new Promise((resolve) => {
       let settled = false;
       let timedOut = false;
@@ -249,9 +296,10 @@ export class HermesAdapter {
           executable: this.executable,
           profile: this.profile,
           queryFile: promptFile,
-          maxTurns: this.maxTurns,
-          maxRunSec: this.maxRunSec,
+          maxTurns: limits.maxTurns,
+          maxRunSec: limits.maxRunSec,
           resume: resumeId,
+          perm,
         });
         child = spawnCommand(argv, this.cwd);
       } catch (err) {
@@ -265,7 +313,7 @@ export class HermesAdapter {
 
       this.current = { child, requestInterrupt: () => { interrupted = true; killTree(child, 'interrupt'); } };
 
-      const timeoutMs = this.maxRunSec * 1000 + this.timeoutExtraSec * 1000;
+      const timeoutMs = limits.maxRunSec * 1000 + this.timeoutExtraSec * 1000;
       const timer = setTimeout(() => {
         timedOut = true;
         killTree(child, 'timeout');

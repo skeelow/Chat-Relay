@@ -17,6 +17,11 @@ import {
   buildArgv,
   connectToEngine,
   MODE_A_TOOLSETS,
+  WORK_TOOLSETS,
+  WORK_MAX_TURNS,
+  WORK_MAX_RUN_SEC,
+  DEFAULT_MAX_TURNS,
+  DEFAULT_MAX_RUN_SEC,
   defaultCwd,
   resolveHermes,
   runForever,
@@ -164,6 +169,63 @@ test('buildArgv: profile validation fails closed', () => {
   assert.doesNotThrow(() => buildArgv({
     executable: FAKE, profile: 'claude_2', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300,
   }));
+});
+
+// --- M6.4b: argv per permission mode (conversation | work | full) ---
+
+test('M6.4b: WORK_TOOLSETS is the fixed code constant', () => {
+  assert.equal(WORK_TOOLSETS, 'terminal,file,code_execution,web,todo,memory,session_search');
+});
+
+test('M6.4b buildArgv: conversation perm (and default) is the M6.1 argv exactly', () => {
+  const base = { executable: FAKE, profile: 'claude', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300 };
+  assert.deepEqual(buildArgv(base), [
+    FAKE, '-p', 'claude', 'chat', '--query-file', 'q.txt', '--format', 'stream-json',
+    '-t', MODE_A_TOOLSETS, '--max-turns', '6',
+  ]);
+  assert.deepEqual(buildArgv({ ...base, perm: 'conversation' }), buildArgv(base));
+});
+
+test('M6.4b buildArgv: work perm uses -t WORK_TOOLSETS and never --yolo', () => {
+  const argv = buildArgv({
+    executable: FAKE, profile: 'claude', queryFile: 'q.txt',
+    maxTurns: WORK_MAX_TURNS, maxRunSec: WORK_MAX_RUN_SEC, perm: 'work',
+  });
+  assert.deepEqual(argv, [
+    FAKE, '-p', 'claude', 'chat', '--query-file', 'q.txt', '--format', 'stream-json',
+    '-t', WORK_TOOLSETS, '--max-turns', '60',
+  ]);
+});
+
+test('M6.4b buildArgv: full perm has --yolo exactly once, no -t, and resumes', () => {
+  const argv = buildArgv({
+    executable: FAKE, profile: 'claude', queryFile: 'q.txt',
+    maxTurns: WORK_MAX_TURNS, maxRunSec: WORK_MAX_RUN_SEC, resume: 'sess-1', perm: 'full',
+  });
+  assert.deepEqual(argv, [
+    FAKE, '-p', 'claude', 'chat', '--query-file', 'q.txt', '--format', 'stream-json',
+    '--yolo', '--max-turns', '60', '--resume', 'sess-1',
+  ]);
+  assert.equal(argv.filter((v) => v === '--yolo').length, 1, '--yolo exactly once');
+  assert.equal(argv.includes('-t'), false, 'full has no -t (profile toolsets)');
+});
+
+test('M6.4b buildArgv: --yolo count 0/0/1, -t present/present/absent, forbidden flags never appear', () => {
+  for (const perm of ['conversation', 'work', 'full'] as const) {
+    const argv = buildArgv({
+      executable: FAKE, profile: 'claude', queryFile: 'q.txt',
+      maxTurns: 6, maxRunSec: 300, resume: 'sess-1', perm,
+    });
+    assert.equal(argv.filter((v) => v === '--yolo').length, perm === 'full' ? 1 : 0, `--yolo count for ${perm}`);
+    assert.equal(argv.includes('-t'), perm !== 'full', `-t present only for conversation and work (${perm})`);
+    for (const banned of ['--source', '--ignore-user-config', '--safe-mode', '--accept-hooks', '-q', '--query', '--run-budget']) {
+      assert.ok(!argv.includes(banned), `${banned} must never appear in ${perm} argv`);
+    }
+    assert.ok(!argv.includes(WORK_TOOLSETS) || perm === 'work', 'work toolsets only in work argv');
+    // --resume unchanged: the same relay session continues across perms.
+    assert.equal(argv.indexOf('--resume'), argv.length - 2);
+    assert.equal(argv[argv.length - 1], 'sess-1');
+  }
 });
 
 test('normal run: captured once, thread, delivered, temp file deleted', async () => {
@@ -411,11 +473,36 @@ test('sourceRef is unique per run and across restarts', async () => {
   assert.ok(/^local-sess:1700000000000-[12]$/.test(second ?? ''));
 });
 
-test('static guard: no --yolo, --source or shell: true in adapter source outside comments', () => {
+test('static guard: --source/--run-budget/shell:true absent; --yolo only inside the full branch', () => {
   const src = readFileSync(join(process.cwd(), 'adapters', 'hermes', 'adapter.ts'), 'utf8');
   const stripped = stripComments(src);
-  for (const banned of ['--yolo', '--source', '--run-budget', 'shell: true']) {
+  for (const banned of ['--source', '--run-budget', 'shell: true']) {
     assert.ok(!stripped.includes(banned), `${banned} must not appear in the adapter source outside comments`);
+  }
+  // '--yolo' may appear in adapter source ONLY inside buildArgv's full branch:
+  // exactly once in the whole stripped source, and inside the `if (perm === 'full') { … }` block.
+  const yoloCount = stripped.split("--yolo").length - 1;
+  assert.equal(yoloCount, 1, 'the literal --yolo appears exactly once in the adapter source');
+  const branch = stripped.indexOf("perm === 'full'");
+  assert.ok(branch !== -1, 'the full branch exists in buildArgv');
+  const open = stripped.indexOf('{', branch);
+  assert.ok(open !== -1);
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < stripped.length; i++) {
+    if (stripped[i] === '{') depth++;
+    else if (stripped[i] === '}') { depth--; if (depth === 0) { close = i; break; } }
+  }
+  assert.ok(close !== -1, 'the full branch block closes');
+  const yoloIdx = stripped.indexOf("--yolo");
+  assert.ok(yoloIdx > branch && yoloIdx < close,
+    'the only --yolo sits inside the full branch (no conversation/work path can reach it)');
+  // and it never appears in the conversation/work argv (runtime guard, mirrors the argv tests)
+  for (const perm of ['conversation', 'work'] as const) {
+    const argv = buildArgv({
+      executable: 'x', profile: 'claude', queryFile: 'q.txt', maxTurns: 6, maxRunSec: 300, perm,
+    });
+    assert.ok(!argv.includes('--yolo'), `--yolo must never appear in ${perm} argv`);
   }
 });
 
@@ -940,21 +1027,49 @@ test('R1: run killed when socket closes', async () => {
   assert.ok(error === 'Stopped' || error === 'Hermes exited with code 1', `expected 'Stopped' or 'Hermes exited with code 1', got '${error}'`);
 });
 
-// --- M6.4a: fail-closed perm + kill ---
+// --- M6.4b: work and full run; unknown perm fails closed ---
 
-test('M6.4a: deliver with perm=work fails closed with the exact message and starts no process', async () => {
+test('M6.4b: deliver perm=work runs with the work argv, no --yolo, work limits', async () => {
+  clearControl();
+  setControl('normal', { text: 'work reply' });
+  const { adapter, frames } = makeAdapter();
+  await adapter.deliver('m-work', 'do work', 'work');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-work', 'work delivery completes');
+  const argv = readArgv();
+  assert.equal(argv[argv.indexOf('-t') + 1], WORK_TOOLSETS, '-t with the work toolsets');
+  assert.equal(argv.filter((v) => v === '--yolo').length, 0, 'work argv has no --yolo');
+  assert.equal(argv[argv.indexOf('--max-turns') + 1], '60', 'work uses maxTurns 60');
+});
+
+test('M6.4b: deliver perm=full runs with --yolo, no -t, and resumes the same session', async () => {
+  clearControl();
+  setControl('normal', { text: 'full reply' });
+  const { adapter, frames } = makeAdapter();
+  await adapter.deliver('m-work', 'work first', 'work'); // establishes session local-sess
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-work');
+  await adapter.deliver('m-full', 'go full', 'full');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-full', 'full delivery completes');
+  const argv = readArgv();
+  assert.equal(argv.filter((v) => v === '--yolo').length, 1, 'full argv has --yolo exactly once');
+  assert.equal(argv.includes('-t'), false, 'full argv has no -t (profile toolsets)');
+  assert.equal(argv[argv.indexOf('--max-turns') + 1], '60', 'full uses maxTurns 60');
+  assert.ok(argv.includes('--resume') && argv[argv.indexOf('--resume') + 1] === 'local-sess',
+    'the same relay session is resumed across perms');
+});
+
+test('M6.4b: deliver with an unknown perm fails closed and starts no process', async () => {
   clearControl();
   setControl('normal', { text: 'should never run' });
   const { adapter, frames } = makeAdapter();
-  const marker = join(TMP, 'argv-perm-work.json');
+  const marker = join(TMP, 'argv-perm-bogus.json');
   try { unlinkSync(marker); } catch { /* absent is what we want */ }
   const prev = process.env.FAKE_HERMES_ARGV_FILE;
   process.env.FAKE_HERMES_ARGV_FILE = marker;
   try {
-    await adapter.deliver('m-work', 'do privileged things', 'work');
+    await adapter.deliver('m-bogus', 'evil', 'everything');
     const failed = lastFrameOfType(frames, 'failed');
-    assert.equal(failed?.messageId, 'm-work');
-    assert.equal(failed?.error, 'work and full modes are not available yet');
+    assert.equal(failed?.messageId, 'm-bogus');
+    assert.equal(failed?.error, 'unknown permission mode');
     assert.ok(!frames.some((f) => (f as { type?: string; status?: string }).type === 'status' && (f as { status?: string }).status === 'thinking'),
       'no run started (no thinking status)');
     assert.equal(existsSync(marker), false, 'the fake executable was never spawned');
@@ -963,19 +1078,32 @@ test('M6.4a: deliver with perm=work fails closed with the exact message and star
   }
 });
 
-test('M6.4a: deliver with perm=full fails closed; conversation/undefined run normally', async () => {
+test('M6.4b: a deliver without perm is conversation (memory,session_search, no --yolo)', async () => {
   clearControl();
-  setControl('normal', { text: 'normal reply' });
+  setControl('normal', { text: 'plain reply' });
   const { adapter, frames } = makeAdapter();
-  await adapter.deliver('m-full', 'privileged', 'full');
-  assert.equal(lastFrameOfType(frames, 'failed')?.messageId, 'm-full');
-  assert.equal(lastFrameOfType(frames, 'failed')?.error, 'work and full modes are not available yet');
-  await adapter.deliver('m-conv', 'hello', 'conversation');
-  for (let i = 0; i < 25 && lastFrameOfType(frames, 'delivered')?.messageId !== 'm-conv'; i++) await new Promise((r) => setTimeout(r, 100));
-  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-conv', 'conversation perm runs normally');
-  await adapter.deliver('m-undef', 'hello again');
-  for (let i = 0; i < 25 && lastFrameOfType(frames, 'delivered')?.messageId !== 'm-undef'; i++) await new Promise((r) => setTimeout(r, 100));
-  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-undef', 'undefined perm runs normally');
+  await adapter.deliver('m-plain', 'hello');
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-plain');
+  const argv = readArgv();
+  assert.equal(argv[argv.indexOf('-t') + 1], MODE_A_TOOLSETS);
+  assert.equal(argv.filter((v) => v === '--yolo').length, 0);
+});
+
+test('M6.4b: limits per perm — conversation 6/300 defaults, work and full 60/3600 defaults', () => {
+  assert.equal(DEFAULT_MAX_TURNS, 6);
+  assert.equal(DEFAULT_MAX_RUN_SEC, 300);
+  assert.equal(WORK_MAX_TURNS, 60);
+  assert.equal(WORK_MAX_RUN_SEC, 3600);
+});
+
+test('M6.4b: a hanging work run is wall-clock killed with the work maxRunSec', async () => {
+  clearControl();
+  setControl('grandchild-hang');
+  const { adapter, frames } = makeAdapter({ workMaxRunSec: 1 }); // work kill fires after 1 s + 1 s extra
+  const before = Date.now();
+  await adapter.deliver('m-work-hang', 'hang forever', 'work');
+  assert.ok(Date.now() - before >= 1900, 'the work wall-clock kill used the work maxRunSec, not the conversation one');
+  assert.equal(String(lastFrameOfType(frames, 'failed')?.error), 'Hermes timed out');
 });
 
 test('M6.4a: kill ends a hanging run, kills the grandchild tree, and reports Stopped', async () => {

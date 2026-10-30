@@ -13,12 +13,23 @@ import {
   type EngineHandle,
   DEFAULT_ACK_TIMEOUT_MS,
   HERMES_ACK_TIMEOUT_MS,
+  HERMES_WORK_ACK_TIMEOUT_MS,
+  hermesAckTimeoutMs,
 } from '../relay/engine.ts';
 import { hashBody } from '../relay/store.ts';
 
 test('ack timeouts: Hermes 6 minutes, Codex 30 seconds', () => {
   assert.equal(HERMES_ACK_TIMEOUT_MS, 360000);
   assert.equal(DEFAULT_ACK_TIMEOUT_MS, 30000);
+});
+
+// M6.4b (D33): work/full rows must cover maxRunSec 3600 + 30 wall-clock + 60 slack.
+test('M6.4b ack timeouts: hermes work/full = 3600+30+60 s, conversation stays 360 s', () => {
+  assert.equal(HERMES_WORK_ACK_TIMEOUT_MS, (3600 + 30 + 60) * 1000);
+  assert.equal(hermesAckTimeoutMs('work'), 3690000);
+  assert.equal(hermesAckTimeoutMs('full'), 3690000);
+  assert.equal(hermesAckTimeoutMs('conversation'), 360000);
+  assert.equal(hermesAckTimeoutMs(undefined), 360000, 'a missing perm is conversation');
 });
 
 // --- minimal WebSocket client, mirroring tests/engine.test.ts ---
@@ -659,6 +670,35 @@ test('M6.4a audit: perm_requested audited for non-conversation send, not for con
     await pause(120);
     const none = engine.store.recentAudit(50).filter((e) => e.event === 'perm_requested' && e.messageId === d2.messageId);
     assert.equal(none.length, 0, 'a conversation send does not audit perm_requested');
+  });
+});
+
+// M6.4b: the hermes_delivering audit detail carries the perm; full adds a distinct event.
+test('M6.4b audit: hermes_delivering detail carries the perm; full adds hermes_full_started', async () => {
+  await withEngine('audit-perm-detail', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    gui.send({ type: 'send', body: 'work run body', targets: ['hermes'], perm: 'work' });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    await pause(120);
+    let entries = engine.store.recentAudit(50);
+    const hd = entries.find((e) => e.event === 'hermes_delivering' && e.messageId === deliver.messageId);
+    assert.ok(hd, 'hermes_delivering audited for a work run');
+    assert.equal(hd!.detail, 'work', 'hermes_delivering detail is the perm');
+    assert.ok(!entries.some((e) => e.event === 'hermes_full_started' && e.messageId === deliver.messageId),
+      'no hermes_full_started for a work run');
+    gui.send({ type: 'send', body: 'full run body', targets: ['hermes'], perm: 'full' });
+    const deliver2 = (await hermes.nextMessage()) as { messageId: string };
+    await pause(120);
+    entries = engine.store.recentAudit(50);
+    const hd2 = entries.find((e) => e.event === 'hermes_delivering' && e.messageId === deliver2.messageId);
+    assert.equal(hd2!.detail, 'full', 'hermes_delivering detail is the perm (full)');
+    const fs = entries.find((e) => e.event === 'hermes_full_started' && e.messageId === deliver2.messageId);
+    assert.ok(fs, 'hermes_full_started audited for a full run');
+    assert.equal(fs!.actor, 'engine', 'hermes_full_started actor is engine');
+    for (const e of entries) {
+      assert.ok(!String(e.detail ?? '').includes('run body'), 'message body never appears in audit detail');
+    }
   });
 });
 

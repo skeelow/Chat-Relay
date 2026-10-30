@@ -71,6 +71,20 @@ function setting(dbPath: string, key: string): string | null {
   } finally { db.close(); }
 }
 
+function messageCount(dbPath: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return (db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+  } finally { db.close(); }
+}
+
+function auditEventCount(dbPath: string, event: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return (db.prepare('SELECT COUNT(*) AS n FROM audit WHERE event = ?').get(event) as { n: number }).n;
+  } finally { db.close(); }
+}
+
 // Return true if a Windows PID is still present in the task list.
 function pidIsAlive(pid: string): boolean {
   try {
@@ -132,7 +146,7 @@ async function run() {
 
   try {
     // ------------------------------------------------------------------
-    // Setup A: real engine + real adapter + fake GUI (checks 1-6, 8-10).
+    // Setup A: real engine + real adapter + fake GUI (checks 1-6, 8-16).
     // ------------------------------------------------------------------
     dirA = mkdtempSync(join(tmpdir(), 'relay-smoke-a-'));
     const dbPathA = join(dirA, 'relay.db');
@@ -326,25 +340,20 @@ async function run() {
             guiB.send({ type: 'resume' });
             try { await guiB.waitFor((m: any) => m.type === 'pause_update' && m.paused === false, 3000); } catch { /* */ }
 
-            // Check 11: a GUI send with perm='work' to Hermes fails closed with
-            // the exact message and starts no process. grandchild-hang would
-            // hang and write a pid file IF the adapter spawned; fail-closed
-            // means it never spawns, so the pid file stays absent.
+            // Check 11 (M6.4b): a GUI send with an unknown perm is ignored
+            // whole-frame by the engine (fail closed at the boundary): no
+            // message is stored, no delivery row is created, nothing spawns.
+            // grandchild-hang would write a pid file IF the adapter spawned.
             writeControl(dirA, 'grandchild-hang');
             try { unlinkSync(grandchildPidFile); } catch { /* fresh */ }
-            guiB.send({ type: 'send', body: 'do privileged things', targets: ['hermes'], perm: 'work' });
-            let check11ok = false;
-            let check11detail = '';
-            try {
-              const failed = (await guiB.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'failed', 6000)) as any;
-              const msgOk = String(failed.error ?? '') === 'work and full modes are not available yet';
-              await new Promise((r) => setTimeout(r, 400));
-              const spawned = existsSync(grandchildPidFile);
-              check11ok = msgOk && !spawned;
-              check11detail = `error="${failed.error}" pidFileExists=${spawned}`;
-            } catch (err) { check11detail = String(err); }
-            finally { writeControl(dirA, 'normal'); }
-            check(11, "GUI send perm='work' to Hermes fails closed with the exact message and starts no process", check11ok, check11detail);
+            const countBefore = messageCount(dbPathA);
+            guiB.send({ type: 'send', body: 'bad perm send', targets: ['hermes'], perm: 'everything' });
+            await new Promise((r) => setTimeout(r, 800));
+            const countAfter = messageCount(dbPathA);
+            const spawned = existsSync(grandchildPidFile);
+            check(11, "GUI send with an unknown perm is ignored whole-frame: nothing stored, nothing spawned",
+              countAfter === countBefore && !spawned,
+              `messages=${countBefore}->${countAfter} pidFileExists=${spawned}`);
 
             // Check 12: a kill during a hanging run ends it, the process tree
             // is gone, and the row is back to pending_approval.
@@ -375,6 +384,113 @@ async function run() {
             } catch (err) { check12detail = String(err); }
             finally { writeControl(dirA, 'normal'); }
             check(12, 'kill during a hanging run ends it, the process tree is gone, and the row returns to pending_approval', check12ok, check12detail);
+
+            // ---- M6.4b checks 13-16: work and full runs, real engine +
+            // real adapter + fake executable. The fake writes its received
+            // argv as JSON to FAKE_HERMES_ARGV_FILE (tests/fake-hermes.ts).
+            const WORK_ARGS = 'terminal,file,code_execution,web,todo,memory,session_search';
+            const smokeArgvFile = join(dirA, 'smoke-argv.json');
+            process.env.FAKE_HERMES_ARGV_FILE = smokeArgvFile;
+            function readSmokeArgv(): string[] {
+              if (!existsSync(smokeArgvFile)) throw new Error('no argv file written — the fake never spawned');
+              return JSON.parse(readFileSync(smokeArgvFile, 'utf8')) as string[];
+            }
+
+            // Check 12's kill left the engine stopped — resume it.
+            guiB.send({ type: 'resume' });
+            try { await guiB.waitFor((m: any) => m.type === 'pause_update' && m.paused === false, 3000); } catch { /* */ }
+
+            // One GUI send, returning its message id (via the user-message
+            // transcript_update) and waiting for the Hermes row to be delivered.
+            async function sendWorkFull(body: string, perm?: string): Promise<string[]> {
+              try { unlinkSync(smokeArgvFile); } catch { /* fresh */ }
+              const frame: any = { type: 'send', body, targets: ['hermes'] };
+              if (perm !== undefined) frame.perm = perm;
+              guiB.send(frame);
+              const um = (await guiB.waitFor((m: any) =>
+                m.type === 'transcript_update' && m.message?.body === body, 8000)) as any;
+              const mid = String(um.message.id);
+              await guiB.waitFor((m: any) =>
+                m.type === 'delivery_update' && m.messageId === mid && m.status === 'delivered', 8000);
+              return readSmokeArgv();
+            }
+            const yoloCount = (argv: string[]): number => argv.filter((v) => v === '--yolo').length;
+
+            // Check 13: perm='work' is delivered; argv has -t with the work
+            // toolsets and no --yolo.
+            let check13ok = false; let check13detail = '';
+            let workArgv: string[] = [];
+            try {
+              workArgv = await sendWorkFull('m64b work 13', 'work');
+              check13ok = workArgv.includes('-t') && workArgv[workArgv.indexOf('-t') + 1] === WORK_ARGS
+                && yoloCount(workArgv) === 0 && workArgv[workArgv.indexOf('--max-turns') + 1] === '60';
+              check13detail = `t=${workArgv[workArgv.indexOf('-t') + 1]} yolo=${yoloCount(workArgv)}`;
+            } catch (err) { check13detail = String(err); }
+            check(13, "GUI send perm='work' is delivered with -t WORK_TOOLSETS and no --yolo", check13ok, check13detail);
+
+            // Check 14: perm='full' argv has --yolo exactly once and no -t.
+            let check14ok = false; let check14detail = '';
+            let fullArgv: string[] = [];
+            try {
+              fullArgv = await sendWorkFull('m64b full 14', 'full');
+              check14ok = yoloCount(fullArgv) === 1 && !fullArgv.includes('-t')
+                && fullArgv[fullArgv.indexOf('--max-turns') + 1] === '60';
+              check14detail = `yolo=${yoloCount(fullArgv)} hasT=${fullArgv.includes('-t')}`;
+            } catch (err) { check14detail = String(err); }
+            check(14, "GUI send perm='full' has --yolo exactly once and no -t", check14ok, check14detail);
+
+            // Check 15: a default-perm send after those is conversation argv
+            // (memory,session_search, no --yolo), and the same session id was
+            // resumed across all three runs.
+            let check15ok = false; let check15detail = '';
+            try {
+              const convArgv = await sendWorkFull('m64b default 15');
+              const resumed = [workArgv, fullArgv, convArgv].every((argv) =>
+                argv.includes('--resume') && argv[argv.indexOf('--resume') + 1] === 'sess-smoke-1');
+              check15ok = convArgv.includes('-t') && convArgv[convArgv.indexOf('-t') + 1] === 'memory,session_search'
+                && yoloCount(convArgv) === 0 && resumed;
+              check15detail = `t=${convArgv[convArgv.indexOf('-t') + 1]} yolo=${yoloCount(convArgv)} resumed=${resumed}`;
+            } catch (err) { check15detail = String(err); }
+            check(15, 'after work/full a default send is conversation argv; the same session resumed across all three', check15ok, check15detail);
+
+            // Check 16: Kill during a hanging work run ends it, the tree is
+            // gone, the row is back to pending_approval, and the audit
+            // contains a new 'kill' entry.
+            writeControl(dirA, 'grandchild-hang');
+            try { unlinkSync(grandchildPidFile); } catch { /* fresh */ }
+            let check16ok = false; let check16detail = '';
+            try {
+              try { unlinkSync(smokeArgvFile); } catch { /* fresh */ }
+              const frame = { type: 'send', body: 'm64b hang 16', targets: ['hermes'], perm: 'work' };
+              guiB.send(frame);
+              const um = (await guiB.waitFor((m: any) =>
+                m.type === 'transcript_update' && m.message?.body === 'm64b hang 16', 8000)) as any;
+              const mid = String(um.message.id);
+              await guiB.waitFor((m: any) =>
+                m.type === 'delivery_update' && m.messageId === mid && m.status === 'delivering', 6000);
+              let pid = '';
+              for (let i = 0; i < 25; i++) {
+                if (existsSync(grandchildPidFile)) { pid = readFileSync(grandchildPidFile, 'utf8').trim(); if (pid !== '') break; }
+                await new Promise((r) => setTimeout(r, 200));
+              }
+              const killCountBefore = auditEventCount(dbPathA, 'kill');
+              guiB.send({ type: 'kill' });
+              let rowPending = false;
+              try {
+                await guiB.waitFor((m: any) =>
+                  m.type === 'delivery_update' && m.messageId === mid && m.status === 'pending_approval', 8000);
+                rowPending = true;
+              } catch { /* */ }
+              let treeGone = false;
+              if (pid !== '') {
+                for (let i = 0; i < 15; i++) { if (!pidIsAlive(pid)) { treeGone = true; break; } await new Promise((r) => setTimeout(r, 300)); }
+              }
+              const killGrew = auditEventCount(dbPathA, 'kill') > killCountBefore;
+              check16ok = rowPending && treeGone && killGrew;
+              check16detail = `rowPending=${rowPending} treeGone=${treeGone} auditKillGrew=${killGrew} pid=${pid}`;
+            } catch (err) { check16detail = String(err); }
+            finally { writeControl(dirA, 'normal'); delete process.env.FAKE_HERMES_ARGV_FILE; }
+            check(16, 'kill during a hanging work run ends it, tree gone, row pending again, audit contains kill', check16ok, check16detail);
 
           } finally {
             astra.close();

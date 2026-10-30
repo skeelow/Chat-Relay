@@ -19,6 +19,7 @@ const REPO = process.cwd();
 // Known-flaky test names (the packet seeds this with one entry).
 export const KNOWN_FLAKY = [
   'restart: a delivering user row returns to pending and nothing is re-sent',
+  'unticking auto_send and leaving Auto both cancel the countdowns',
 ];
 
 // ---------------------------------------------------------------------------
@@ -218,17 +219,29 @@ function step2Typecheck() {
   return { pass: false, line: 'FAIL typecheck: ' + (res.stderr || res.stdout).trim().split('\n').slice(-3).join(' | ') };
 }
 
-function parseTestOutput(output) {
+// Parse `npm test` output. Node's spec reporter prints each failing test as a
+// line `✖ name (12.3ms)` — once inline, again under the trailing
+// "✖ failing tests:" heading — and the counts on `ℹ …` summary lines.
+// Read the ✖ lines (strip the trailing duration, dedupe); keep the older
+// quoted-name heuristic under "failing tests:" as a fallback.
+export function parseTestOutput(output) {
   const testsM = output.match(/ℹ tests (\d+)/);
   const passM = output.match(/ℹ pass (\d+)/);
   const failM = output.match(/ℹ fail (\d+)/);
   const failingNames = [];
+  const pushName = (name) => {
+    if (name && !failingNames.includes(name)) failingNames.push(name);
+  };
+  for (const line of output.split(/\r?\n/)) {
+    const m = line.match(/^\s*✖\s+(.+?)\s+\([\d.]+(?:ms|s)\)\s*$/);
+    if (m) pushName(m[1]);
+  }
   const failIdx = output.indexOf('failing tests:');
   if (failIdx !== -1) {
     const section = output.slice(failIdx);
     for (const line of section.split(/\r?\n/)) {
       const m = line.match(/^\s{4}'([^']+)'/);
-      if (m) failingNames.push(m[1]);
+      if (m) pushName(m[1]);
     }
   }
   return {
