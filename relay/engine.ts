@@ -25,6 +25,9 @@
 //   GUI → engine    {type:'stop'}                                M3.2b: Stop halts everything
 //   GUI → engine    {type:'resume'}                              M3.2b: Resume clears the stopped state
 //   engine → GUI    {type:'pause_update', paused}                M3.2b: broadcast on every change
+//                                                                 M6.4f (D34): carries reason
+//                                                                 'relay_kill_astra' when Astra
+//                                                                 triggered the kill itself
 //   engine → adapter {type:'interrupt'}                          M3.2b: to codex on Stop (best effort)
 //   adapter → engine {type:'approval_request', requestId, kind, summary, method}   M3.3: a codex approval
 //   engine → GUI    {type:'approval_request', ...}               M3.3: broadcast banner card
@@ -71,7 +74,7 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   openStore, StoreError, isOverTurnCap, validateModeUpdate, validatePerm,
-  type Participant, type PendingDelivery, type Perm, type RelayMessage, type RelayStore,
+  type AuditInput, type Participant, type PendingDelivery, type Perm, type RelayMessage, type RelayStore,
 } from './store.ts';
 import { exportMarkdown, EXPORT_CAP, type ExportDelivery } from './export.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -144,6 +147,14 @@ function relayHeader(pending: { messageId: string; source: Participant; hop: num
 
 function isParticipant(value: unknown): value is Participant {
   return value === 'user' || value === 'astra' || value === 'codex' || value === 'hermes';
+}
+
+/** M6.4f (D34): the RELAY-KILL trigger line. True when one whole line of a
+ *  captured body is exactly `RELAY-KILL` — case-sensitive, after trimming
+ *  only trailing whitespace/CR. Leading indentation or other text anywhere
+ *  on the line (a substring, a code span on a longer line) does not match. */
+export function hasRelayKillLine(body: string): boolean {
+  return body.split('\n').some((line) => line.replace(/\s+$/, '') === 'RELAY-KILL');
 }
 
 interface ClientState {
@@ -426,8 +437,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
    *  honest note, clear approvals and countdowns, broadcast the new state.
    *  Returns how many rows were returned. The adapter frames differ per caller
    *  (Stop interrupts codex+hermes; Kill kills hermes and interrupts codex),
-   *  so they stay in the handlers. */
-  const enterStoppedState = (reason: string): number => {
+   *  so they stay in the handlers. M6.4f (D34): pauseNotice rides along on the
+   *  pause_update broadcast when the stopped state was entered without a GUI
+   *  round-trip (a RELAY-KILL from Astra), so the GUI can say who did it. */
+  const enterStoppedState = (reason: string, pauseNotice?: string): number => {
     paused = true;
     store.setPaused(true);
     const inFlight = store.pendingDeliveries()
@@ -442,8 +455,31 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
     }
     resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
     clearAllCountdowns(reason); // M5.1 (D18-4): and every countdown — the rows stay pending
-    broadcast({ type: 'pause_update', paused: true });
+    broadcast(pauseNotice === undefined
+      ? { type: 'pause_update', paused: true }
+      : { type: 'pause_update', paused: true, reason: pauseNotice });
     return inFlight.length;
+  };
+
+  /** M6.4a (D33) Kill action; M6.4f (D34): shared by the GUI `kill` frame and
+   *  the engine-side RELAY-KILL trigger so both do exactly the same thing:
+   *  audit, enter the stopped state (in-flight rows back to pending_approval,
+   *  countdowns and pending auto-forwards cancelled, D35 switch stays as set),
+   *  `kill` the relay-launched Hermes run tree — never any other process on
+   *  the PC — `interrupt` Codex, and `interrupt` Astra (D36: cancels a pending
+   *  auto-Send click). Like the GUI Kill, an action while already stopped is
+   *  not skipped: it re-sends the frames to catch any orphan. */
+  const performKill = (audit: AuditInput, pauseNotice?: string): number => {
+    store.appendAudit(audit);
+    const returned = enterStoppedState('Kill', pauseNotice);
+    const hermesSock = adapterSocketFor('hermes');
+    if (hermesSock !== null) hermesSock.send(JSON.stringify({ type: 'kill' }));
+    const codexSock = adapterSocketFor('codex');
+    if (codexSock !== null) codexSock.send(JSON.stringify({ type: 'interrupt' }));
+    // M6.4e (D36): Kill stops auto-send too — cancel the pending click.
+    const astraSock = adapterSocketFor('astra');
+    if (astraSock !== null) astraSock.send(JSON.stringify({ type: 'interrupt' }));
+    return returned;
   };
 
   /** The approve case's body, extracted so a countdown expiry does exactly
@@ -673,6 +709,25 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               if (message.source !== 'user') {
                 turnsUsed += 1;
                 broadcastSessionSummary();
+              }
+              // M6.4f (D34): RELAY-KILL — the one narrow exception to the hard
+              // rule that text relayed from any participant is data: a whole
+              // line exactly `RELAY-KILL` in a captured Astra reply performs
+              // the Kill from the engine side (same action as the GUI kill
+              // frame — it can only stop things, never grant capability).
+              // Detection is before any routing: the reply is stored and shown
+              // normally but never forwarded onward — with D35 on it fires
+              // before the reply would be auto-forwarded to Hermes — and it
+              // cancels every pending countdown and auto-Send click. Only
+              // Astra's own replies trigger; Codex, Hermes and GUI text never
+              // do, and near misses (substring, indent, other case) do not.
+              if (message.source === 'astra' && hasRelayKillLine(body)) {
+                const returned = performKill(
+                  { actor: 'astra', event: 'relay_kill_astra', messageId: message.id },
+                  'relay_kill_astra',
+                );
+                console.log(`[engine] RELAY-KILL from astra (${message.id}): stopped; ${returned} in-flight row(s) returned; kill→hermes, interrupt→codex+astra`);
+                return;
               }
               // M4.2 (D16-3) + M5.1 (D18-2): approve_each and auto route
               // every stored AI capture to the other AI as a pending item.
@@ -1009,16 +1064,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             // whenever the engine is up, even with nothing running — then it
             // just records the audit entry and the stopped state. Unlike Stop,
             // a Kill while already stopped still re-sends the frames (to catch
-            // any orphan) and records the audit entry.
-            store.appendAudit({ actor: 'gui', event: 'kill' });
-            const returned = enterStoppedState('Kill');
-            const hermesSock = adapterSocketFor('hermes');
-            if (hermesSock !== null) hermesSock.send(JSON.stringify({ type: 'kill' }));
-            const codexSock = adapterSocketFor('codex');
-            if (codexSock !== null) codexSock.send(JSON.stringify({ type: 'interrupt' }));
-            // M6.4e (D36): Kill stops auto-send too — cancel the pending click.
-            const astraSock = adapterSocketFor('astra');
-            if (astraSock !== null) astraSock.send(JSON.stringify({ type: 'interrupt' }));
+            // any orphan) and records the audit entry. M6.4f (D34): the action
+            // lives in performKill, shared with the RELAY-KILL trigger.
+            const returned = performKill({ actor: 'gui', event: 'kill' });
             console.log(`[engine] kill: stopped; ${returned} in-flight row(s) returned; kill→hermes, interrupt→codex+astra`);
             return;
           }

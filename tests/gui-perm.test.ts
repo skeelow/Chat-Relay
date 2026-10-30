@@ -23,6 +23,7 @@ import {
   isKillHotkey,
   killConfirmation,
   killFrame,
+  relayKillNotice,
   startKillWait,
   type DeliveryRow,
 } from '../app/src/deliveries.ts';
@@ -136,6 +137,13 @@ test('M6.4d kill: deliveries before the click do not count (the wait starts at z
   assert.equal(wait.awaiting, false);
   assert.equal(applyKillDelivery(wait, row('m1', 'hermes', 'pending_approval')).returned, 0,
     'an update after the reply resolved changes nothing');
+});
+
+test('M6.4f D34: relayKillNotice — the Kill note area says Astra triggered the kill', () => {
+  const line = relayKillNotice();
+  assert.ok(line.includes('Astra'), 'the notice names Astra as the trigger');
+  assert.ok(line.includes('RELAY-KILL'), 'the notice names the trigger line');
+  assert.ok(line.includes('Resume'), 'the notice keeps the stopped-until-Resume wording');
 });
 
 // ---------------- Item 3: audit view ----------------

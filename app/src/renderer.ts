@@ -42,6 +42,7 @@ import {
   pauseBannerText,
   pendingCount,
   rejectFrame,
+  relayKillNotice,
   resumeFrame,
   startKillWait,
   stopButtonLabel,
@@ -765,6 +766,13 @@ function handleFrame(frame: Frame): void {
     if (killWait.awaiting && paused) {
       killWait = finishKillWait(killWait);
       showKillConfirmation();
+      renderKillUi();
+    }
+    // M6.4f (D34): the engine says Astra triggered this kill itself (a whole
+    // RELAY-KILL line in a captured reply) — the Kill note area shows who did
+    // it. There is no GUI round-trip to confirm, so no killWait is involved.
+    if (paused && frame.reason === 'relay_kill_astra' && killNoteEl !== null) {
+      killNoteEl.textContent = relayKillNotice();
       renderKillUi();
     }
     return;

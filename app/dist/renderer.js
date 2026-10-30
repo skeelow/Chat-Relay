@@ -205,6 +205,9 @@
   function killConfirmation(returned) {
     return returned === 0 ? "Killed \u2014 nothing was in flight; the relay is stopped until you Resume" : `Killed \u2014 ${returned} in-flight row(s) returned to pending; nothing runs; the relay is stopped until you Resume`;
   }
+  function relayKillNotice() {
+    return "Astra triggered a kill (RELAY-KILL) \u2014 nothing runs; the relay is stopped until you Resume";
+  }
 
   // app/src/compose.ts
   var COMPOSE_BODY_CAP = 2e4;
@@ -1030,6 +1033,10 @@
       if (killWait.awaiting && paused) {
         killWait = finishKillWait(killWait);
         showKillConfirmation();
+        renderKillUi();
+      }
+      if (paused && frame.reason === "relay_kill_astra" && killNoteEl !== null) {
+        killNoteEl.textContent = relayKillNotice();
         renderKillUi();
       }
       return;

@@ -323,3 +323,10 @@ export function killConfirmation(returned: number): string {
     ? 'Killed — nothing was in flight; the relay is stopped until you Resume'
     : `Killed — ${returned} in-flight row(s) returned to pending; nothing runs; the relay is stopped until you Resume`;
 }
+
+/** M6.4f (D34): the notice for the Kill note area when the engine's
+ *  pause_update carries reason 'relay_kill_astra' — a captured Astra reply
+ *  with a whole line exactly `RELAY-KILL` triggered the kill itself. */
+export function relayKillNotice(): string {
+  return 'Astra triggered a kill (RELAY-KILL) — nothing runs; the relay is stopped until you Resume';
+}

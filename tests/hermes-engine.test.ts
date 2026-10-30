@@ -1018,3 +1018,123 @@ test('M6.4e D35 real engine: Kill cancels the pending auto-forward countdown and
     assert.equal(engine.store.paused(), true, 'the engine is stopped');
   });
 });
+
+// --- M6.4f: D34 — RELAY-KILL. A captured Astra reply whose whole line is
+// exactly `RELAY-KILL` (trailing whitespace/CR trimmed) triggers the engine's
+// kill action — the narrow exception where relayed AI text is honoured, and it
+// can only stop things. Real-engine tests: frames in, frames and rows out. ---
+
+test('M6.4f D34 real engine: a whole-line RELAY-KILL in a captured astra reply performs the kill', async () => {
+  await withEngine('d34-kill-action', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    const astra = await openAdapter(url, token, 'astra');
+    // A Hermes run in flight, as in the M6.4a kill test.
+    gui.send({ type: 'send', body: 'long run', targets: ['hermes'] });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    assert.equal(engine.store.getDelivery(deliver.messageId, 'hermes')?.status, 'delivering');
+    // Astra's reply carries the trigger line alone.
+    astra.send({ type: 'captured', body: 'RELAY-KILL', sourceRef: 'd34-1' });
+    const cap = (await nextMatching(gui, (f) => f.type === 'transcript_update'
+      && (f.message as { body?: string } | undefined)?.body === 'RELAY-KILL',
+      'the killing reply is still stored and shown')).message as { id: string };
+    let sawKill = false;
+    for (let i = 0; i < 6; i++) { try { const m = await hermes.nextMessage(500); if (m.type === 'kill') { sawKill = true; break; } } catch { break; } }
+    assert.ok(sawKill, 'the hermes adapter receives {type:kill} — the same action as the kill frame');
+    let sawInterrupt = false;
+    for (let i = 0; i < 6; i++) { try { const m = await codex.nextMessage(500); if (m.type === 'interrupt') { sawInterrupt = true; break; } } catch { break; } }
+    assert.ok(sawInterrupt, 'the codex adapter receives {type:interrupt}');
+    let sawAstraInterrupt = false;
+    for (let i = 0; i < 6; i++) { try { const m = await astra.nextMessage(500); if (m.type === 'interrupt') { sawAstraInterrupt = true; break; } } catch { break; } }
+    assert.ok(sawAstraInterrupt, 'the astra adapter receives {type:interrupt} — a pending auto-Send click is cancelled');
+    await pause(150);
+    assert.equal(engine.store.getDelivery(deliver.messageId, 'hermes')?.status, 'pending_approval',
+      'the in-flight row returns to pending — kill effects as the existing kill');
+    assert.equal(engine.store.paused(), true, 'the relay enters the stopped state');
+    const audit = engine.store.recentAudit(50).find((e) => e.event === 'relay_kill_astra');
+    assert.ok(audit !== undefined, 'the relay kill is audited as relay_kill_astra');
+    assert.equal(audit.actor, 'astra');
+    assert.equal(audit.messageId, cap.id);
+    assert.ok(audit.detail === null || audit.detail === '', 'the audit row carries no message body');
+  });
+});
+
+test('M6.4f D34 real engine: the trigger survives CRLF and works as one line among others', async () => {
+  await withEngine('d34-crlf', async (engine, url, token) => {
+    const astra = await openAdapter(url, token, 'astra');
+    const crlf = String.fromCharCode(13, 10);
+    astra.send({ type: 'captured', body: ['first line', 'RELAY-KILL', 'last line'].join(crlf), sourceRef: 'd34-2' });
+    await pause(150);
+    assert.equal(engine.store.paused(), true, 'the line among others still triggers (CRLF)');
+    assert.ok(engine.store.recentAudit(50).some((e) => e.event === 'relay_kill_astra'), 'audited');
+  });
+});
+
+test('M6.4f D34 real engine: near misses do not trigger — substring, other text on the line, indent, case, code span', async () => {
+  await withEngine('d34-near-miss', async (engine, url, token) => {
+    const astra = await openAdapter(url, token, 'astra');
+    const bodies = [
+      'please RELAY-KILL now',
+      'RELAY-KILL is the trigger keyword',
+      '   RELAY-KILL',
+      'relay-kill',
+      'RELAY-KILL!',
+      'the rule says `RELAY-KILL` in a code span on a longer line',
+      '\tRELAY-KILL',
+    ];
+    for (const [i, body] of bodies.entries()) {
+      astra.send({ type: 'captured', body, sourceRef: `d34-nm-${i}` });
+      await pause(100);
+      assert.equal(engine.store.paused(), false, `near miss does not trigger: ${JSON.stringify(body)}`);
+    }
+    assert.ok(!engine.store.recentAudit(100).some((e) => e.event === 'relay_kill_astra'), 'no relay kill audited');
+  });
+});
+
+test('M6.4f D34 real engine: only astra replies trigger — codex, hermes and GUI text with the exact line do not', async () => {
+  await withEngine('d34-sources', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    codex.send({ type: 'captured', body: 'RELAY-KILL', sourceRef: 'd34-src-1' });
+    await pause(120);
+    assert.equal(engine.store.paused(), false, 'a codex capture with the exact line does nothing');
+    hermes.send({ type: 'captured', body: 'RELAY-KILL', sourceRef: 'd34-src-2' });
+    await pause(120);
+    assert.equal(engine.store.paused(), false, 'a hermes capture with the exact line does nothing');
+    gui.send({ type: 'send', body: 'RELAY-KILL', targets: ['codex'] });
+    await pause(120);
+    assert.equal(engine.store.paused(), false, 'the user sending the line does nothing');
+    assert.ok(!engine.store.recentAudit(100).some((e) => e.event === 'relay_kill_astra'), 'nothing audited as a relay kill');
+  });
+});
+
+test('M6.4f D34 real engine: with auto-forward ON the killing reply is not forwarded and the pending auto-forward is cancelled', async () => {
+  await withEngine('d34-no-forward', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    await openHermesAdapter(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoSend: true, autoSendDelaySec: 30, autoForwardAstra: true });
+    await pause(250);
+    // A normal reply arms the auto-forward countdown to Hermes.
+    astra.send({ type: 'captured', body: 'forward me when the countdown ends', sourceRef: 'd34-f-1' });
+    const cd = (await nextMatching(gui, (f) => f.type === 'countdown' && f.target === 'hermes'
+      && typeof f.seconds === 'number', 'the armed countdown')) as { messageId: string };
+    // The killing reply: stored and shown, forwarded to no one.
+    astra.send({ type: 'captured', body: 'RELAY-KILL', sourceRef: 'd34-f-2' });
+    const cap = (await nextMatching(gui, (f) => f.type === 'transcript_update'
+      && (f.message as { body?: string } | undefined)?.body === 'RELAY-KILL',
+      'the killing reply is stored and shown')).message as { id: string };
+    await nextMatching(gui, (f) => f.type === 'countdown' && f.target === 'hermes'
+      && f.messageId === cd.messageId && f.seconds === null, 'the pending auto-forward is cancelled');
+    assert.equal(engine.store.getDelivery(cap.id, 'hermes'), null, 'the killing reply is never forwarded to Hermes');
+    assert.equal(engine.store.getDelivery(cap.id, 'codex'), null, 'nor onward to Codex');
+    assert.equal(engine.store.getDelivery(cd.messageId, 'hermes')?.status, 'pending_approval', 'the pending row stays pending');
+    assert.equal(engine.store.paused(), true, 'the relay is stopped');
+    assert.equal(engine.store.autoForwardAstra(), true, 'the switch stays as set');
+    const audits = engine.store.recentAudit(100);
+    assert.ok(!audits.some((e) => e.event === 'auto_forward' && e.messageId === cap.id), 'no auto-forward audit row for the killing reply');
+    assert.ok(audits.some((e) => e.event === 'relay_kill_astra' && e.messageId === cap.id), 'audited as relay_kill_astra');
+  });
+});
