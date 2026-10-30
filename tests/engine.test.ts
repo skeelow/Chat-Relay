@@ -129,9 +129,11 @@ async function openClient(url: string, token: string): Promise<Client> {
 async function openAdapter(url: string, token: string, name: string): Promise<Client> {
   const client = await openClient(url, token);
   client.send({ type: 'hello', name, version: '0.0.0-test' });
-  if (name === 'codex') {
+  if (name === 'codex' || name === 'astra') {
     // M2.2: every codex hello is followed by a config frame — consume it so
     // callers see only delivery traffic. The config tests read it raw below.
+    // M6.4e (D36): astra now gets its own config frame the same way —
+    // consume it here too so the existing astra tests see no new traffic.
     const config = await client.nextMessage();
     assert.equal(config.type, 'config');
   }
@@ -1458,8 +1460,10 @@ test('stop: in-flight rows return to pending with the right notes within 1s, and
     assertDeliveryUpdate(waitingUpdate, waiting.id, 'codex', 'pending_approval', 0);
     assert.equal(waitingUpdate.error, 'stopped — approve again after you resume');
     assert.deepEqual(pauseFrame, { type: 'pause_update', paused: true });
-    // The interrupt goes to the connected codex adapter only:
+    // The interrupt goes to the connected adapters (M6.4e: codex and astra —
+    // the extension cancels a pending auto-Send click on it):
     assert.deepEqual(await codex.nextMessage(), { type: 'interrupt' });
+    assert.deepEqual(await astra.nextMessage(), { type: 'interrupt' });
     await astra.expectSilence(300);
     // The store agrees, and the stopped state persists:
     assert.equal(engine.store.getDelivery(flyingId, 'codex')?.error,
@@ -2022,6 +2026,7 @@ test('set_mode: GUI sockets only; partial frames change only their fields; inval
     gui.send({ type: 'set_mode', turnCap: 12 });
     assert.deepEqual(await gui.nextMessage(), {
       type: 'settings_update', mode: 'manual', turnCap: 12, autoSend: false, autoSendDelaySec: 10,
+      autoForwardAstra: false, extClicksSend: false,
     }, 'a partial frame changes only its field; the broadcast carries the whole object');
 
     gui.send({ type: 'set_mode', mode: 'approve_each', turnCap: 99 }); // one bad field poisons all
@@ -2031,7 +2036,8 @@ test('set_mode: GUI sockets only; partial frames change only their fields; inval
     const late = await openClient(url, token);
     late.send({ type: 'gui_hello' });
     const snapshot = await late.nextMessage() as { settings?: { mode?: string; turnCap?: number; autoSend?: boolean; autoSendDelaySec?: number } };
-    assert.deepEqual(snapshot.settings, { mode: 'manual', turnCap: 12, autoSend: false, autoSendDelaySec: 10 },
+    assert.deepEqual(snapshot.settings, { mode: 'manual', turnCap: 12, autoSend: false, autoSendDelaySec: 10,
+      autoForwardAstra: false, extClicksSend: false },
       'the rejected frames changed nothing');
   });
 });
@@ -2049,6 +2055,7 @@ test('set_mode: a full valid frame applies everything and the settings survive a
       gui.send({ type: 'set_mode', mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300 });
       assert.deepEqual(await gui.nextMessage(), {
         type: 'settings_update', mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300,
+        autoForwardAstra: false, extClicksSend: false,
       });
       engine.stop();
     }
@@ -2059,7 +2066,8 @@ test('set_mode: a full valid frame applies everything and the settings survive a
       const gui = await openClient(url, token);
       gui.send({ type: 'gui_hello' });
       const snapshot = await gui.nextMessage() as { settings?: unknown };
-      assert.deepEqual(snapshot.settings, { mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300 });
+      assert.deepEqual(snapshot.settings, { mode: 'approve_each', turnCap: 5, autoSend: true, autoSendDelaySec: 300,
+        autoForwardAstra: false, extClicksSend: false });
       engine.stop();
     }
   } finally {
@@ -2491,6 +2499,9 @@ test('Stop cancels every countdown, leaves the rows pending; Resume starts nothi
       && f.messageId === id), true, 'the countdown ended');
     clock.advance(60000);
     await pause(300);
+    // M6.4e (D36): the Stop's interrupt reaches the astra adapter (cancel a
+    // pending auto-Send click); beyond it, nothing delivers.
+    assert.deepEqual(await astra.nextMessage(), { type: 'interrupt' });
     await astra.expectSilence(300);
     gui.send({ type: 'resume' });
     await pause(300);
@@ -2627,6 +2638,9 @@ test('while stopped, an auto capture creates no row and no hold; Resume starts n
     const astra = await openAdapter(url, token, 'astra');
     gui.send({ type: 'stop' });
     await pause(300);
+    // M6.4e (D36): the Stop's interrupt reaches astra too — the extension
+    // cancels a pending auto-Send click on it.
+    assert.deepEqual(await astra.nextMessage(), { type: 'interrupt' });
     const seed = engine.store.insertMessage({ source: 'user', targets: ['user'], body: 'seed', hop: 0 });
     engine.store.insertDelivery(seed.id, 'codex');
     engine.store.markStatus(seed.id, 'codex', 'queued');
@@ -2966,4 +2980,130 @@ test('session summary: nothing is persisted — a restarted engine starts from z
   } finally {
     cleanupDir(dir);
   }
+});
+
+// --- M6.4e: the D35 auto-forward switch and the D36 extension auto-Send ---
+
+test('M6.4e set_mode: the two switches apply, broadcast, and survive a restart; invalid values are ignored whole', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-engine-m64e-switches-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    { // Run 1: the GUI flips both switches on.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openGui(url, token);
+      gui.send({ type: 'set_mode', autoForwardAstra: true, extClicksSend: true });
+      assert.deepEqual(await gui.nextMessage(), {
+        type: 'settings_update', mode: 'manual', turnCap: 4, autoSend: false, autoSendDelaySec: 10,
+        autoForwardAstra: true, extClicksSend: true,
+      }, 'the broadcast carries the whole settings object with the switches');
+      assert.equal(engine.store.autoForwardAstra(), true, 'the D35 switch is persisted engine-side');
+      assert.equal(engine.store.extClicksSend(), true, 'the D36 switch is persisted engine-side');
+      engine.stop();
+    }
+    { // Run 2: the snapshot proves persistence; an invalid switch is ignored whole.
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      const gui = await openClient(url, token);
+      gui.send({ type: 'gui_hello' });
+      const snapshot = await gui.nextMessage() as { settings?: { autoForwardAstra?: boolean; extClicksSend?: boolean } };
+      assert.equal(snapshot.settings?.autoForwardAstra, true, 'the D35 switch survives an engine restart');
+      assert.equal(snapshot.settings?.extClicksSend, true, 'the D36 switch survives an engine restart');
+      gui.send({ type: 'set_mode', autoForwardAstra: 'yes' });
+      gui.send({ type: 'set_mode', mode: 'manual', extClicksSend: 1 });
+      await gui.expectSilence(300);
+      assert.equal(engine.store.autoForwardAstra(), true, 'a non-boolean switch value changes nothing');
+      assert.equal(engine.store.extClicksSend(), true);
+      engine.stop();
+    }
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test('M6.4e D36: astra hello is answered with config {extClicksSend}; a change pushes a fresh config to the connected extension', async () => {
+  await withEngine('astra-config', async (_engine, url, token) => {
+    const astra = await openClient(url, token);
+    astra.send({ type: 'hello', name: 'astra', version: '0.0.0-test' });
+    assert.deepEqual(await astra.nextMessage(), { type: 'config', extClicksSend: false },
+      'the engine sends the switch state to the extension right after hello');
+    const gui = await openGui(url, token);
+    gui.send({ type: 'set_mode', extClicksSend: true });
+    assert.deepEqual(await astra.nextMessage(), { type: 'config', extClicksSend: true },
+      'a change to the switch is pushed to the connected adapter');
+    gui.send({ type: 'set_mode', autoForwardAstra: true });
+    await astra.expectSilence(200); // an unrelated change does not re-push the extension config
+  });
+});
+
+test('M6.4e D36: Stop and Kill send interrupt to the connected astra adapter (cancel a pending auto-send)', async () => {
+  await withEngine('astra-interrupt', async (_engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra'); // the config is consumed by the helper
+    gui.send({ type: 'stop' });
+    assert.deepEqual(await astra.nextMessage(), { type: 'interrupt' }, 'Stop cancels a pending auto-send');
+    gui.send({ type: 'resume' });
+    await pause(100);
+    gui.send({ type: 'kill' });
+    assert.deepEqual(await astra.nextMessage(), { type: 'interrupt' }, 'Kill cancels it too');
+  });
+});
+
+test('M6.4e D36 audit: a delivered ack with autoSend:true writes one auto_send row; a plain ack writes none', async () => {
+  await withEngine('auto-send-audit', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const id = engine.store.insertMessage({ source: 'user', targets: ['astra'], body: 'auto send me', hop: 0 }).id;
+    gui.send({ type: 'approve', messageId: id, target: 'astra' });
+    const deliver = await astra.nextMessage();
+    assert.equal(deliver.type, 'deliver');
+    astra.send({ type: 'delivered', messageId: id, autoSend: true });
+    for (;;) { // wait for the delivered update to land before reading the audit
+      const upd = await gui.nextMessage();
+      if (upd.type === 'delivery_update' && upd.status === 'delivered') break;
+    }
+    const rows = engine.store.recentAudit(50);
+    assert.equal(rows.filter((e) => e.event === 'auto_send').length, 1, 'exactly one auto_send audit row');
+    const row = rows.find((e) => e.event === 'auto_send');
+    assert.equal(row?.messageId, id);
+    assert.equal(row?.target, 'astra');
+    const id2 = engine.store.insertMessage({ source: 'user', targets: ['astra'], body: 'plain typed', hop: 0 }).id;
+    gui.send({ type: 'approve', messageId: id2, target: 'astra' });
+    const deliver2 = await astra.nextMessage();
+    assert.equal(deliver2.type, 'deliver');
+    astra.send({ type: 'delivered', messageId: id2 }); // no flag: typed, the human clicks
+    for (;;) {
+      const upd = await gui.nextMessage();
+      if (upd.type === 'delivery_update' && upd.status === 'delivered') break;
+    }
+    assert.equal(engine.store.recentAudit(50).filter((e) => e.event === 'auto_send').length, 1,
+      'a plain typed delivery is not an auto-send');
+  });
+});
+
+test('M6.4e D35: engine enforcement — with the switch off no capture ever routes into Hermes, and an adapter cannot flip the switch', async () => {
+  await withEngine('d35-off', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoSend: true, autoSendDelaySec: 3 });
+    await pause(200);
+    // The switch was never turned on: an astra capture routes to Codex only.
+    astra.send({ type: 'captured', body: 'not forwarded', sourceRef: 'd35off-1' });
+    await pause(600);
+    const cap = engine.store.recentMessages(1)[0];
+    assert.equal(engine.store.getDelivery(cap.id, 'codex')?.status, 'pending_approval', 'the Codex row is the existing behaviour');
+    assert.equal(engine.store.getDelivery(cap.id, 'hermes'), null, 'switch off: nothing auto-routes into Hermes');
+    // An adapter socket cannot flip the switch: set_mode is GUI-only.
+    astra.send({ type: 'set_mode', autoForwardAstra: true });
+    await pause(200);
+    assert.equal(engine.store.autoForwardAstra(), false, 'an adapter frame changed nothing');
+    astra.send({ type: 'captured', body: 'still not forwarded', sourceRef: 'd35off-2' });
+    await pause(600);
+    const cap2 = engine.store.recentMessages(1)[0];
+    assert.equal(engine.store.getDelivery(cap2.id, 'hermes'), null, 'the engine, not the GUI, decides');
+    gui.send({ type: 'reject', messageId: cap.id, target: 'codex' });
+  });
 });

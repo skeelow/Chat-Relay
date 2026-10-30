@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  autoForwardBadge,
   delayToSeconds,
   isDelayValid,
   isTurnCapValid,
@@ -16,7 +17,8 @@ import {
 } from '../app/src/settings.ts';
 
 const server = (over: Partial<RelaySettings> = {}): RelaySettings => ({
-  mode: 'manual', turnCap: 4, autoSend: false, autoSendDelaySec: 10, ...over,
+  mode: 'manual', turnCap: 4, autoSend: false, autoSendDelaySec: 10,
+  autoForwardAstra: false, extClicksSend: false, ...over,
 });
 
 test('delayToSeconds: seconds and minutes convert; the reverse round-trips', () => {
@@ -70,4 +72,19 @@ test('modeLabel and the exact set_mode frames', () => {
   assert.equal(JSON.stringify(setModeFrame({ turnCap: 5 })), '{"type":"set_mode","turnCap":5}');
   assert.equal(JSON.stringify(setModeFrame({ autoSend: true, autoSendDelaySec: 300 })),
     '{"type":"set_mode","autoSend":true,"autoSendDelaySec":300}');
+});
+
+test('M6.4e: the two switches default off in the panel state; their frames are exact; the badge reads the D35 switch', () => {
+  const controls = settingsControls(server());
+  assert.deepEqual(controls, {
+    mode: 'manual', turnCap: '4', autoSend: false, delay: { value: 10, unit: 'seconds' },
+  }, 'the existing panel state is unchanged');
+  assert.equal(server().autoForwardAstra, false, 'D35 default: off');
+  assert.equal(server().extClicksSend, false, 'D36 default: off');
+  assert.equal(autoForwardBadge(false), '', 'off: no badge');
+  assert.equal(autoForwardBadge(true), 'Auto-forward → Hermes ON', 'on: the badge is unmistakable');
+  assert.equal(JSON.stringify(setModeFrame({ autoForwardAstra: true })),
+    '{"type":"set_mode","autoForwardAstra":true}');
+  assert.equal(JSON.stringify(setModeFrame({ extClicksSend: false })),
+    '{"type":"set_mode","extClicksSend":false}');
 });

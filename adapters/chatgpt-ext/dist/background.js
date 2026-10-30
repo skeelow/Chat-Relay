@@ -9,6 +9,12 @@
   function statusToReplayAfterHello(latest) {
     return latest !== null && latest !== "idle" ? latest : null;
   }
+  var AUTO_SEND_MIN_GAP_MS = 5e3;
+  function autoSendClickPlan(enabled, nowMs, lastClickMs) {
+    if (!enabled) return { click: false, delayMs: 0 };
+    const wait = lastClickMs === null ? 0 : AUTO_SEND_MIN_GAP_MS - (nowMs - lastClickMs);
+    return { click: true, delayMs: wait > 0 ? wait : 0 };
+  }
   function deliveryTabDecision(knownTabId) {
     if (knownTabId === null) {
       return {
@@ -20,7 +26,7 @@
   }
 
   // adapters/chatgpt-ext/src/background.ts
-  var BUILD_MARKER = "2026-10-22.1";
+  var BUILD_MARKER = "2026-10-30.1";
   console.log("[relay-astra worker] service worker started", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -40,6 +46,8 @@
   var PING_INTERVAL_MS = 2e4;
   var MAX_PERSISTED_QUEUE = 20;
   var PING_FRAME = JSON.stringify({ type: "ping" });
+  var AUTO_SEND_CONFIG_KEY = "extClicksSend";
+  var AUTO_SEND_AT_KEY = "lastAutoSendAt";
   var maybeChrome = globalThis.chrome;
   if (maybeChrome === void 0) {
     throw new Error("[relay-astra worker] no chrome API \u2014 this file must run as the extension service worker");
@@ -110,6 +118,42 @@
     }
     return false;
   }
+  var extClicksSend = false;
+  var lastAutoSendAtMs = null;
+  var pendingAutoSend = null;
+  function cancelPendingAutoSend() {
+    if (pendingAutoSend === null) return;
+    const { messageId, timer } = pendingAutoSend;
+    pendingAutoSend = null;
+    clearTimeout(timer);
+    sendEngineFrame({ type: "failed", messageId, error: "stopped before the click \u2014 nothing was sent to ChatGPT" });
+    console.log("[relay-astra worker] pending auto-send cancelled (Stop/Kill)");
+  }
+  async function clickSend(messageId, tabId) {
+    if (pendingAutoSend === null || pendingAutoSend.messageId !== messageId) return;
+    pendingAutoSend = null;
+    try {
+      const response = await chromeApi.tabs.sendMessage(tabId, { type: "click-send", messageId });
+      if (response?.ok === true && response.clicked === true) {
+        lastAutoSendAtMs = Date.now();
+        void chromeApi.storage.session.set({ [AUTO_SEND_AT_KEY]: lastAutoSendAtMs });
+        sendEngineFrame({ type: "delivered", messageId, autoSend: true });
+        console.log("[relay-astra worker] auto-send: the extension clicked Send");
+      } else {
+        sendEngineFrame({
+          type: "failed",
+          messageId,
+          error: response?.error ?? "the Send button was not found \u2014 the text stays in the box; click Send yourself"
+        });
+      }
+    } catch (err) {
+      sendEngineFrame({
+        type: "failed",
+        messageId,
+        error: `could not reach the ChatGPT tab to click Send \u2014 the text stays in the box: ${String(err).slice(0, 120)}`
+      });
+    }
+  }
   async function deliverToChatGpt(messageId, text) {
     const decision = deliveryTabDecision(lastSenderTabId);
     if (!decision.ok) {
@@ -119,10 +163,23 @@
     const tabId = decision.tabId;
     try {
       const response = await chromeApi.tabs.sendMessage(tabId, { type: "type-relay-text", messageId, text });
-      if (response?.ok === true) {
-        sendEngineFrame({ type: "delivered", messageId });
-      } else {
+      if (response?.ok !== true) {
         sendEngineFrame({ type: "failed", messageId, error: response?.error ?? "the ChatGPT page refused the text" });
+        return;
+      }
+      if (extClicksSend === true) {
+        const plan = autoSendClickPlan(true, Date.now(), lastAutoSendAtMs);
+        if (plan.click) {
+          if (plan.delayMs > 0) {
+            console.log(`[relay-astra worker] auto-send waits ${plan.delayMs}ms (minimum gap)`);
+          }
+          cancelPendingAutoSend();
+          pendingAutoSend = { messageId, timer: setTimeout(() => {
+            void clickSend(messageId, tabId);
+          }, plan.delayMs) };
+        }
+      } else {
+        sendEngineFrame({ type: "delivered", messageId });
       }
     } catch (err) {
       sendEngineFrame({
@@ -138,6 +195,19 @@
       if (typeof record.messageId === "string" && typeof record.text === "string") {
         void deliverToChatGpt(record.messageId, record.text);
       }
+      return;
+    }
+    if (record?.type === "config") {
+      if (typeof record.extClicksSend === "boolean") {
+        extClicksSend = record.extClicksSend;
+        void chromeApi.storage.session.set({ [AUTO_SEND_CONFIG_KEY]: extClicksSend });
+        console.log(`[relay-astra worker] extension-clicks-Send is ${extClicksSend ? "ON" : "off"}`);
+      }
+      return;
+    }
+    if (record?.type === "interrupt") {
+      cancelPendingAutoSend();
+      return;
     }
   }
   function scheduleReconnect() {
@@ -290,9 +360,21 @@
   });
   void restoreQueue().then(() => {
     void restoreSenderTab().then(() => {
-      void connectEngine();
+      void restoreAutoSendState().then(() => {
+        void connectEngine();
+      });
     });
   });
+  async function restoreAutoSendState() {
+    const bag = await chromeApi.storage.session.get(AUTO_SEND_CONFIG_KEY);
+    if (typeof bag[AUTO_SEND_CONFIG_KEY] === "boolean") {
+      extClicksSend = bag[AUTO_SEND_CONFIG_KEY];
+    }
+    const at = await chromeApi.storage.session.get(AUTO_SEND_AT_KEY);
+    if (typeof at[AUTO_SEND_AT_KEY] === "number") {
+      lastAutoSendAtMs = at[AUTO_SEND_AT_KEY];
+    }
+  }
   async function restoreSenderTab() {
     const bag = await chromeApi.storage.session.get(SENDER_TAB_KEY);
     const stored = bag[SENDER_TAB_KEY];

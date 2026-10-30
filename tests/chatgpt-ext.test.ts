@@ -15,6 +15,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  autoSendClickPlan,
+  AUTO_SEND_MIN_GAP_MS,
   deliveryPageDecision,
   deliveryTabDecision,
   isRelayHeaderEcho,
@@ -347,13 +349,54 @@ test('deliveryTabDecision: the latest sender tab wins; no known tab fails at onc
   assert.ok((none.error ?? '').length > 0, 'the no-tab failure carries an actionable error');
 });
 
-test('M3.1 guard: the extension source never presses Send', () => {
+// M6.4e (D36) replaced the M3.1/D10 "never presses Send" guard with the
+// rule the publisher chose: the Send click happens ONLY when the engine's
+// extension-clicks-Send setting is on, on an empty composer, at most once
+// per minimum gap — and the old never-submit/never-keyboard rules stand.
+
+test('M6.4e autoSendClickPlan: no click with the setting off; a click when on; a 5 s minimum gap between clicks', () => {
+  assert.equal(AUTO_SEND_MIN_GAP_MS, 5000, 'the constant: at most one auto-send per 5 s, in one place');
+  assert.deepEqual(autoSendClickPlan(false, 100000, null), { click: false, delayMs: 0 });
+  assert.deepEqual(autoSendClickPlan(false, 100000, 0), { click: false, delayMs: 0 },
+    'off is off whatever the clock says');
+  assert.deepEqual(autoSendClickPlan(true, 100000, null), { click: true, delayMs: 0 },
+    'on with no previous click: click now');
+  assert.deepEqual(autoSendClickPlan(true, 100000, 50000), { click: true, delayMs: 0 },
+    'older than the gap: click now');
+  assert.equal(autoSendClickPlan(true, 100000, 95000).delayMs, 0, 'exactly the gap elapsed: click now');
+  const gated = autoSendClickPlan(true, 100000, 97000);
+  assert.equal(gated.click, true, 'the click is only delayed, never dropped');
+  assert.equal(gated.delayMs, AUTO_SEND_MIN_GAP_MS - 3000, 'inside the gap: wait out the remainder');
+});
+
+test('M6.4e D36 guard: the Send click happens only when the setting is on', () => {
   const srcDir = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'adapters', 'chatgpt-ext', 'src');
   for (const file of ['content.ts', 'background.ts', 'popup.ts', 'options.ts', 'protocol.ts', 'selectors.ts']) {
     const src = readFileSync(join(srcDir, file), 'utf8');
-    assert.ok(!/sendButton[\s\S]{0,80}?\.click\(/.test(src), `${file} must not click the send button`);
+    // The old never-submit rules stand unchanged (D10 carried over).
     assert.ok(!src.includes('requestSubmit'), `${file} must not submit the form`);
     assert.ok(!/\.submit\(/.test(src), `${file} must not submit the form`);
     assert.ok(!/new KeyboardEvent/.test(src), `${file} must not dispatch keyboard events (Enter could submit)`);
+    if (file !== 'content.ts') {
+      assert.ok(!/sendButton[\s\S]{0,120}?\.click\(/.test(src), `${file} must not click the send button`);
+    }
   }
+  // The worker only schedules the click through the plan, and never when the
+  // engine config left the switch off: the click message ('click-send') is
+  // dispatched only after autoSendClickPlan(...).click — there is exactly one
+  // such dispatch site in the worker source.
+  const bg = readFileSync(join(srcDir, 'background.ts'), 'utf8');
+  assert.equal(bg.split("'click-send'").length - 1, 1, 'the worker sends click-send from exactly one place');
+  assert.match(bg, /autoSendClickPlan/, 'that place plans through the pure gate');
+  assert.match(bg, /if \(plan\.click\)/, 'and only clicks when the plan says so');
+  assert.match(bg, /extClicksSend === true/, 'the switch arrives from the engine config');
+  // In the content script the click lives in the click-send handler, never
+  // in the type path (typing alone still sends nothing).
+  const content = readFileSync(join(srcDir, 'content.ts'), 'utf8');
+  const clickIdx = content.search(/sendButton[\s\S]{0,120}?\.click\(/);
+  const typeIdx = content.indexOf('function typeRelayText');
+  assert.ok(clickIdx >= 0, 'content.ts clicks the send button somewhere');
+  assert.ok(typeIdx >= 0);
+  assert.ok(clickIdx < typeIdx, 'the click is in the click-send handler, not the type path');
+  assert.equal(content.split('.click(').length - 1, 1, 'content.ts clicks exactly one thing — the send button');
 });

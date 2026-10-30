@@ -12,6 +12,10 @@ export interface RelaySettings {
   turnCap: number;
   autoSend: boolean;
   autoSendDelaySec: number;
+  /** M6.4e (D35): auto-forward captured Astra replies to Hermes. Off by default. */
+  autoForwardAstra: boolean;
+  /** M6.4e (D36): the extension clicks Send after typing into an empty composer. Off by default. */
+  extClicksSend: boolean;
 }
 
 export const TURN_CAP_MIN = 1;
@@ -51,6 +55,14 @@ export function modeLabel(mode: string): string {
 }
 
 /**
+ * M6.4e (D35): the header badge for the auto-forward switch — the state is
+ * shown clearly, not just ticked in a hidden panel. Off: no badge at all.
+ */
+export function autoForwardBadge(on: boolean): string {
+  return on ? 'Auto-forward → Hermes ON' : '';
+}
+
+/**
  * The panel's control state for a server value: which radio is checked, the
  * cap box's text, the checkbox, and the delay box/unit. Pure — the renderer
  * just applies it, so the panel can only ever show the server's truth.
@@ -75,6 +87,8 @@ export function setModeFrame(update: {
   turnCap?: number;
   autoSend?: boolean;
   autoSendDelaySec?: number;
+  autoForwardAstra?: boolean;   // M6.4e (D35)
+  extClicksSend?: boolean;      // M6.4e (D36)
 }): { type: 'set_mode' } & Record<string, unknown> {
   return { type: 'set_mode', ...update };
 }

@@ -50,6 +50,17 @@
 //   engine → GUI    {type:'session_summary', turnsUsed, held,    M5.2: broadcast on any change
 //                    approvalsPending, since}                      of the three; one session is
 //                                                                     one engine run
+//   engine → adapter {type:'config', extClicksSend}              M6.4e (D36): to astra on hello
+//                                                                     and whenever set_mode changes
+//                                                                     the switch — the auto-Send
+//                                                                     setting, engine-side truth
+//   adapter → engine {type:'delivered', autoSend?}               M6.4e: the extension flags an
+//                                                                     ack whose text it clicked
+//                                                                     Send for; each flag is
+//                                                                     audited (auto_send)
+//   GUI → engine    {type:'set_mode', autoForwardAstra?, extClicksSend?}  M6.4e (D35/D36):
+//                                                                     the two switches, added to
+//                                                                     the D16 set_mode fields
 //
 // The token comes from %APPDATA%\RelayChat\token (created with a random value on
 // first start). The token value is never logged. Hard rule: local only — the server
@@ -191,14 +202,21 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   // M4.2 (D16): the relay settings, persisted in the settings table and
   // cached here — a restart reads them back (the snapshot proves it).
   // M5.1: 'auto' is a real mode now.
+  // M6.4e: two switches ride along — D35 auto-forward Astra→Hermes (the
+  // engine decides; the GUI only asks), D36 extension-clicks-Send (pushed
+  // to the astra adapter in a config frame).
   const settings = {
     mode: store.relayMode() as 'manual' | 'approve_each' | 'auto',
     turnCap: store.turnCap(),
     autoSend: store.autoSend(),
     autoSendDelaySec: store.autoSendDelaySec(),
+    autoForwardAstra: store.autoForwardAstra(),
+    extClicksSend: store.extClicksSend(),
   };
-  const settingsView = (): { mode: string; turnCap: number; autoSend: boolean; autoSendDelaySec: number } =>
-    ({ ...settings });
+  const settingsView = (): {
+    mode: string; turnCap: number; autoSend: boolean; autoSendDelaySec: number;
+    autoForwardAstra: boolean; extClicksSend: boolean;
+  } => ({ ...settings });
 
   // M3.2b (D12-1): the stopped state is a persisted setting — a restarted
   // engine that was stopped stays stopped, until the user resumes.
@@ -606,6 +624,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 ws.send(JSON.stringify({ type: 'config', threadId }));
               }
             }
+            if (name === 'astra') {
+              // M6.4e (D36): the extension's config is the auto-Send switch —
+              // sent right after hello, and re-pushed whenever set_mode changes
+              // it, so a worker restart or a fresh browser session gets the
+              // engine's truth, not a stale page.
+              ws.send(JSON.stringify({ type: 'config', extClicksSend: settings.extClicksSend }));
+            }
             // M2.1: approved items waiting for this adapter go out now,
             // oldest first, each exactly once (each leaves 'queued').
             // M3.2b (D12-3): while stopped, a hello flushes nothing.
@@ -660,26 +685,45 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               // out of Hermes. The "other AI" logic stays strictly
               // Astra <-> Codex: a Hermes capture creates no row and no
               // countdown in any mode, and an Astra/Codex capture never
-              // targets Hermes.
+              // targets Hermes —
+              //
+              // M6.4e (D35) exception: when the owner turns on the
+              // auto-forward switch, a captured Astra reply ALSO routes to
+              // Hermes through the same machinery — the same pending row,
+              // the same turn cap, the same countdown, perm always
+              // Conversation, each forward audited without bodies. Codex→
+              // Hermes and everything out of Hermes stay manual.
               if (message.source !== 'user' && settings.mode !== 'manual') {
                 let other: Participant | null = null;
                 if (message.source === 'astra') other = 'codex';
                 else if (message.source === 'codex') other = 'astra';
                 // source === 'hermes': other stays null -> no row, no countdown.
-                if (other !== null) {
+                const autoTargets: Participant[] = [];
+                if (other !== null) autoTargets.push(other);
+                if (message.source === 'astra' && settings.autoForwardAstra) autoTargets.push('hermes');
+                const routeCapture = (target: Participant): void => {
+                  if (store.getDelivery(message.id, target) !== null) return;
+                  store.insertDelivery(message.id, target);
+                  if (target === 'hermes') {
+                    // D35: engine-side enforcement of the permission level —
+                    // an auto-forward is Conversation, always, never Work/Full.
+                    store.setDeliveryPerm(message.id, target, 'conversation');
+                    store.appendAudit({ actor: 'engine', event: 'auto_forward', target: 'hermes', messageId: message.id });
+                  }
+                  broadcastDeliveryUpdate(message.id, target);
+                  if (settings.mode === 'auto' && settings.autoSend) startCountdown(message.id, target);
+                };
+                if (autoTargets.length > 0) {
                   if (settings.mode === 'auto') {
                     if (paused) {
                       console.log(`[engine] auto capture ${message.id} stored without routing (the relay is stopped)`);
                     } else if (isOverTurnCap(message.hop, settings.turnCap)) {
                       holdMessage(message.id, message.hop, settings.turnCap);
-                    } else if (store.getDelivery(message.id, other) === null) {
-                      store.insertDelivery(message.id, other);
-                      broadcastDeliveryUpdate(message.id, other);
-                      if (settings.autoSend) startCountdown(message.id, other);
+                    } else {
+                      for (const target of autoTargets) routeCapture(target);
                     }
-                  } else if (store.getDelivery(message.id, other) === null) {
-                    store.insertDelivery(message.id, other);
-                    broadcastDeliveryUpdate(message.id, other);
+                  } else {
+                    for (const target of autoTargets) routeCapture(target);
                   }
                 }
               }
@@ -861,6 +905,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const messageId = record.messageId;
             if (typeof messageId !== 'string') return;
             const row = store.getDelivery(messageId, target);
+            // M6.4e (D36): the extension flags an ack whose text it clicked
+            // Send for; every such click is audited (event name, no body).
+            const auditAutoSend = (): void => {
+              if (target === 'astra' && record.autoSend === true) {
+                store.appendAudit({ actor: 'astra', event: 'auto_send', target: 'astra', messageId });
+              }
+            };
             if (record.type === 'delivered' &&
                 row !== null && row.status === 'failed' && row.error === 'no confirmation from adapter') {
               // E1: the ack only lost the race with the timer — the adapter
@@ -868,6 +919,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               // adapter itself reported failure, or a replacement) stays failed.
               store.markStatus(messageId, target, 'delivered');
               if (target === 'hermes') store.appendAudit({ actor: 'hermes', event: 'hermes_delivered', target: 'hermes', messageId });
+              auditAutoSend();
               clearAckTimer(messageId, target);
               broadcastDeliveryUpdate(messageId, target);
               return;
@@ -876,6 +928,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (record.type === 'delivered') {
               store.markStatus(messageId, target, 'delivered');
               if (target === 'hermes') store.appendAudit({ actor: 'hermes', event: 'hermes_delivered', target: 'hermes', messageId });
+              auditAutoSend();
             } else {
               const error = typeof record.error === 'string' && record.error.length > 0
                 ? record.error
@@ -939,7 +992,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             // M3.2b / M6.2: Stop interrupts the active runs on both codex
             // and hermes (best effort). Their in-flight rows were returned
             // to pending_approval by enterStoppedState.
-            for (const participant of ['codex', 'hermes'] as const) {
+            // M6.4e (D36): astra gets the same interrupt — the extension
+            // cancels a pending auto-Send click before it fires.
+            for (const participant of ['astra', 'codex', 'hermes'] as const) {
               const sock = adapterSocketFor(participant);
               if (sock !== null) sock.send(JSON.stringify({ type: 'interrupt' }));
             }
@@ -961,7 +1016,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (hermesSock !== null) hermesSock.send(JSON.stringify({ type: 'kill' }));
             const codexSock = adapterSocketFor('codex');
             if (codexSock !== null) codexSock.send(JSON.stringify({ type: 'interrupt' }));
-            console.log(`[engine] kill: stopped; ${returned} in-flight row(s) returned; kill→hermes, interrupt→codex`);
+            // M6.4e (D36): Kill stops auto-send too — cancel the pending click.
+            const astraSock = adapterSocketFor('astra');
+            if (astraSock !== null) astraSock.send(JSON.stringify({ type: 'interrupt' }));
+            console.log(`[engine] kill: stopped; ${returned} in-flight row(s) returned; kill→hermes, interrupt→codex+astra`);
             return;
           }
           case 'resume': {
@@ -1077,6 +1135,10 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             const update = validateModeUpdate({
               mode: record.mode, turnCap: record.turnCap,
               autoSend: record.autoSend, autoSendDelaySec: record.autoSendDelaySec,
+              // M6.4e (D35/D36): the two switches ride the same frame; the
+              // engine, not the GUI, decides — they only change the cached,
+              // persisted settings below.
+              autoForwardAstra: record.autoForwardAstra, extClicksSend: record.extClicksSend,
             });
             if (update === null) {
               console.log(`[engine] set_mode ignored (invalid frame): ${JSON.stringify(record)}`);
@@ -1085,6 +1147,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             // M6.4a: every valid set_mode frame is audited (no message body here).
             store.appendAudit({ actor: 'gui', event: 'set_mode', detail: JSON.stringify(update) });
             const before = JSON.stringify(settingsView());
+            const extBefore = settings.extClicksSend;
             if (update.mode !== undefined) { settings.mode = update.mode; store.setRelayMode(update.mode); }
             if (update.turnCap !== undefined) { settings.turnCap = update.turnCap; store.setTurnCap(update.turnCap); }
             if (update.autoSend !== undefined) { settings.autoSend = update.autoSend; store.setAutoSend(update.autoSend); }
@@ -1092,9 +1155,28 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               settings.autoSendDelaySec = update.autoSendDelaySec;
               store.setAutoSendDelaySec(update.autoSendDelaySec);
             }
+            // M6.4e: the two switches. Engine-side persisted — the engine,
+            // not the GUI, decides; with D35 off the captured routing above
+            // is exactly as before.
+            if (update.autoForwardAstra !== undefined) {
+              settings.autoForwardAstra = update.autoForwardAstra;
+              store.setAutoForwardAstra(update.autoForwardAstra);
+            }
+            if (update.extClicksSend !== undefined) {
+              settings.extClicksSend = update.extClicksSend;
+              store.setExtClicksSend(update.extClicksSend);
+            }
             if (JSON.stringify(settingsView()) !== before) {
               console.log(`[engine] settings changed: ${JSON.stringify(settingsView())}`);
               broadcast({ type: 'settings_update', ...settingsView() });
+            }
+            // M6.4e (D36): a fresh extension-clicks-Send value is pushed to
+            // the connected astra adapter immediately — hello is not enough.
+            if (settings.extClicksSend !== extBefore) {
+              const astraSock = adapterSocketFor('astra');
+              if (astraSock !== null) {
+                astraSock.send(JSON.stringify({ type: 'config', extClicksSend: settings.extClicksSend }));
+              }
             }
             // M5.1 (D18-4): leaving Auto or unticking auto_send cancels every
             // running countdown — the rows stay pending, nothing delivers.

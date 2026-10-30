@@ -385,6 +385,9 @@
     if (mode === "auto") return "Auto";
     return "Manual";
   }
+  function autoForwardBadge(on) {
+    return on ? "Auto-forward \u2192 Hermes ON" : "";
+  }
   function settingsControls(server) {
     return {
       mode: server.mode,
@@ -523,6 +526,9 @@
   var autoSendInput = document.getElementById("auto-send");
   var autoSendDelayInput = document.getElementById("auto-send-delay");
   var autoSendUnitInput = document.getElementById("auto-send-unit");
+  var autoForwardInput = document.getElementById("auto-forward-astra");
+  var extClicksInput = document.getElementById("ext-clicks-send");
+  var autoForwardBadgeEl = document.getElementById("auto-forward-badge");
   var searchButton = document.getElementById("search-btn");
   var searchPanel = document.getElementById("search");
   var searchInput = document.getElementById("search-input");
@@ -653,6 +659,8 @@
     if (autoSendInput !== null) autoSendInput.disabled = !on;
     if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
     if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
+    if (autoForwardInput !== null) autoForwardInput.disabled = !on;
+    if (extClicksInput !== null) extClicksInput.disabled = !on;
     if (killButton !== null) killButton.disabled = !on;
     if (auditButton !== null) auditButton.disabled = !on;
     if (auditRefreshButton !== null) auditRefreshButton.disabled = !on;
@@ -695,6 +703,17 @@
     if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
     if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
     if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
+    if (autoForwardInput !== null) {
+      autoForwardInput.disabled = !engineOnline;
+      autoForwardInput.checked = relaySettings.autoForwardAstra === true;
+    }
+    if (extClicksInput !== null) {
+      extClicksInput.disabled = !engineOnline;
+      extClicksInput.checked = relaySettings.extClicksSend === true;
+    }
+    if (autoForwardBadgeEl !== null) {
+      autoForwardBadgeEl.textContent = autoForwardBadge(relaySettings.autoForwardAstra === true);
+    }
     if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
     if (settingsHint !== null) settingsHint.textContent = "";
     console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
@@ -1020,7 +1039,9 @@
         mode: frame.mode === "approve_each" ? "approve_each" : frame.mode === "auto" ? "auto" : "manual",
         turnCap: typeof frame.turnCap === "number" ? frame.turnCap : 4,
         autoSend: frame.autoSend === true,
-        autoSendDelaySec: typeof frame.autoSendDelaySec === "number" ? frame.autoSendDelaySec : 10
+        autoSendDelaySec: typeof frame.autoSendDelaySec === "number" ? frame.autoSendDelaySec : 10,
+        autoForwardAstra: frame.autoForwardAstra === true,
+        extClicksSend: frame.extClicksSend === true
       };
       renderSettings();
       return;
@@ -1273,6 +1294,18 @@
   if (autoSendUnitInput !== null) {
     autoSendUnitInput.disabled = true;
     autoSendUnitInput.addEventListener("change", submitDelay);
+  }
+  if (autoForwardInput !== null) {
+    autoForwardInput.disabled = true;
+    autoForwardInput.addEventListener("change", () => {
+      sendFrameToEngine(setModeFrame({ autoForwardAstra: autoForwardInput.checked }));
+    });
+  }
+  if (extClicksInput !== null) {
+    extClicksInput.disabled = true;
+    extClicksInput.addEventListener("change", () => {
+      sendFrameToEngine(setModeFrame({ extClicksSend: extClicksInput.checked }));
+    });
   }
   var submitSearch = () => {
     if (searchInput === null) return;

@@ -504,6 +504,34 @@ test('relay settings: defaults, accessors and persistence across a reopen', () =
   }
 });
 
+test('M6.4e settings: auto_forward_astra and ext_clicks_send default off, store "1" or absent, survive restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-m64e-settings-'));
+  try {
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.autoForwardAstra(), false, 'the D35 switch is off by default');
+      assert.equal(store.extClicksSend(), false, 'the D36 switch is off by default');
+      store.setAutoForwardAstra(true);
+      store.setExtClicksSend(true);
+      assert.equal(store.getSetting('auto_forward_astra'), '1', '"1" or absent — never another value');
+      assert.equal(store.getSetting('ext_clicks_send'), '1');
+      store.close();
+    }
+    {
+      const store = openStore(join(dir, 'relay.db'));
+      assert.equal(store.autoForwardAstra(), true, 'the D35 switch survives a restart');
+      assert.equal(store.extClicksSend(), true, 'the D36 switch survives a restart');
+      store.setAutoForwardAstra(false);
+      assert.equal(store.autoForwardAstra(), false);
+      assert.equal(store.getSetting('auto_forward_astra'), null, 'clearing removes the key entirely');
+      store.close();
+    }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); }
+    catch (err) { console.warn(`[test] could not remove temp dir ${dir}: ${String(err)}`); }
+  }
+});
+
 test('validateModeUpdate: good and bad values per field; one bad field poisons the frame', () => {
   assert.deepEqual(validateModeUpdate({}), {}, 'an empty frame is valid — it changes nothing');
   assert.deepEqual(validateModeUpdate({ mode: 'manual' }), { mode: 'manual' });
@@ -529,6 +557,19 @@ test('validateModeUpdate: good and bad values per field; one bad field poisons t
     { mode: 'approve_each', turnCap: 2, autoSend: true, autoSendDelaySec: 300 });
   assert.equal(validateModeUpdate({ mode: 'manual', turnCap: 99 }), null,
     'one invalid field ignores the whole frame');
+});
+
+test('M6.4e validateModeUpdate: the two switch fields must be booleans', () => {
+  assert.deepEqual(validateModeUpdate({ autoForwardAstra: true }), { autoForwardAstra: true });
+  assert.deepEqual(validateModeUpdate({ autoForwardAstra: false }), { autoForwardAstra: false });
+  assert.deepEqual(validateModeUpdate({ extClicksSend: true }), { extClicksSend: true });
+  assert.deepEqual(validateModeUpdate({ extClicksSend: false }), { extClicksSend: false });
+  assert.equal(validateModeUpdate({ autoForwardAstra: 'yes' }), null);
+  assert.equal(validateModeUpdate({ extClicksSend: 1 }), null);
+  assert.equal(validateModeUpdate({ autoForwardAstra: true, turnCap: 99 }), null,
+    'a bad old field still poisons a frame that carries a switch');
+  assert.deepEqual(validateModeUpdate({ autoForwardAstra: true, extClicksSend: false }),
+    { autoForwardAstra: true, extClicksSend: false });
 });
 
 // --- M4.3: the search read query ---

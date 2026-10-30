@@ -68,7 +68,7 @@
   }
 
   // adapters/chatgpt-ext/src/content.ts
-  var BUILD_MARKER = "2026-10-20.1";
+  var BUILD_MARKER = "2026-10-30.1";
   console.log("[relay-astra] content script loaded", BUILD_MARKER);
   var DEBUG = false;
   function debug(...parts) {
@@ -288,6 +288,10 @@
   });
   checkCompletion();
   chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "click-send") {
+      sendResponse(clickSendButton());
+      return;
+    }
     if (msg?.type === "type-relay-text" && typeof msg.text === "string" && typeof msg.messageId === "string") {
       sendResponse(typeRelayText(msg.text));
       return;
@@ -308,6 +312,17 @@
     }
     sendResponse({ ok: true, note: "typed \u2014 Send is yours to click" });
   });
+  function clickSendButton() {
+    const button = document.querySelector(SELECTORS.sendButton);
+    if (button === null) return sendClickMiss();
+    button.click();
+    console.log("[relay-astra] auto-send: the extension clicked Send");
+    return { ok: true, clicked: true };
+  }
+  function sendClickMiss() {
+    reportStatus("selectors_stale");
+    return { ok: false, error: "Send button not found after typing (page changed?) \u2014 the text stays in the box; click Send yourself" };
+  }
   function composerText(composer) {
     return composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? "";
   }

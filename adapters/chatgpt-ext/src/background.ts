@@ -20,9 +20,9 @@
 //        chrome.storage.session so a worker death cannot drop them.
 //   F4 — a 20s {"type":"ping"} keepalive; the manifest's
 //        minimum_chrome_version 116 gates the WebSocket keepalive rule.
-import { deliveryTabDecision, isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
+import { autoSendClickPlan, deliveryTabDecision, isRelayHeaderEcho, statusToReplayAfterHello } from './protocol.ts';
 
-const BUILD_MARKER = '2026-10-22.1';
+const BUILD_MARKER = '2026-10-30.1';
 console.log('[relay-astra worker] service worker started', BUILD_MARKER);
 
 const DEBUG = false;
@@ -44,6 +44,11 @@ const DRAIN_SETTLE_MS = 500;             // F3: wait out the token-rejection win
 const PING_INTERVAL_MS = 20000;         // F4: under the ~30s MV3 idle kill
 const MAX_PERSISTED_QUEUE = 20;          // F3: keep the persisted queue small
 const PING_FRAME = JSON.stringify({ type: 'ping' });
+// M6.4e (D36): the auto-Send switch and the last click, mirrored into
+// chrome.storage.session so a worker death cannot forget them (same rule
+// as F2/S1: state that must survive lives there).
+const AUTO_SEND_CONFIG_KEY = 'extClicksSend';
+const AUTO_SEND_AT_KEY = 'lastAutoSendAt';
 
 // --- minimal chrome API view (structural typing, as in the spike) ---
 
@@ -190,10 +195,64 @@ function sendEngineFrame(frame: unknown): boolean {
   return false;
 }
 
+// --- M6.4e (D36): the auto-Send click, driven from the worker ---
+//
+// The switch is engine truth (a config frame on hello and on every change);
+// the worker holds it and mirrors it into chrome.storage.session. A click is
+// scheduled only after the text was verified typed into an EMPTY composer
+// (the content script's rule, unchanged) and only through autoSendClickPlan
+// — the single gate for the 5 s minimum gap. Stop/Kill reach the worker as
+// an engine interrupt and cancel a pending click before it fires.
+
+let extClicksSend = false;                    // engine truth via config
+let lastAutoSendAtMs: number | null = null;   // the previous click, for the gap
+let pendingAutoSend: { messageId: string; timer: ReturnType<typeof setTimeout> } | null = null;
+
+function cancelPendingAutoSend(): void {
+  if (pendingAutoSend === null) return;
+  const { messageId, timer } = pendingAutoSend;
+  pendingAutoSend = null;
+  clearTimeout(timer);
+  // The engine has usually already returned the row to pending_approval by
+  // now (Stop moves in-flight rows first); this ack is ignored then and only
+  // matters in the narrow window where the row is still delivering.
+  sendEngineFrame({ type: 'failed', messageId, error: 'stopped before the click — nothing was sent to ChatGPT' });
+  console.log('[relay-astra worker] pending auto-send cancelled (Stop/Kill)');
+}
+
+async function clickSend(messageId: string, tabId: number): Promise<void> {
+  if (pendingAutoSend === null || pendingAutoSend.messageId !== messageId) return; // cancelled
+  pendingAutoSend = null;
+  try {
+    const response = await chromeApi.tabs.sendMessage(tabId, { type: 'click-send', messageId }) as
+      | { ok?: boolean; clicked?: boolean; error?: string };
+    if (response?.ok === true && response.clicked === true) {
+      lastAutoSendAtMs = Date.now();
+      void chromeApi.storage.session.set({ [AUTO_SEND_AT_KEY]: lastAutoSendAtMs });
+      sendEngineFrame({ type: 'delivered', messageId, autoSend: true });
+      console.log('[relay-astra worker] auto-send: the extension clicked Send');
+    } else {
+      // D36 keeps the D10 fallback: if the click cannot happen the text just
+      // sits in the box, failed visibly, for the human to send or clear.
+      sendEngineFrame({
+        type: 'failed', messageId,
+        error: response?.error ?? 'the Send button was not found — the text stays in the box; click Send yourself',
+      });
+    }
+  } catch (err) {
+    sendEngineFrame({
+      type: 'failed', messageId,
+      error: `could not reach the ChatGPT tab to click Send — the text stays in the box: ${String(err).slice(0, 120)}`,
+    });
+  }
+}
+
 /**
- * M3.1: forward one deliver to the chosen tab's content script. `delivered`
- * means TYPED into the box, waiting for the user to click Send — the
- * extension never sends. Any failure is reported at once; never retried.
+ * M3.1: forward one deliver to the chosen tab's content script. Without the
+ * D36 switch `delivered` means TYPED into the box, waiting for the user to
+ * click Send (D10, kept as the default). With the switch on the worker
+ * schedules the click through autoSendClickPlan. Any failure is reported at
+ * once; never retried.
  */
 async function deliverToChatGpt(messageId: string, text: string): Promise<void> {
   const decision = deliveryTabDecision(lastSenderTabId);
@@ -205,10 +264,27 @@ async function deliverToChatGpt(messageId: string, text: string): Promise<void> 
   try {
     const response = await chromeApi.tabs.sendMessage(tabId, { type: 'type-relay-text', messageId, text }) as
       | { ok?: boolean; error?: string };
-    if (response?.ok === true) {
-      sendEngineFrame({ type: 'delivered', messageId });
-    } else {
+    if (response?.ok !== true) {
       sendEngineFrame({ type: 'failed', messageId, error: response?.error ?? 'the ChatGPT page refused the text' });
+      return;
+    }
+    if (extClicksSend === true) {
+      // D36: the typed text is in an empty, verified composer — the plan
+      // decides when it is clicked (never sooner than 5 s after the last).
+      const plan = autoSendClickPlan(true, Date.now(), lastAutoSendAtMs);
+      if (plan.click) {
+        if (plan.delayMs > 0) {
+          console.log(`[relay-astra worker] auto-send waits ${plan.delayMs}ms (minimum gap)`);
+        }
+        // One pending click at a time: a second typed delivery replacing the
+        // first must not orphan its timer (the ack would be lost silently).
+        cancelPendingAutoSend();
+        pendingAutoSend = { messageId, timer: setTimeout(() => { void clickSend(messageId, tabId); }, plan.delayMs) };
+      }
+      // (the plan only says false when the switch is off — unreachable here;
+      // the pure gate is tested in tests/chatgpt-ext.test.ts)
+    } else {
+      sendEngineFrame({ type: 'delivered', messageId });
     }
   } catch (err) {
     sendEngineFrame({
@@ -219,13 +295,32 @@ async function deliverToChatGpt(messageId: string, text: string): Promise<void> 
   }
 }
 
-/** M3.1: the engine's frames to the astra adapter — so far only `deliver`. */
+/** M3.1 + M6.4e: the engine's frames to the astra adapter. */
 function handleEngineFrame(frame: unknown): void {
-  const record = frame as { type?: unknown; messageId?: unknown; text?: unknown };
+  const record = frame as {
+    type?: unknown; messageId?: unknown; text?: unknown;
+    extClicksSend?: unknown; autoSend?: unknown;
+  };
   if (record?.type === 'deliver') {
     if (typeof record.messageId === 'string' && typeof record.text === 'string') {
       void deliverToChatGpt(record.messageId, record.text);
     }
+    return;
+  }
+  if (record?.type === 'config') {
+    // M6.4e (D36): the switch arrives as engine truth — on hello and on
+    // every change. Anything that is not a boolean leaves the state alone.
+    if (typeof record.extClicksSend === 'boolean') {
+      extClicksSend = record.extClicksSend;
+      void chromeApi.storage.session.set({ [AUTO_SEND_CONFIG_KEY]: extClicksSend });
+      console.log(`[relay-astra worker] extension-clicks-Send is ${extClicksSend ? 'ON' : 'off'}`);
+    }
+    return;
+  }
+  if (record?.type === 'interrupt') {
+    // M6.4e (D36): Stop/Kill — a pending click must not fire.
+    cancelPendingAutoSend();
+    return;
   }
 }
 
@@ -394,12 +489,30 @@ chromeApi.storage.onChanged.addListener((changes, area) => {
 });
 
 // Restore the persisted queue first (F3), then the remembered sender tab
-// (S1), then connect — a capture the previous worker had queued must be in
-// place before the post-hello drain, and a delivery that races the restore
-// still fails visibly (no tab known) rather than silently.
+// (S1), then the auto-Send state (M6.4e — the switch and the last click,
+// so a worker death neither forgets the engine's setting nor loses the
+// 5 s gap), then connect — a capture the previous worker had queued must be
+// in place before the post-hello drain, and a delivery that races the
+// restore still fails visibly (no tab known) rather than silently.
 void restoreQueue().then(() => {
-  void restoreSenderTab().then(() => { void connectEngine(); });
+  void restoreSenderTab().then(() => {
+    void restoreAutoSendState().then(() => { void connectEngine(); });
+  });
 });
+
+/** M6.4e (D36): bring back the switch and the last click. The engine re-sends
+ *  its truth on every hello anyway — this only closes the window between a
+ *  worker revival and the hello, and keeps the minimum gap honest. */
+async function restoreAutoSendState(): Promise<void> {
+  const bag = await chromeApi.storage.session.get(AUTO_SEND_CONFIG_KEY);
+  if (typeof bag[AUTO_SEND_CONFIG_KEY] === 'boolean') {
+    extClicksSend = bag[AUTO_SEND_CONFIG_KEY] as boolean;
+  }
+  const at = await chromeApi.storage.session.get(AUTO_SEND_AT_KEY);
+  if (typeof at[AUTO_SEND_AT_KEY] === 'number') {
+    lastAutoSendAtMs = at[AUTO_SEND_AT_KEY] as number;
+  }
+}
 
 /** S1 (M3.2a): bring back the tab id the previous worker chose. A tab that
  *  has since closed still fails visibly when messaged — storage.session

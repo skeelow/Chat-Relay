@@ -111,16 +111,22 @@ export interface ModeUpdate {
   turnCap?: number;
   autoSend?: boolean;
   autoSendDelaySec?: number;
+  /** M6.4e (D35): auto-forward captured Astra replies to Hermes (Conversation only). */
+  autoForwardAstra?: boolean;
+  /** M6.4e (D36): the extension clicks Send after typing into an empty composer. */
+  extClicksSend?: boolean;
 }
 
 /**
  * M4.2 (D16-2): validate a set_mode frame, pure. Only provided fields are
  * checked; any invalid value — a mode of 'auto' (not accepted until M5.1), a
- * turn cap outside 1..50, a non-boolean autoSend, a delay outside 3..1800 —
- * rejects the WHOLE frame (null). The engine logs and ignores it entirely.
+ * turn cap outside 1..50, a non-boolean autoSend, a delay outside 3..1800,
+ * or since M6.4e a non-boolean switch — rejects the WHOLE frame (null).
+ * The engine logs and ignores it entirely.
  */
 export function validateModeUpdate(update: {
   mode?: unknown; turnCap?: unknown; autoSend?: unknown; autoSendDelaySec?: unknown;
+  autoForwardAstra?: unknown; extClicksSend?: unknown;
 }): ModeUpdate | null {
   const result: ModeUpdate = {};
   if (update.mode !== undefined) {
@@ -140,6 +146,15 @@ export function validateModeUpdate(update: {
     if (typeof update.autoSendDelaySec !== 'number' || !Number.isInteger(update.autoSendDelaySec) ||
         update.autoSendDelaySec < 3 || update.autoSendDelaySec > 1800) return null;
     result.autoSendDelaySec = update.autoSendDelaySec;
+  }
+  // M6.4e (D35/D36): the two switches, booleans only, same whole-frame rule.
+  if (update.autoForwardAstra !== undefined) {
+    if (typeof update.autoForwardAstra !== 'boolean') return null;
+    result.autoForwardAstra = update.autoForwardAstra;
+  }
+  if (update.extClicksSend !== undefined) {
+    if (typeof update.extClicksSend !== 'boolean') return null;
+    result.extClicksSend = update.extClicksSend;
   }
   return result;
 }
@@ -327,6 +342,12 @@ export interface RelayStore {
   /** M4.2: the auto-send delay in seconds, 3 to 1800 (default 10). */
   autoSendDelaySec(): number;
   setAutoSendDelaySec(seconds: number): void;
+  /** M6.4e (D35): the auto-forward Astra→Hermes switch — "1" or absent (off). */
+  autoForwardAstra(): boolean;
+  setAutoForwardAstra(value: boolean): void;
+  /** M6.4e (D36): the extension-clicks-Send switch — "1" or absent (off). */
+  extClicksSend(): boolean;
+  setExtClicksSend(value: boolean): void;
   /** M3.2b (D12-1): the persisted stopped state. "1" means stopped; the key's
    *  absence (or any other value) means running. It survives restarts. */
   paused(): boolean;
@@ -722,6 +743,21 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     setSetting('auto_send_delay_sec', String(seconds));
   };
 
+  // M6.4e: the two switches — the same "1"-or-absent rule as auto_send.
+  const autoForwardAstra = (): boolean => getSetting('auto_forward_astra') === '1';
+
+  const setAutoForwardAstra = (value: boolean): void => {
+    if (value) setSetting('auto_forward_astra', '1');
+    else db.prepare('DELETE FROM settings WHERE key = ?').run('auto_forward_astra'); // "1" or absent, never another value
+  };
+
+  const extClicksSend = (): boolean => getSetting('ext_clicks_send') === '1';
+
+  const setExtClicksSend = (value: boolean): void => {
+    if (value) setSetting('ext_clicks_send', '1');
+    else db.prepare('DELETE FROM settings WHERE key = ?').run('ext_clicks_send'); // "1" or absent, never another value
+  };
+
   const paused = (): boolean => getSetting('paused') === '1';
 
   const setPaused = (value: boolean): void => {
@@ -919,6 +955,10 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     setAutoSend,
     autoSendDelaySec,
     setAutoSendDelaySec,
+    autoForwardAstra,
+    setAutoForwardAstra,
+    extClicksSend,
+    setExtClicksSend,
     paused,
     setPaused,
     hopForCapture,

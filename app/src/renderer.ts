@@ -79,8 +79,8 @@ import {
   searchFrame, startSearch, type SearchState,
 } from './search.ts';
 import {
-  delayToSeconds, isDelayValid, isTurnCapValid, modeLabel, setModeFrame, settingsControls,
-  type RelaySettings,
+  autoForwardBadge, delayToSeconds, isDelayValid, isTurnCapValid, modeLabel,
+  setModeFrame, settingsControls, type RelaySettings,
 } from './settings.ts';
 import {
   applyCountdownFrame, autoSendControlsEnabled, countdownHeaderText, emptyCountdownState,
@@ -139,6 +139,10 @@ const turnCapInput = document.getElementById('turn-cap') as HTMLInputElement | n
 const autoSendInput = document.getElementById('auto-send') as HTMLInputElement | null;
 const autoSendDelayInput = document.getElementById('auto-send-delay') as HTMLInputElement | null;
 const autoSendUnitInput = document.getElementById('auto-send-unit') as HTMLSelectElement | null;
+// M6.4e: the two switches — D35 auto-forward Astra→Hermes, D36 extension clicks Send.
+const autoForwardInput = document.getElementById('auto-forward-astra') as HTMLInputElement | null;
+const extClicksInput = document.getElementById('ext-clicks-send') as HTMLInputElement | null;
+const autoForwardBadgeEl = document.getElementById('auto-forward-badge');
 const searchButton = document.getElementById('search-btn') as HTMLButtonElement | null;
 const searchPanel = document.getElementById('search');
 const searchInput = document.getElementById('search-input') as HTMLInputElement | null;
@@ -307,6 +311,9 @@ function engineState(label: string, on: boolean): void {
   if (autoSendInput !== null) autoSendInput.disabled = !on;
   if (autoSendDelayInput !== null) autoSendDelayInput.disabled = !on;
   if (autoSendUnitInput !== null) autoSendUnitInput.disabled = !on;
+  // M6.4e: the two switches need the engine; they are engine-side settings.
+  if (autoForwardInput !== null) autoForwardInput.disabled = !on;
+  if (extClicksInput !== null) extClicksInput.disabled = !on;
   // M6.4d: Kill and the audit panel need the engine too; the picker only
   // affects outgoing frames, so it is disabled along with the send controls.
   if (killButton !== null) killButton.disabled = !on;
@@ -361,6 +368,20 @@ function renderSettings(): void {
   if (autoSendInput !== null) autoSendInput.checked = controls.autoSend;
   if (autoSendDelayInput !== null) autoSendDelayInput.value = String(controls.delay.value);
   if (autoSendUnitInput !== null) autoSendUnitInput.value = controls.delay.unit;
+  // M6.4e: the two switches show the server's truth; the D35 badge makes the
+  // auto-forward state visible outside the panel. They apply in any mode —
+  // the engine is the one that ignores them while Manual.
+  if (autoForwardInput !== null) {
+    autoForwardInput.disabled = !engineOnline;
+    autoForwardInput.checked = relaySettings.autoForwardAstra === true;
+  }
+  if (extClicksInput !== null) {
+    extClicksInput.disabled = !engineOnline;
+    extClicksInput.checked = relaySettings.extClicksSend === true;
+  }
+  if (autoForwardBadgeEl !== null) {
+    autoForwardBadgeEl.textContent = autoForwardBadge(relaySettings.autoForwardAstra === true);
+  }
   if (modeLabelEl !== null) modeLabelEl.textContent = `Mode: ${modeLabel(relaySettings.mode)}`;
   if (settingsHint !== null) settingsHint.textContent = '';
   console.log(`[relay-gui] settings: ${JSON.stringify(relaySettings)}`);
@@ -750,12 +771,14 @@ function handleFrame(frame: Frame): void {
   }
   if (type === 'settings_update') {
     // M4.2 + M5.1: the server's settings are the panel's only truth —
-    // manual, approve_each or auto.
+    // manual, approve_each or auto. M6.4e: the two switches ride along.
     relaySettings = {
       mode: frame.mode === 'approve_each' ? 'approve_each' : frame.mode === 'auto' ? 'auto' : 'manual',
       turnCap: typeof frame.turnCap === 'number' ? frame.turnCap : 4,
       autoSend: frame.autoSend === true,
       autoSendDelaySec: typeof frame.autoSendDelaySec === 'number' ? frame.autoSendDelaySec : 10,
+      autoForwardAstra: frame.autoForwardAstra === true,
+      extClicksSend: frame.extClicksSend === true,
     };
     renderSettings();
     return;
@@ -1047,6 +1070,20 @@ if (autoSendDelayInput !== null) {
 if (autoSendUnitInput !== null) {
   autoSendUnitInput.disabled = true;
   autoSendUnitInput.addEventListener('change', submitDelay);
+}
+// M6.4e: the two switches — one set_mode frame each; like every settings
+// control, the box snaps to the server's value when settings_update returns.
+if (autoForwardInput !== null) {
+  autoForwardInput.disabled = true;
+  autoForwardInput.addEventListener('change', () => {
+    sendFrameToEngine(setModeFrame({ autoForwardAstra: autoForwardInput.checked }));
+  });
+}
+if (extClicksInput !== null) {
+  extClicksInput.disabled = true;
+  extClicksInput.addEventListener('change', () => {
+    sendFrameToEngine(setModeFrame({ extClicksSend: extClicksInput.checked }));
+  });
 }
 
 // M4.3: search — the panel over the transcript, engine queries over the

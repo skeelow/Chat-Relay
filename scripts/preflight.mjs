@@ -297,10 +297,15 @@ function step4Builds() {
   return { pass: allOk, lines };
 }
 
-function step5StatusFile(task) {
+export function step5StatusFile(task) {
   const path = `docs/status/${task}.md`;
   if (!existsSync(path)) {
-    return { pass: false, line: `FAIL status: ${path} missing` };
+    // Same `{pass, lines}` shape every other step returns: main() does
+    // `allLines.push(...s5.lines)`, so a missing status file must yield a
+    // one-element lines array, not a bare `line` (which crashed preflight
+    // "s5.lines is not iterable" instead of reporting FAIL). Pinned by
+    // tests/preflight.test.ts.
+    return { pass: false, lines: [`FAIL status: ${path} missing`] };
   }
   const text = readFileSync(path, 'utf8');
   const result = checkStatusFile(text);

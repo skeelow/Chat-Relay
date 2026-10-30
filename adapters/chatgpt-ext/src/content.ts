@@ -1,10 +1,12 @@
 // Relay Chat — astra adapter, content script (M1.4). Turns the M0.2 spike
-// into the read-only ChatGPT side of the relay: it detects completed
-// replies exactly as the spike did (witnessed streaming + stop button
-// gone + turn complete + 1.5s stable text) and reports them to the engine
-// through the service worker. It never sends anything into ChatGPT —
-// typing the test prompt (popup) waits for the user to click Send, per
-// the SPEC.
+// into the ChatGPT side of the relay: it detects completed replies exactly
+// as the spike did (witnessed streaming + stop button gone + turn complete
+// + 1.5s stable text) and reports them to the engine through the service
+// worker. By default it never sends anything into ChatGPT — typing (popup
+// or relay delivery) waits for the user to click Send. M6.4e (D36) adds one
+// opt-in exception: only when the engine's extension-clicks-Send switch is
+// on does the worker ask this page to click the Send button (see
+// clickSendButton — the single click site, never in the type path).
 //
 // Carry items applied (docs/status/m0.2.md):
 //   1. Code-block header labels are stripped before reporting (replyText).
@@ -20,7 +22,7 @@ import {
 } from './protocol.ts';
 
 // Bump this marker on every build so the console shows which version runs.
-const BUILD_MARKER = '2026-10-20.1';
+const BUILD_MARKER = '2026-10-30.1';
 console.log('[relay-astra] content script loaded', BUILD_MARKER);
 
 // Debug logging is off by default (carry item 3); flip to true to trace
@@ -280,8 +282,14 @@ checkCompletion();
 // Manual test from the popup: type the test text into the composer.
 // It must NOT press send — the user clicks Send (SPEC M0.2 step 4).
 // M3.1: the same listener now also serves relay deliveries, which type
-// the delivered text and never, ever send it (D10 — see typeRelayText).
+// the delivered text (D10 default: the user still clicks Send; M6.4e D36:
+// only when the engine's extension-clicks-Send switch is on does the
+// worker ask for the click-send below).
 chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === 'click-send') {                 // M6.4e (D36) — see below
+    sendResponse(clickSendButton());
+    return;
+  }
   if (msg?.type === 'type-relay-text' && typeof msg.text === 'string' && typeof msg.messageId === 'string') {
     sendResponse(typeRelayText(msg.text));
     return;
@@ -302,6 +310,30 @@ chromeApi?.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   sendResponse({ ok: true, note: 'typed — Send is yours to click' });
 });
+
+/**
+ * M6.4e (D36): the ONE place in the whole extension that clicks the page's
+ * Send button, and it runs only when the worker asks — which happens only
+ * with the engine's extension-clicks-Send switch on, only after the text
+ * was verified typed into an EMPTY composer, and never inside the 5 s
+ * minimum gap. No submit call, no synthesized keystroke (the old D10
+ * guardrails stand). If the button is gone the text just sits there,
+ * failed visibly, exactly as the switch-off path.
+ */
+function clickSendButton(): { ok: boolean; clicked?: boolean; error?: string } {
+  const button = document.querySelector(SELECTORS.sendButton) as HTMLButtonElement | null;
+  if (button === null) return sendClickMiss();
+  button.click();
+  console.log('[relay-astra] auto-send: the extension clicked Send');
+  return { ok: true, clicked: true };
+}
+
+/** The miss path of the click: no click happens, the page is reported
+ *  stale, and the text stays in the box for the human (D10 fallback). */
+function sendClickMiss(): { ok: boolean; error: string } {
+  reportStatus('selectors_stale');
+  return { ok: false, error: 'Send button not found after typing (page changed?) — the text stays in the box; click Send yourself' };
+}
 
 // --- M3.1: the relay deliver path (typing only — the user always clicks Send) ---
 

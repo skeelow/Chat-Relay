@@ -155,7 +155,23 @@ async function openClient(url: string, token: string): Promise<Client> {
 async function openAdapter(url: string, token: string, name: string): Promise<Client> {
   const client = await openClient(url, token);
   client.send({ type: 'hello', name, version: '0.0.0-test' });
+  if (name === 'astra') {
+    // M6.4e (D36): the engine answers an astra hello with its config frame —
+    // consume it here so the existing astra tests see no new traffic.
+    const config = await client.nextMessage();
+    assert.equal(config.type, 'config', 'astra hello is answered with config');
+  }
   return client;
+}
+
+/** Poll a client's frames until one matches (used by the M6.4e D35 tests). */
+async function nextMatching(client: Client, pred: (f: Frame) => boolean, label: string): Promise<Frame> {
+  for (let i = 0; i < 30; i++) {
+    let frame: Frame;
+    try { frame = await client.nextMessage(2000); } catch { break; }
+    if (pred(frame)) return frame;
+  }
+  throw new Error(`no frame matching: ${label}`);
 }
 
 async function openGui(url: string, token: string): Promise<Client> {
@@ -911,5 +927,94 @@ test('M6.4d GUI builders through the real engine: work send, kill round-trip, au
     // 4. The forward builder never puts a perm on a non-Hermes frame.
     assert.deepEqual(forwardFrameWithPerm('m1', 'codex', 'work'),
       { type: 'forward', messageId: 'm1', target: 'codex' });
+  });
+});
+
+// --- M6.4e: D35 — the auto-forward Astra→Hermes switch (real engine) ---
+
+test('M6.4e D35 real engine: switch on routes the astra capture to Hermes as Conversation, audited without bodies', async () => {
+  await withEngine('d35-on', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoForwardAstra: true });
+    await pause(250);
+    astra.send({ type: 'captured', body: 'a reply worth forwarding', sourceRef: 'd35-on-1' });
+    const cap = (await nextMatching(gui, (f) => f.type === 'transcript_update'
+      && (f.message as { body?: string } | undefined)?.body === 'a reply worth forwarding',
+      'the astra capture')).message as { id: string };
+    const hermesRow = (await nextMatching(gui, (f) => f.type === 'delivery_update' && f.target === 'hermes',
+      'the auto-forward hermes row')) as { status: string };
+    assert.equal(hermesRow.status, 'pending_approval', 'the auto-forward creates the same row a manual forward creates');
+    assert.equal(engine.store.getDeliveryPerm(cap.id, 'hermes'), 'conversation', 'auto-forwards are Conversation, always');
+    const audits = engine.store.recentAudit(50);
+    const fwd = audits.find((e) => e.event === 'auto_forward');
+    assert.ok(fwd !== undefined, 'the auto-forward is audited by name');
+    assert.equal(fwd.target, 'hermes');
+    assert.equal(fwd.messageId, cap.id);
+    assert.ok(!audits.some((e) => String(e.detail ?? '').includes('worth forwarding')
+      || String(e.detail ?? '').includes('a reply')), 'no message body in any audit row');
+    // Approving the pending auto-forward delivers it with the relay header and the conversation perm:
+    gui.send({ type: 'approve', messageId: cap.id, target: 'hermes' });
+    const deliver = (await nextMatching(hermes, (f) => f.type === 'deliver', 'the hermes deliver frame')) as { messageId: string; text: string; perm?: string };
+    assert.equal(deliver.messageId, cap.id);
+    assert.equal(deliver.perm, 'conversation', 'the deliver frame carries conversation');
+    assert.ok(deliver.text.includes('[Relay · from Astra · #'), 'the relay header is the existing forward path');
+    hermes.send({ type: 'delivered', messageId: cap.id });
+  });
+});
+
+test('M6.4e D35 real engine: a Codex capture never auto-routes into Hermes; the switch lifts Astra→Hermes only', async () => {
+  await withEngine('d35-only-astra', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    await openHermesAdapter(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    await codex.nextMessage(); // codex config
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoForwardAstra: true });
+    await pause(250);
+    codex.send({ type: 'captured', body: 'codex speaks', sourceRef: 'd35-only-1' });
+    const ccap = (await nextMatching(gui, (f) => f.type === 'transcript_update'
+      && (f.message as { body?: string } | undefined)?.body === 'codex speaks', 'the codex capture')).message as { id: string };
+    assert.equal(engine.store.getDelivery(ccap.id, 'hermes'), null, 'Codex→Hermes stays manual even with the switch on');
+    gui.send({ type: 'reject', messageId: ccap.id, target: 'astra' });
+  });
+});
+
+test('M6.4e D35 real engine: the turn cap still gates the auto-forward — an over-cap capture is held with no rows', async () => {
+  await withEngine('d35-cap', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    await openHermesAdapter(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 1, autoForwardAstra: true });
+    await pause(250);
+    // Put the astra capture at hop 1: its previous relay text was delivered.
+    const relayed = engine.store.insertMessage({ source: 'codex', targets: ['astra'], body: 'relay me', hop: 0 });
+    engine.store.markStatus(relayed.id, 'astra', 'queued');
+    engine.store.markStatus(relayed.id, 'astra', 'delivered');
+    astra.send({ type: 'captured', body: 'astra at hop one', sourceRef: 'd35-cap-1' });
+    const held = (await nextMatching(gui, (f) => f.type === 'routing_held', 'the turn-cap hold')) as { messageId: string; hop: number; cap: number };
+    assert.equal(held.hop, 1);
+    assert.equal(held.cap, 1, 'the existing M5 limit is the gate — no new limits');
+    assert.equal(engine.store.getDelivery(held.messageId, 'hermes'), null, 'held: no auto-forward row');
+    assert.equal(engine.store.getDelivery(held.messageId, 'codex'), null, 'held: no codex row either');
+  });
+});
+
+test('M6.4e D35 real engine: Kill cancels the pending auto-forward countdown and leaves the switch as set', async () => {
+  await withEngine('d35-kill', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    gui.send({ type: 'set_mode', mode: 'auto', turnCap: 4, autoSend: true, autoSendDelaySec: 30, autoForwardAstra: true });
+    await pause(250);
+    astra.send({ type: 'captured', body: 'count me down to hermes', sourceRef: 'd35-kill-1' });
+    const cd = (await nextMatching(gui, (f) => f.type === 'countdown' && f.target === 'hermes'
+      && typeof f.seconds === 'number', 'the armed countdown')) as { messageId: string; seconds: number };
+    assert.equal(cd.seconds, 30, 'the existing M5 countdown applies');
+    gui.send({ type: 'kill' });
+    await nextMatching(gui, (f) => f.type === 'countdown' && f.target === 'hermes'
+      && f.messageId === cd.messageId && f.seconds === null, 'the countdown cancelled');
+    assert.equal(engine.store.getDelivery(cd.messageId, 'hermes')?.status, 'pending_approval', 'the row stays pending — nothing was forwarded');
+    assert.equal(engine.store.autoForwardAstra(), true, 'the switch stays as set after a kill');
+    assert.equal(engine.store.paused(), true, 'the engine is stopped');
   });
 });

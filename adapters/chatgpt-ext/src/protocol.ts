@@ -107,6 +107,26 @@ export function textsMatch(typed: string, expected: string): boolean {
   return typed.replace(/\s+/g, ' ').trim() === expected.replace(/\s+/g, ' ').trim();
 }
 
+// --- M6.4e (D36): the extension-clicks-Send switch ---
+
+/** Rate safety, in one place: at most one auto-Send click per this many ms. */
+export const AUTO_SEND_MIN_GAP_MS = 5000;
+
+/**
+ * The click decision, pure (tests/chatgpt-ext.test.ts runs every branch):
+ * with the setting off there is no click at all — the human clicks Send,
+ * exactly the old D10 behaviour. With it on the click happens, but never
+ * sooner than AUTO_SEND_MIN_GAP_MS after the previous one: inside the gap
+ * the plan defers (delayMs), it never drops the send silently.
+ */
+export function autoSendClickPlan(
+  enabled: boolean, nowMs: number, lastClickMs: number | null,
+): { click: boolean; delayMs: number } {
+  if (!enabled) return { click: false, delayMs: 0 };
+  const wait = lastClickMs === null ? 0 : AUTO_SEND_MIN_GAP_MS - (nowMs - lastClickMs);
+  return { click: true, delayMs: wait > 0 ? wait : 0 };
+}
+
 /** The worker's tab choice (D10): deliver to the most recent sender tab. */
 export interface DeliveryTabDecision {
   ok: boolean;

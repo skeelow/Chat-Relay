@@ -104,6 +104,8 @@
     .msg .delivery button:disabled { opacity: 0.45; cursor: default; }
     #pending { font-size: 12px; color: #e3b341; }
     #pending:empty { display: none; }
+    #auto-forward-badge { font-size: 12px; color: #e3b341; font-weight: 600; }
+    #auto-forward-badge:empty { display: none; }
     #approvals-badge { font-size: 12px; color: #e3b341; font-weight: 600; }
     #approvals-badge:empty { display: none; }
     #compose { display: flex; gap: 8px; padding: 10px 14px;
@@ -214,6 +216,7 @@
     <span id="export-note"></span>
     <span id="countdown-count"></span>
     <span id="mode-label"></span>
+    <span id="auto-forward-badge"></span>
     <span id="pending"></span>
     <span id="approvals-badge"></span>
     <span id="engine"><span id="dot"></span><span id="engine-label">connecting…</span></span>
@@ -249,7 +252,7 @@
       </span>
       <span class="choice-stack">
         <label><input type="radio" name="relay-mode" id="mode-auto"> Auto</label>
-        <span class="choice-help">Replies are forwarded between the AIs automatically, up to the turn cap, then it stops and waits for you. ChatGPT text is typed into its box; you click Send there. Codex approvals always wait for you.</span>
+        <span class="choice-help">Replies are forwarded between the AIs automatically, up to the turn cap, then it stops and waits for you. ChatGPT text is typed into its box; you click Send there (unless Extension clicks Send is on). Codex approvals always wait for you.</span>
       </span>
     </div>
     <div class="settings-row">
@@ -264,6 +267,18 @@
         <option value="seconds">seconds</option>
         <option value="minutes">minutes</option>
       </select>
+    </div>
+    <div class="settings-row">
+      <span class="choice-stack">
+        <label><input type="checkbox" id="auto-forward-astra" disabled> Auto-forward Astra replies to Hermes</label>
+        <span class="choice-help">Off by default (D35). On: a captured Astra reply is forwarded to Hermes automatically, with the existing countdown and turn-cap limits and Conversation permission only. Stop, Kill and Pause cancel pending auto-forwards. Codex→Hermes and anything out of Hermes stay manual.</span>
+      </span>
+    </div>
+    <div class="settings-row">
+      <span class="choice-stack">
+        <label><input type="checkbox" id="ext-clicks-send" disabled> Extension clicks Send</label>
+        <span class="choice-help">Off by default (D36). On: after typing into an EMPTY ChatGPT box the extension clicks Send itself — at most one click per 5 seconds, cancelled by Stop/Kill. A box with your draft still fails the delivery; the text stays untouched.</span>
+      </span>
     </div>
     <div id="settings-hint"></div>
   </div>

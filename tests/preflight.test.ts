@@ -18,6 +18,7 @@ import {
   isBuiltFile,
   checkRemoved,
   parseTestOutput,
+  step5StatusFile,
 } from '../scripts/preflight.mjs';
 
 // Sample node spec-reporter output (captured from `node --test` on this repo's
@@ -186,4 +187,22 @@ test('checkRemoved: empty list without none fails', () => {
   const r = checkRemoved([], 'Removed: something else');
   assert.equal(r.pass, false);
   assert.ok(r.lines.some((l) => l.includes("FAIL removed: no deleted source files")));
+});
+
+// M6.4e: step5 must return the same {pass, lines} shape every other step
+// gives main() — a missing status file is a FAIL line, not a crash
+// ("s5.lines is not iterable" killed the whole run before the verdict).
+
+test('step5StatusFile: a missing status file FAILs with a spreadable lines array', () => {
+  const r = step5StatusFile('task-with-no-status-file-m64e-check');
+  assert.equal(r.pass, false);
+  assert.ok(Array.isArray(r.lines), 'lines is an array (main spreads it)');
+  assert.equal(r.lines.length, 1);
+  assert.match(r.lines[0], /^FAIL status: docs\/status\/task-with-no-status-file-m64e-check\.md missing$/);
+});
+
+test('step5StatusFile: an existing status file reports PASS/FAIL through lines too', () => {
+  const r = step5StatusFile('m6.4d');
+  assert.ok(Array.isArray(r.lines), 'lines is always an array');
+  assert.ok(r.lines.some((l) => /^PASS status: docs\/status\/m6\.4d\.md/.test(l)));
 });
