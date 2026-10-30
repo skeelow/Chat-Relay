@@ -1048,3 +1048,120 @@ test('store: codex duplicate rule unchanged — identical text within 10 minutes
     );
   } finally { done(); }
 });
+
+// --- M6.4a: delivery_perms + audit tables, perm storage, audit API ---
+
+function tableNames(dbPath: string, names: string[]): string[] {
+  const db = new DatabaseSync(dbPath);
+  const rows = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name IN (${names.map(() => '?').join(',')}) ORDER BY name`,
+  ).all(...names) as { name: string }[];
+  db.close();
+  return rows.map((r) => r.name);
+}
+
+test('store M6.4a: fresh database has delivery_perms and audit; audit has no body column', () => {
+  const { dbPath, done } = freshStore('m64a-fresh');
+  try {
+    assert.deepEqual(tableNames(dbPath, ['delivery_perms', 'audit']),
+      ['audit', 'delivery_perms'], 'both new tables exist on a fresh database');
+    const db = new DatabaseSync(dbPath);
+    const cols = (db.prepare('PRAGMA table_info(audit)').all() as { name: string }[]).map((c) => c.name);
+    db.close();
+    assert.deepEqual(cols, ['id', 'at', 'actor', 'event', 'target', 'message_id', 'detail'],
+      'audit has exactly the specified columns — no body column');
+  } finally { done(); }
+});
+
+test('store M6.4a: old-schema database gains both tables without losing rows or indexes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-m64a-old-'));
+  const dbPath = join(dir, 'relay.db');
+  try {
+    // Build the pre-M6.4a schema (366f5d7's parent store) and fill it.
+    const old = new DatabaseSync(dbPath);
+    old.exec('PRAGMA foreign_keys = OFF;');
+    old.exec(OLD_SCHEMA);
+    old.prepare('INSERT INTO messages (id, source, body, content_hash, source_ref, hop, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('m-1', 'astra', 'body one', hashBody('body one'), 'ref-1', 0, '2026-01-01T00:00:00Z');
+    old.prepare('INSERT INTO deliveries (message_id, target, status, attempts, updated_at, error) VALUES (?,?,?,?,?,?)')
+      .run('m-1', 'codex', 'delivered', 1, '2026-01-01T01:00:00Z', null);
+    old.exec('PRAGMA user_version = 0;');
+    old.close();
+
+    const before = (() => {
+      const db = new DatabaseSync(dbPath);
+      const messages = db.prepare('SELECT * FROM messages ORDER BY id').all();
+      const deliveries = db.prepare('SELECT * FROM deliveries ORDER BY message_id, target').all();
+      const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+      db.close();
+      return { messages, deliveries, indexes };
+    })();
+
+    // Opening with the new store adds the tables (CREATE TABLE IF NOT EXISTS);
+    // the user_version migration is untouched.
+    const store = openStore(dbPath);
+    try {
+      assert.deepEqual(tableNames(dbPath, ['delivery_perms', 'audit']),
+        ['audit', 'delivery_perms'], 'new tables added to the old-schema database');
+      const db = new DatabaseSync(dbPath);
+      const messages = db.prepare('SELECT * FROM messages ORDER BY id').all();
+      const deliveries = db.prepare('SELECT * FROM deliveries ORDER BY message_id, target').all();
+      const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+      db.close();
+      assert.deepEqual(messages, before.messages, 'message rows preserved');
+      assert.deepEqual(deliveries, before.deliveries, 'delivery rows preserved');
+      for (const idx of before.indexes) assert.ok(indexes.includes(idx), `index ${idx} preserved`);
+      // The new tables are usable on the migrated database.
+      store.setDeliveryPerm('m-1', 'codex', 'conversation');
+      assert.equal(store.getDeliveryPerm('m-1', 'codex'), 'conversation');
+    } finally { store.close(); }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 300 }); } catch { /* temp dir pruned after 24h */ }
+  }
+});
+
+test('store M6.4a: setDeliveryPerm/getDeliveryPerm round-trip, upsert, and default', () => {
+  const { store, done } = freshStore('m64a-perm');
+  try {
+    const msg = store.insertMessage({ source: 'user', targets: ['hermes'], body: 'hi', hop: 0 });
+    assert.equal(store.getDeliveryPerm(msg.id, 'hermes'), 'conversation', 'absent perm defaults to conversation');
+    store.setDeliveryPerm(msg.id, 'hermes', 'work');
+    assert.equal(store.getDeliveryPerm(msg.id, 'hermes'), 'work');
+    store.setDeliveryPerm(msg.id, 'hermes', 'full');
+    assert.equal(store.getDeliveryPerm(msg.id, 'hermes'), 'full', 'upsert overwrites');
+    store.setDeliveryPerm(msg.id, 'hermes', 'conversation');
+    assert.equal(store.getDeliveryPerm(msg.id, 'hermes'), 'conversation');
+  } finally { done(); }
+});
+
+test('store M6.4a: appendAudit/recentAudit newest-first, limit honoured, no body field', () => {
+  const { store, done } = freshStore('m64a-audit');
+  try {
+    store.appendAudit({ actor: 'gui', event: 'perm_requested', target: 'hermes', messageId: 'm-1', detail: 'work' });
+    store.appendAudit({ actor: 'engine', event: 'hermes_delivering', target: 'hermes', messageId: 'm-1' });
+    store.appendAudit({ actor: 'hermes', event: 'hermes_failed', target: 'hermes', messageId: 'm-1', detail: 'boom' });
+    const all = store.recentAudit(500);
+    assert.equal(all.length, 3, 'all three entries returned');
+    assert.equal(all[0].event, 'hermes_failed', 'newest first');
+    assert.equal(all[2].event, 'perm_requested', 'oldest last');
+    assert.equal(all[0].actor, 'hermes');
+    assert.equal(all[0].target, 'hermes');
+    assert.equal(all[0].messageId, 'm-1');
+    assert.equal(all[0].detail, 'boom');
+    assert.equal(all[1].detail, null, 'absent detail is null');
+    assert.equal(store.recentAudit(2).length, 2, 'limit caps the result');
+    assert.equal(store.recentAudit(2)[0].event, 'hermes_failed', 'still newest-first under a limit');
+    for (const e of all) assert.ok(!('body' in e), 'audit entries never expose a body field');
+  } finally { done(); }
+});
+
+test('store M6.4a: recentAudit caps at 500 even when more rows exist', () => {
+  const { store, done } = freshStore('m64a-audit-cap');
+  try {
+    for (let i = 0; i < 505; i++) store.appendAudit({ actor: 'engine', event: 'tick', detail: String(i) });
+    assert.equal(store.recentAudit(1000).length, 500, 'a limit above 500 is capped');
+    assert.equal(store.recentAudit(500).length, 500);
+    assert.equal(store.recentAudit(10).length, 10);
+    assert.equal(store.recentAudit(1)[0].detail, '504', 'newest-first: the last insert is first');
+  } finally { done(); }
+});

@@ -11,7 +11,7 @@
 import { WebSocket } from 'ws';
 import { DatabaseSync } from 'node:sqlite';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startEngine, type EngineHandle } from '../relay/engine.ts';
@@ -320,6 +320,61 @@ async function run() {
               sessionUnchanged = sid === 'sess-smoke-1';
             } catch { /* */ }
             check(10, 'thread from non-hermes socket does not change hermes_session_id', sessionUnchanged, `sessionId=${setting(dbPathA, 'hermes_session_id')}`);
+
+            // Resume — check 9's Stop left the engine paused, and checks 11-12
+            // need a running engine so a send actually reaches the adapter.
+            guiB.send({ type: 'resume' });
+            try { await guiB.waitFor((m: any) => m.type === 'pause_update' && m.paused === false, 3000); } catch { /* */ }
+
+            // Check 11: a GUI send with perm='work' to Hermes fails closed with
+            // the exact message and starts no process. grandchild-hang would
+            // hang and write a pid file IF the adapter spawned; fail-closed
+            // means it never spawns, so the pid file stays absent.
+            writeControl(dirA, 'grandchild-hang');
+            try { unlinkSync(grandchildPidFile); } catch { /* fresh */ }
+            guiB.send({ type: 'send', body: 'do privileged things', targets: ['hermes'], perm: 'work' });
+            let check11ok = false;
+            let check11detail = '';
+            try {
+              const failed = (await guiB.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'failed', 6000)) as any;
+              const msgOk = String(failed.error ?? '') === 'work and full modes are not available yet';
+              await new Promise((r) => setTimeout(r, 400));
+              const spawned = existsSync(grandchildPidFile);
+              check11ok = msgOk && !spawned;
+              check11detail = `error="${failed.error}" pidFileExists=${spawned}`;
+            } catch (err) { check11detail = String(err); }
+            finally { writeControl(dirA, 'normal'); }
+            check(11, "GUI send perm='work' to Hermes fails closed with the exact message and starts no process", check11ok, check11detail);
+
+            // Check 12: a kill during a hanging run ends it, the process tree
+            // is gone, and the row is back to pending_approval.
+            writeControl(dirA, 'grandchild-hang');
+            try { unlinkSync(grandchildPidFile); } catch { /* fresh */ }
+            guiB.send({ type: 'send', body: 'long run for kill', targets: ['hermes'] });
+            let check12ok = false;
+            let check12detail = '';
+            try {
+              await guiB.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'delivering', 6000);
+              let pid = '';
+              for (let i = 0; i < 25; i++) {
+                if (existsSync(grandchildPidFile)) { pid = readFileSync(grandchildPidFile, 'utf8').trim(); if (pid !== '') break; }
+                await new Promise((r) => setTimeout(r, 200));
+              }
+              guiB.send({ type: 'kill' });
+              let rowPending = false;
+              try {
+                await guiB.waitFor((m: any) => m.type === 'delivery_update' && m.target === 'hermes' && m.status === 'pending_approval', 8000);
+                rowPending = true;
+              } catch { /* */ }
+              let treeGone = false;
+              if (pid !== '') {
+                for (let i = 0; i < 15; i++) { if (!pidIsAlive(pid)) { treeGone = true; break; } await new Promise((r) => setTimeout(r, 300)); }
+              }
+              check12ok = rowPending && treeGone;
+              check12detail = `rowPending=${rowPending} treeGone=${treeGone} pid=${pid}`;
+            } catch (err) { check12detail = String(err); }
+            finally { writeControl(dirA, 'normal'); }
+            check(12, 'kill during a hanging run ends it, the process tree is gone, and the row returns to pending_approval', check12ok, check12detail);
 
           } finally {
             astra.close();

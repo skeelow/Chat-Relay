@@ -59,8 +59,8 @@
 
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  openStore, StoreError, isOverTurnCap, validateModeUpdate,
-  type Participant, type PendingDelivery, type RelayMessage, type RelayStore,
+  openStore, StoreError, isOverTurnCap, validateModeUpdate, validatePerm,
+  type Participant, type PendingDelivery, type Perm, type RelayMessage, type RelayStore,
 } from './store.ts';
 import { exportMarkdown, EXPORT_CAP, type ExportDelivery } from './export.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -296,6 +296,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       attempts: row.attempts,
       updatedAt: row.updatedAt,
       ...(row.error !== null ? { error: row.error } : {}),
+      // M6.4a: Hermes rows carry their permission level to the GUI.
+      ...(target === 'hermes' ? { perm: store.getDeliveryPerm(messageId, target) } : {}),
     });
   };
 
@@ -317,7 +319,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   /** Send one queued row to its adapter, mark it delivering, arm the ack timer. */
   const deliverTo = (ws: WebSocket, pending: PendingDelivery): void => {
     const text = `${relayHeader(pending)}\n${pending.body}`;
-    ws.send(JSON.stringify({ type: 'deliver', messageId: pending.messageId, text }));
+    // M6.4a (D33): a Hermes delivery carries its perm, and its start is audited.
+    const frame: Record<string, unknown> = { type: 'deliver', messageId: pending.messageId, text };
+    if (pending.target === 'hermes') {
+      frame.perm = store.getDeliveryPerm(pending.messageId, pending.target);
+      store.appendAudit({ actor: 'engine', event: 'hermes_delivering', target: 'hermes', messageId: pending.messageId });
+    }
+    ws.send(JSON.stringify(frame));
     store.markStatus(pending.messageId, pending.target, 'delivering');
     clearAckTimer(pending.messageId, pending.target); // a re-delivery replaces any stale timer
     const key = `${pending.messageId}:${pending.target}`;
@@ -376,6 +384,31 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
       if (!quiet) broadcastCountdown(running.messageId, running.target, null);
     }
     if (cancelled.length > 0) console.log(`[engine] cancelled ${cancelled.length} countdown(s): ${reason}`);
+  };
+
+  /** M6.4a (D33): the stopped-state transition shared by Stop and Kill —
+   *  set the persisted state, return every in-flight row to the user with an
+   *  honest note, clear approvals and countdowns, broadcast the new state.
+   *  Returns how many rows were returned. The adapter frames differ per caller
+   *  (Stop interrupts codex+hermes; Kill kills hermes and interrupts codex),
+   *  so they stay in the handlers. */
+  const enterStoppedState = (reason: string): number => {
+    paused = true;
+    store.setPaused(true);
+    const inFlight = store.pendingDeliveries()
+      .filter((p) => p.status === 'queued' || p.status === 'delivering');
+    for (const pending of inFlight) {
+      const note = pending.status === 'queued'
+        ? 'stopped — approve again after you resume'
+        : 'stopped before confirmation — it may already have arrived';
+      store.markStatus(pending.messageId, pending.target, 'pending_approval', note);
+      clearAckTimer(pending.messageId, pending.target); // Stop cancels the ack wait too
+      broadcastDeliveryUpdate(pending.messageId, pending.target);
+    }
+    resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
+    clearAllCountdowns(reason); // M5.1 (D18-4): and every countdown — the rows stay pending
+    broadcast({ type: 'pause_update', paused: true });
+    return inFlight.length;
   };
 
   /** The approve case's body, extracted so a countdown expiry does exactly
@@ -638,6 +671,12 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               return;
             }
             const target: Participant = record.target;
+            // M6.4a (D33): optional perm; an invalid value ignores the whole frame.
+            const perm = validatePerm(record.perm);
+            if (perm === null) {
+              console.log(`[engine] forward ignored: invalid perm ${JSON.stringify(record.perm)}`);
+              return;
+            }
             const message = store.getMessage(messageId);
             if (message === null) {
               console.log(`[engine] forward ignored: unknown message ${messageId}`);
@@ -647,9 +686,14 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] forward ignored: ${target} is the message's own source`);
               return;
             }
+            // M6.4a: audit every forward that asked for a non-conversation perm.
+            if (perm !== 'conversation') {
+              store.appendAudit({ actor: 'gui', event: 'perm_requested', target, messageId, detail: perm });
+            }
             const existing = store.getDelivery(messageId, target);
             if (existing === null) {
               store.insertDelivery(messageId, target);
+              store.setDeliveryPerm(messageId, target, target === 'hermes' ? perm : 'conversation');
               broadcastDeliveryUpdate(messageId, target);
             } else if (existing.status === 'failed') {
               // M3.2a (D11-4): the user may retry a failed delivery at most
@@ -661,6 +705,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               }
               // A failed delivery gets a fresh start: forward again, approve again.
               store.markStatus(messageId, target, 'pending_approval');
+              store.setDeliveryPerm(messageId, target, target === 'hermes' ? perm : 'conversation');
               broadcastDeliveryUpdate(messageId, target);
             }
             // Any other state: idempotent — nothing changes, nothing broadcasts.
@@ -776,6 +821,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               // did receive the text. Upgrade; a genuinely failed row (the
               // adapter itself reported failure, or a replacement) stays failed.
               store.markStatus(messageId, target, 'delivered');
+              if (target === 'hermes') store.appendAudit({ actor: 'hermes', event: 'hermes_delivered', target: 'hermes', messageId });
               clearAckTimer(messageId, target);
               broadcastDeliveryUpdate(messageId, target);
               return;
@@ -783,11 +829,14 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             if (row === null || row.status !== 'delivering') return;
             if (record.type === 'delivered') {
               store.markStatus(messageId, target, 'delivered');
+              if (target === 'hermes') store.appendAudit({ actor: 'hermes', event: 'hermes_delivered', target: 'hermes', messageId });
             } else {
               const error = typeof record.error === 'string' && record.error.length > 0
                 ? record.error
                 : 'delivery failed';
               store.markStatus(messageId, target, 'failed', error);
+              // M6.4a: a Hermes failure is audited with the adapter's error text (truncated).
+              if (target === 'hermes') store.appendAudit({ actor: 'hermes', event: 'hermes_failed', target: 'hermes', messageId, detail: error.slice(0, 300) });
             }
             clearAckTimer(messageId, target);
             broadcastDeliveryUpdate(messageId, target);
@@ -812,7 +861,9 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               },
               messages,
               // M2.1: every non-user delivery row of those messages.
-              deliveries: store.deliveriesOf(messages.map((m) => m.id)),
+              // M6.4a: hermes rows carry their perm.
+              deliveries: store.deliveriesOf(messages.map((m) => m.id)).map((d) =>
+                d.target === 'hermes' ? { ...d, perm: store.getDeliveryPerm(d.messageId, d.target) } : d),
               // M3.2b: the stopped state rides along, so a joining GUI knows
               // to show the banner and keep Approve disabled.
               paused,
@@ -835,36 +886,36 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             return;
           }
           case 'stop': {
-            // M3.2b (D12-2): Stop means stop. One synchronous pass, nothing
-            // awaited on adapters: set the persisted state, return every
-            // in-flight row to the user with an honest note, broadcast each
-            // change, broadcast the new state, then tell the codex adapter
-            // to interrupt its in-progress turns. Stop twice is the same as
+            // M3.2b (D12-2): Stop means stop. Stop twice is the same as
             // once — a second frame changes nothing.
             if (paused) return;
-            paused = true;
-            store.setPaused(true);
-            const inFlight = store.pendingDeliveries()
-              .filter((p) => p.status === 'queued' || p.status === 'delivering');
-            for (const pending of inFlight) {
-              const note = pending.status === 'queued'
-                ? 'stopped — approve again after you resume'
-                : 'stopped before confirmation — it may already have arrived';
-              store.markStatus(pending.messageId, pending.target, 'pending_approval', note);
-              clearAckTimer(pending.messageId, pending.target); // Stop cancels the ack wait too
-              broadcastDeliveryUpdate(pending.messageId, pending.target);
-            }
-            resolveAllApprovals('stopped'); // M3.3 (D13-5): Stop clears every approval
-            clearAllCountdowns('Stop'); // M5.1 (D18-4): and every countdown — the rows stay pending
-            broadcast({ type: 'pause_update', paused: true });
+            const returned = enterStoppedState('Stop');
             // M3.2b / M6.2: Stop interrupts the active runs on both codex
             // and hermes (best effort). Their in-flight rows were returned
-            // to pending_approval above.
+            // to pending_approval by enterStoppedState.
             for (const participant of ['codex', 'hermes'] as const) {
               const sock = adapterSocketFor(participant);
               if (sock !== null) sock.send(JSON.stringify({ type: 'interrupt' }));
             }
-            console.log(`[engine] stopped: paused until resume; ${inFlight.length} in-flight row(s) returned to pending_approval`);
+            store.appendAudit({ actor: 'gui', event: 'stop' });
+            console.log(`[engine] stopped: paused until resume; ${returned} in-flight row(s) returned to pending_approval`);
+            return;
+          }
+          case 'kill': {
+            // M6.4a (D33): Kill does everything Stop does (stopped state,
+            // in-flight rows back to pending) and additionally kills the
+            // Hermes process tree at once and interrupts Codex. Available
+            // whenever the engine is up, even with nothing running — then it
+            // just records the audit entry and the stopped state. Unlike Stop,
+            // a Kill while already stopped still re-sends the frames (to catch
+            // any orphan) and records the audit entry.
+            store.appendAudit({ actor: 'gui', event: 'kill' });
+            const returned = enterStoppedState('Kill');
+            const hermesSock = adapterSocketFor('hermes');
+            if (hermesSock !== null) hermesSock.send(JSON.stringify({ type: 'kill' }));
+            const codexSock = adapterSocketFor('codex');
+            if (codexSock !== null) codexSock.send(JSON.stringify({ type: 'interrupt' }));
+            console.log(`[engine] kill: stopped; ${returned} in-flight row(s) returned; kill→hermes, interrupt→codex`);
             return;
           }
           case 'resume': {
@@ -905,6 +956,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] send ignored: bad targets ${JSON.stringify(record.targets)}`);
               return;
             }
+            // M6.4a (D33): optional per-message perm. An invalid value ignores
+            // the whole frame, exactly like an invalid set_mode.
+            const perm = validatePerm(record.perm);
+            if (perm === null) {
+              console.log(`[engine] send ignored: invalid perm ${JSON.stringify(record.perm)}`);
+              return;
+            }
             let message: RelayMessage;
             try {
               // allowDuplicate: a deliberate resend is still stored — the
@@ -924,6 +982,14 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               throw err;
             }
             broadcast({ type: 'transcript_update', message });
+            // M6.4a: audit every send that asked for a non-conversation perm.
+            if (perm !== 'conversation') {
+              store.appendAudit({
+                actor: 'gui', event: 'perm_requested',
+                target: targets.length === 1 ? (targets[0] as Participant) : null,
+                messageId: message.id, detail: perm,
+              });
+            }
             for (const target of targets as Participant[]) {
               // M3.2a (D11-3) applies to the user's messages too: the same
               // text must not go to the same AI twice inside the window.
@@ -934,6 +1000,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
                 broadcastDeliveryUpdate(message.id, target);
                 continue;
               }
+              // M6.4a: store this row's perm (only hermes may hold work/full).
+              store.setDeliveryPerm(message.id, target, target === 'hermes' ? perm : 'conversation');
               if (paused) {
                 // D14-2: while stopped the row waits, with an honest note.
                 store.markStatus(message.id, target, 'pending_approval',
@@ -968,6 +1036,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
               console.log(`[engine] set_mode ignored (invalid frame): ${JSON.stringify(record)}`);
               return;
             }
+            // M6.4a: every valid set_mode frame is audited (no message body here).
+            store.appendAudit({ actor: 'gui', event: 'set_mode', detail: JSON.stringify(update) });
             const before = JSON.stringify(settingsView());
             if (update.mode !== undefined) { settings.mode = update.mode; store.setRelayMode(update.mode); }
             if (update.turnCap !== undefined) { settings.turnCap = update.turnCap; store.setTurnCap(update.turnCap); }
@@ -1034,6 +1104,23 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
             ws.send(JSON.stringify({
               type: 'export_result', requestId, markdown, messageCount: messages.length,
             }));
+            return;
+          }
+          case 'audit': {
+            // M6.4a: GUI-only. Returns the recent audit entries to the asking
+            // socket alone (never broadcast). Optional limit, capped at 500.
+            if (!state.isGui) {
+              console.log('[engine] audit from a non-GUI socket ignored');
+              return;
+            }
+            const requestId = record.requestId;
+            if (typeof requestId !== 'string' || requestId === '') {
+              console.log(`[engine] audit ignored (bad requestId): ${JSON.stringify(record)}`);
+              return;
+            }
+            const limit = typeof record.limit === 'number' && Number.isFinite(record.limit) && record.limit > 0
+              ? record.limit : 500;
+            ws.send(JSON.stringify({ type: 'audit_result', requestId, entries: store.recentAudit(limit) }));
             return;
           }
           default:

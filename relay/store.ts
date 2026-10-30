@@ -144,6 +144,40 @@ export function validateModeUpdate(update: {
   return result;
 }
 
+/** M6.4a (D33): the per-message Hermes permission level. Only Hermes rows
+ *  can hold 'work' or 'full'; astra/codex are always 'conversation'. */
+export type Perm = 'conversation' | 'work' | 'full';
+
+/** Validate a GUI-supplied perm. undefined → the default 'conversation';
+ *  one of the three literals → itself; anything else → null (the engine
+ *  ignores the whole frame, exactly like an invalid set_mode). */
+export function validatePerm(value: unknown): Perm | null {
+  if (value === undefined) return 'conversation';
+  if (value === 'conversation' || value === 'work' || value === 'full') return value;
+  return null;
+}
+
+/** M6.4a: one audit-log row. Never carries a message body. */
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor: string;
+  event: string;
+  target: string | null;
+  messageId: string | null;
+  detail: string | null;
+}
+
+/** The shape appendAudit accepts (id and at are assigned by the store). */
+export interface AuditInput {
+  actor: string;
+  event: string;
+  target?: string | null;
+  messageId?: string | null;
+  detail?: string | null;
+  at?: string;
+}
+
 /** SPEC relay header. Tested against the trimmed body, so leading blank
  *  lines or spaces cannot sneak copied text past the filter: a first line
  *  matching this means the relay itself injected the text. */
@@ -224,6 +258,23 @@ const SCHEMA = `
     last_seen_ref TEXT,
     updated_at    TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS delivery_perms (
+    message_id TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    perm       TEXT NOT NULL CHECK (perm IN ('conversation','work','full')),
+    PRIMARY KEY (message_id, target)
+  );
+
+  CREATE TABLE IF NOT EXISTS audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    event      TEXT NOT NULL,
+    target     TEXT,
+    message_id TEXT,
+    detail     TEXT
+  );
 `;
 
 export interface RelayStore {
@@ -302,6 +353,14 @@ export interface RelayStore {
   recentMessages(limit: number): RelayMessage[];
   /** SPEC duplicate rule: same source + content_hash within 10 minutes, or a source_ref already stored. */
   isDuplicate(source: Participant, contentHash: string, sourceRef?: string): boolean;
+  /** M6.4a (D33): the per-delivery Hermes permission level, stored in
+   *  delivery_perms. An absent row reads back as 'conversation'. */
+  setDeliveryPerm(messageId: string, target: Participant, perm: Perm): void;
+  getDeliveryPerm(messageId: string, target: Participant): Perm;
+  /** M6.4a: append one audit row (never a message body) and read the most
+   *  recent rows, newest first, capped at 500. */
+  appendAudit(entry: AuditInput): void;
+  recentAudit(limit: number): AuditEntry[];
   close(): void;
 }
 
@@ -801,6 +860,46 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     return { messages, total };
   };
 
+  // --- M6.4a: delivery_perms + audit -------------------------------------
+  const setDeliveryPerm = (messageId: string, target: Participant, perm: Perm): void => {
+    db.prepare(
+      `INSERT INTO delivery_perms (message_id, target, perm) VALUES (?, ?, ?)
+       ON CONFLICT(message_id, target) DO UPDATE SET perm = excluded.perm`,
+    ).run(messageId, target, perm);
+  };
+  const getDeliveryPerm = (messageId: string, target: Participant): Perm => {
+    const row = db.prepare(
+      'SELECT perm FROM delivery_perms WHERE message_id = ? AND target = ?',
+    ).get(messageId, target) as { perm: string } | undefined;
+    return row?.perm === 'work' || row?.perm === 'full' ? row.perm : 'conversation';
+  };
+  const appendAudit = (entry: AuditInput): void => {
+    db.prepare(
+      'INSERT INTO audit (at, actor, event, target, message_id, detail) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      entry.at ?? now(),
+      entry.actor,
+      entry.event,
+      entry.target ?? null,
+      entry.messageId ?? null,
+      entry.detail ?? null,
+    );
+  };
+  const recentAudit = (limit: number): AuditEntry[] => {
+    const capped = Math.min(Math.max(0, Math.floor(limit) || 0), 500);
+    if (capped <= 0) return [];
+    const rows = db.prepare(
+      'SELECT id, at, actor, event, target, message_id, detail FROM audit ORDER BY id DESC LIMIT ?',
+    ).all(capped) as Array<{
+      id: number; at: string; actor: string; event: string;
+      target: string | null; message_id: string | null; detail: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id, at: r.at, actor: r.actor, event: r.event,
+      target: r.target, messageId: r.message_id, detail: r.detail,
+    }));
+  };
+
   return {
     insertMessage,
     markStatus,
@@ -828,6 +927,10 @@ export function openStore(dbPath: string = 'relay.db'): RelayStore {
     recentMessages,
     searchMessages,
     isDuplicate,
+    setDeliveryPerm,
+    getDeliveryPerm,
+    appendAudit,
+    recentAudit,
     close: () => db.close(),
   };
 }

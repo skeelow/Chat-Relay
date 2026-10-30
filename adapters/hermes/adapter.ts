@@ -178,7 +178,14 @@ export class HermesAdapter {
   /** Deliver one message. Fails at once with "Hermes is busy" if a run is
    *  already active (never queued). Until the engine's first `config` frame
    *  has arrived, fails with "waiting for engine config" (review F4). */
-  deliver(messageId: string, text: string): Promise<void> {
+  deliver(messageId: string, text: string, perm?: string): Promise<void> {
+    // M6.4a (D33): fail closed — the `work`/`full` permission modes are not
+    // built yet (M6.4b). Any non-conversation perm is refused before a process
+    // starts. A deliver without a perm behaves as 'conversation'.
+    if (perm !== undefined && perm !== 'conversation') {
+      this.fail(messageId, 'work and full modes are not available yet');
+      return Promise.resolve();
+    }
     if (this.busy) {
       this.fail(messageId, 'Hermes is busy');
       return Promise.resolve();
@@ -194,6 +201,15 @@ export class HermesAdapter {
 
   /** Engine Stop: kill the active process tree and fail with "Stopped". */
   handleInterrupt(): void {
+    if (this.current === null) return;
+    this.current.requestInterrupt();
+  }
+
+  /** Engine Kill (M6.4a/D33): for Hermes this is the same as Stop — kill the
+   *  whole process tree at once (no graceful wait) and report the row stopped.
+   *  Both leave no orphan process; Kill is the engine-side guardrail that also
+   *  works when nothing is running. */
+  handleKill(): void {
     if (this.current === null) return;
     this.current.requestInterrupt();
   }
@@ -498,10 +514,12 @@ export function connectToEngine(
     if (rec.type === 'config') adapter.handleConfig(typeof rec.threadId === 'string' ? rec.threadId : null);
     else if (rec.type === 'deliver') {
       if (typeof rec.messageId === 'string' && typeof rec.text === 'string') {
-        void adapter.deliver(rec.messageId, rec.text);
+        void adapter.deliver(rec.messageId, rec.text, typeof rec.perm === 'string' ? rec.perm : undefined);
       }
     } else if (rec.type === 'interrupt') {
       adapter.handleInterrupt();
+    } else if (rec.type === 'kill') {
+      adapter.handleKill();
     }
   };
   ws.onclose = () => {

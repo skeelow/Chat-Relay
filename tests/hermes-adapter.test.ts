@@ -940,6 +940,65 @@ test('R1: run killed when socket closes', async () => {
   assert.ok(error === 'Stopped' || error === 'Hermes exited with code 1', `expected 'Stopped' or 'Hermes exited with code 1', got '${error}'`);
 });
 
+// --- M6.4a: fail-closed perm + kill ---
+
+test('M6.4a: deliver with perm=work fails closed with the exact message and starts no process', async () => {
+  clearControl();
+  setControl('normal', { text: 'should never run' });
+  const { adapter, frames } = makeAdapter();
+  const marker = join(TMP, 'argv-perm-work.json');
+  try { unlinkSync(marker); } catch { /* absent is what we want */ }
+  const prev = process.env.FAKE_HERMES_ARGV_FILE;
+  process.env.FAKE_HERMES_ARGV_FILE = marker;
+  try {
+    await adapter.deliver('m-work', 'do privileged things', 'work');
+    const failed = lastFrameOfType(frames, 'failed');
+    assert.equal(failed?.messageId, 'm-work');
+    assert.equal(failed?.error, 'work and full modes are not available yet');
+    assert.ok(!frames.some((f) => (f as { type?: string; status?: string }).type === 'status' && (f as { status?: string }).status === 'thinking'),
+      'no run started (no thinking status)');
+    assert.equal(existsSync(marker), false, 'the fake executable was never spawned');
+  } finally {
+    if (prev === undefined) delete process.env.FAKE_HERMES_ARGV_FILE; else process.env.FAKE_HERMES_ARGV_FILE = prev;
+  }
+});
+
+test('M6.4a: deliver with perm=full fails closed; conversation/undefined run normally', async () => {
+  clearControl();
+  setControl('normal', { text: 'normal reply' });
+  const { adapter, frames } = makeAdapter();
+  await adapter.deliver('m-full', 'privileged', 'full');
+  assert.equal(lastFrameOfType(frames, 'failed')?.messageId, 'm-full');
+  assert.equal(lastFrameOfType(frames, 'failed')?.error, 'work and full modes are not available yet');
+  await adapter.deliver('m-conv', 'hello', 'conversation');
+  for (let i = 0; i < 25 && lastFrameOfType(frames, 'delivered')?.messageId !== 'm-conv'; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-conv', 'conversation perm runs normally');
+  await adapter.deliver('m-undef', 'hello again');
+  for (let i = 0; i < 25 && lastFrameOfType(frames, 'delivered')?.messageId !== 'm-undef'; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(lastFrameOfType(frames, 'delivered')?.messageId, 'm-undef', 'undefined perm runs normally');
+});
+
+test('M6.4a: kill ends a hanging run, kills the grandchild tree, and reports Stopped', async () => {
+  clearControl();
+  setControl('grandchild-hang');
+  const { adapter, frames } = makeAdapter();
+  try { unlinkSync(pidFile); } catch { /* fresh */ }
+  const p1 = adapter.deliver('m-kill', 'hanging run');
+  let pid = '';
+  for (let i = 0; i < 25; i++) {
+    if (existsSync(pidFile)) { pid = readFileSync(pidFile, 'utf8').trim(); if (pid !== '') break; }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(pid !== '', 'grandchild started (pid file written)');
+  adapter.handleKill();
+  await p1;
+  assert.equal(lastFrameOfType(frames, 'failed')?.messageId, 'm-kill');
+  assert.equal(String(lastFrameOfType(frames, 'failed')?.error), 'Stopped');
+  let gone = false;
+  for (let i = 0; i < 15; i++) { if (!pidIsAlive(pid)) { gone = true; break; } await new Promise((r) => setTimeout(r, 200)); }
+  assert.equal(gone, true, 'grandchild process is gone after kill (whole tree killed)');
+});
+
 // Cleanup the temp dir once all tests in this file are done.
 test('teardown: remove the temp directory', () => {
   clearControl();

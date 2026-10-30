@@ -498,3 +498,245 @@ test('session summary counts a hermes capture as a turn', async () => {
     running = false;
   });
 });
+
+// --- M6.4a: perm through the protocol, audit log, kill ---
+
+test('M6.4a perm: send to hermes with perm=work stores it and the deliver frame carries it', async () => {
+  await withEngine('perm-hermes', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    gui.send({ type: 'send', body: 'privileged please', targets: ['hermes'], perm: 'work' });
+    const deliver = (await hermes.nextMessage()) as { type: string; messageId: string; perm?: string };
+    assert.equal(deliver.type, 'deliver');
+    assert.equal(deliver.perm, 'work', 'deliver frame to hermes carries perm');
+    assert.equal(engine.store.getDeliveryPerm(deliver.messageId, 'hermes'), 'work', 'perm stored for the hermes row');
+  });
+});
+
+test('M6.4a perm: astra/codex rows are always conversation even if the GUI sends work', async () => {
+  await withEngine('perm-astra-codex', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const astra = await openAdapter(url, token, 'astra');
+    const codex = await openAdapter(url, token, 'codex');
+    gui.send({ type: 'send', body: 'hi both', targets: ['astra', 'codex'], perm: 'work' });
+    // codex (like hermes) gets a config frame on hello, so drain to the deliver.
+    let aDeliver: { messageId: string } | null = null;
+    for (let i = 0; i < 5 && aDeliver === null; i++) { const m = (await astra.nextMessage()) as { type: string; messageId: string }; if (m.type === 'deliver') aDeliver = m; }
+    let cDeliver: { messageId: string } | null = null;
+    for (let i = 0; i < 5 && cDeliver === null; i++) { const m = (await codex.nextMessage()) as { type: string; messageId: string }; if (m.type === 'deliver') cDeliver = m; }
+    assert.ok(aDeliver !== null && cDeliver !== null, 'both adapters received a deliver frame');
+    assert.equal(aDeliver!.messageId, cDeliver!.messageId, 'same message, two targets');
+    assert.equal(engine.store.getDeliveryPerm(aDeliver!.messageId, 'astra'), 'conversation', 'astra forced to conversation');
+    assert.equal(engine.store.getDeliveryPerm(cDeliver!.messageId, 'codex'), 'conversation', 'codex forced to conversation');
+  });
+});
+
+test('M6.4a perm: an invalid perm value ignores the whole send frame', async () => {
+  await withEngine('perm-invalid', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const before = engine.store.recentMessages(50).length;
+    gui.send({ type: 'send', body: 'bad perm', targets: ['hermes'], perm: 'everything' });
+    await hermes.expectSilence(400);
+    assert.equal(engine.store.recentMessages(50).length, before, 'no message stored for an invalid perm');
+  });
+});
+
+test('M6.4a perm: forward stores perm on the hermes row; invalid perm forward ignored', async () => {
+  await withEngine('perm-forward', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const id = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'forward me', hop: 0 }).id;
+    gui.send({ type: 'forward', messageId: id, target: 'hermes', perm: 'full' });
+    await pause(200);
+    assert.equal(engine.store.getDelivery(id, 'hermes')?.status, 'pending_approval', 'forward created a pending row');
+    assert.equal(engine.store.getDeliveryPerm(id, 'hermes'), 'full', 'forward stored perm');
+    const id2 = engine.store.insertMessage({ source: 'astra', targets: ['user'], body: 'forward me too', hop: 0 }).id;
+    gui.send({ type: 'forward', messageId: id2, target: 'hermes', perm: 'bogus' });
+    await pause(200);
+    assert.equal(engine.store.getDelivery(id2, 'hermes'), null, 'invalid perm forward created no delivery row');
+  });
+});
+
+test('M6.4a perm: survives an engine restart and is re-delivered with the same perm', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-m64a-restart-'));
+  const dbPath = join(dir, 'relay.db');
+  const tokenPath = join(dir, 'token');
+  try {
+    let messageId = '';
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      messageId = engine.store.insertMessage({ source: 'user', targets: ['hermes'], body: 'restart perm', hop: 0 }).id;
+      engine.store.setDeliveryPerm(messageId, 'hermes', 'work');
+      engine.store.markStatus(messageId, 'hermes', 'queued');
+      engine.store.markStatus(messageId, 'hermes', 'delivering');
+      engine.stop();
+    }
+    {
+      const engine = await startEngine({ port: 0, dbPath, tokenPath });
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      const url = `ws://127.0.0.1:${engine.port}`;
+      assert.equal(engine.store.getDelivery(messageId, 'hermes')?.status, 'pending_approval', 'delivering row back to pending after restart');
+      assert.equal(engine.store.getDeliveryPerm(messageId, 'hermes'), 'work', 'perm survived the restart');
+      const gui = await openGui(url, token);
+      const { client: hermes } = await openHermesAdapter(url, token);
+      gui.send({ type: 'approve', messageId, target: 'hermes' });
+      const deliver = (await hermes.nextMessage()) as { type: string; perm?: string };
+      assert.equal(deliver.type, 'deliver');
+      assert.equal(deliver.perm, 'work', 're-delivered with the same perm');
+      engine.stop();
+    }
+  } finally { cleanupDir(dir); }
+});
+
+test('M6.4a perm: snapshot and delivery_update include perm for hermes rows only', async () => {
+  await withEngine('perm-snapshot', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    gui.send({ type: 'send', body: 'perm snapshot', targets: ['hermes'], perm: 'full' });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    // delivery_update for the hermes row carries perm:
+    const update = (await gui.nextMessage()) as { type: string; target?: string; perm?: string };
+    // (the first gui frame after send is transcript_update; drain to the delivery_update)
+    let du = update.type === 'delivery_update' ? update : null;
+    for (let i = 0; i < 6 && du === null; i++) {
+      const m = (await gui.nextMessage()) as { type: string; target?: string; perm?: string };
+      if (m.type === 'delivery_update' && m.target === 'hermes') du = m;
+    }
+    assert.ok(du !== null, 'got a hermes delivery_update');
+    assert.equal(du!.perm, 'full', 'delivery_update includes perm for the hermes row');
+    // A fresh GUI's snapshot includes perm on the hermes delivery row:
+    const gui2 = await openClient(url, token);
+    gui2.send({ type: 'gui_hello' });
+    const snap = (await gui2.nextMessage()) as { type: string; deliveries: Array<{ messageId: string; target: string; perm?: string }> };
+    assert.equal(snap.type, 'snapshot');
+    const hermesRow = snap.deliveries.find((d) => d.messageId === deliver.messageId && d.target === 'hermes') as { perm?: string } | undefined;
+    assert.equal(hermesRow?.perm, 'full', 'snapshot hermes delivery row includes perm');
+  });
+});
+
+test('M6.4a audit: hermes delivery started/delivered/failed audited; bodies never stored', async () => {
+  await withEngine('audit-hermes', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const secretBody = 'TOP-SECRET-BODY-XYZ';
+    gui.send({ type: 'send', body: secretBody, targets: ['hermes'] });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    await pause(120);
+    let entries = engine.store.recentAudit(50);
+    assert.ok(entries.some((e) => e.event === 'hermes_delivering' && e.messageId === deliver.messageId), 'hermes_delivering audited');
+    hermes.send({ type: 'delivered', messageId: deliver.messageId });
+    await pause(150);
+    entries = engine.store.recentAudit(50);
+    assert.ok(entries.some((e) => e.event === 'hermes_delivered' && e.messageId === deliver.messageId), 'hermes_delivered audited');
+    gui.send({ type: 'send', body: 'a second message', targets: ['hermes'] });
+    const deliver2 = (await hermes.nextMessage()) as { messageId: string };
+    hermes.send({ type: 'failed', messageId: deliver2.messageId, error: 'boom-detail' });
+    await pause(150);
+    entries = engine.store.recentAudit(50);
+    const failedEntry = entries.find((e) => e.event === 'hermes_failed' && e.messageId === deliver2.messageId);
+    assert.ok(failedEntry, 'hermes_failed audited');
+    assert.equal(failedEntry!.detail, 'boom-detail', 'adapter error text stored in detail');
+    for (const e of entries) {
+      assert.ok(!String(e.detail ?? '').includes(secretBody), 'message body never appears in audit detail');
+      assert.ok(!('body' in e), 'no body field on audit entries');
+    }
+  });
+});
+
+test('M6.4a audit: perm_requested audited for non-conversation send, not for conversation', async () => {
+  await withEngine('audit-perm', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    gui.send({ type: 'send', body: 'work please', targets: ['hermes'], perm: 'work' });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    await pause(120);
+    const pr = engine.store.recentAudit(50).find((e) => e.event === 'perm_requested' && e.messageId === deliver.messageId);
+    assert.ok(pr, 'perm_requested audited for a send with work');
+    assert.equal(pr!.detail, 'work');
+    assert.equal(pr!.actor, 'gui');
+    gui.send({ type: 'send', body: 'plain conversation', targets: ['hermes'] });
+    const d2 = (await hermes.nextMessage()) as { messageId: string };
+    await pause(120);
+    const none = engine.store.recentAudit(50).filter((e) => e.event === 'perm_requested' && e.messageId === d2.messageId);
+    assert.equal(none.length, 0, 'a conversation send does not audit perm_requested');
+  });
+});
+
+test('M6.4a audit: stop, kill and set_mode are audited', async () => {
+  await withEngine('audit-ctl', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    gui.send({ type: 'set_mode', mode: 'manual' });
+    await pause(100);
+    gui.send({ type: 'stop' });
+    await pause(100);
+    gui.send({ type: 'resume' });
+    await pause(100);
+    gui.send({ type: 'kill' });
+    await pause(120);
+    const entries = engine.store.recentAudit(50);
+    assert.ok(entries.some((e) => e.event === 'set_mode' && e.actor === 'gui'), 'set_mode audited');
+    assert.ok(entries.some((e) => e.event === 'stop' && e.actor === 'gui'), 'stop audited');
+    assert.ok(entries.some((e) => e.event === 'kill' && e.actor === 'gui'), 'kill audited');
+  });
+});
+
+test('M6.4a audit: audit frame answered to the asking GUI only; non-GUI gets nothing', async () => {
+  await withEngine('audit-frame', async (engine, url, token) => {
+    const gui1 = await openGui(url, token);
+    const gui2 = await openGui(url, token);
+    gui1.send({ type: 'set_mode', mode: 'manual' }); // generate an audit entry
+    await pause(120);
+    gui1.send({ type: 'audit', requestId: 'r1', limit: 10 });
+    let result: { type: string; requestId: string; entries: unknown[] } | null = null;
+    for (let i = 0; i < 8 && result === null; i++) {
+      const m = (await gui1.nextMessage()) as { type: string };
+      if (m.type === 'audit_result') result = m as { type: string; requestId: string; entries: unknown[] };
+    }
+    assert.ok(result !== null, 'asking GUI receives audit_result');
+    assert.equal(result!.requestId, 'r1');
+    assert.ok(Array.isArray(result!.entries));
+    assert.ok(result!.entries.some((e) => (e as { event?: string }).event === 'set_mode'), 'entries include the set_mode event');
+    // gui2 never asked: drain its broadcasts and assert no audit_result arrives.
+    let gui2GotResult = false;
+    for (let i = 0; i < 12; i++) {
+      try { const m = await gui2.nextMessage(120); if (m.type === 'audit_result') { gui2GotResult = true; break; } } catch { break; }
+    }
+    assert.equal(gui2GotResult, false, 'audit_result goes to the asking socket only');
+    // A non-GUI (adapter) socket asking for audit gets nothing.
+    const astra = await openAdapter(url, token, 'astra');
+    astra.send({ type: 'audit', requestId: 'r2' });
+    await astra.expectSilence(300);
+  });
+});
+
+test('M6.4a kill: stopped state, kill to hermes, interrupt to codex, in-flight row back to pending', async () => {
+  await withEngine('kill-frames', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    const { client: hermes } = await openHermesAdapter(url, token);
+    const codex = await openAdapter(url, token, 'codex');
+    gui.send({ type: 'send', body: 'long run', targets: ['hermes'] });
+    const deliver = (await hermes.nextMessage()) as { messageId: string };
+    assert.equal(engine.store.getDelivery(deliver.messageId, 'hermes')?.status, 'delivering', 'hermes run in flight');
+    gui.send({ type: 'kill' });
+    let sawKill = false;
+    for (let i = 0; i < 6; i++) { try { const m = await hermes.nextMessage(500); if (m.type === 'kill') { sawKill = true; break; } } catch { break; } }
+    assert.ok(sawKill, 'hermes adapter receives {type:kill}');
+    let sawInterrupt = false;
+    for (let i = 0; i < 6; i++) { try { const m = await codex.nextMessage(500); if (m.type === 'interrupt') { sawInterrupt = true; break; } } catch { break; } }
+    assert.ok(sawInterrupt, 'codex adapter receives {type:interrupt}');
+    await pause(150);
+    assert.equal(engine.store.getDelivery(deliver.messageId, 'hermes')?.status, 'pending_approval', 'in-flight row back to pending');
+    assert.equal(engine.store.paused(), true, 'engine is stopped after kill');
+  });
+});
+
+test('M6.4a kill: works when nothing is running (records audit + stopped state)', async () => {
+  await withEngine('kill-idle', async (engine, url, token) => {
+    const gui = await openGui(url, token);
+    assert.equal(engine.store.paused(), false, 'engine starts running');
+    gui.send({ type: 'kill' });
+    await pause(150);
+    assert.equal(engine.store.paused(), true, 'kill enters the stopped state even when idle');
+    assert.ok(engine.store.recentAudit(50).some((e) => e.event === 'kill'), 'kill audited even when idle');
+  });
+});
