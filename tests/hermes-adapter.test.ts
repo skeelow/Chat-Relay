@@ -4,13 +4,14 @@
 //   FAKE_HERMES_ARGV_FILE  path where the fake writes process.argv
 //   FAKE_HERMES_ENV_FILE   path where print-env mode writes process.env
 //   FAKE_HERMES_GRANDCHILD_PID_FILE  path where grandchild-hang writes the grandchild pid
+//   FAKE_HERMES_ORPHAN_PID_FILE  path where orphan-hang writes the orphan pid
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, unlinkSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync, spawnSync, spawn } from 'node:child_process';
 import { WebSocket } from 'ws';
 import {
   HermesAdapter,
@@ -28,16 +29,19 @@ import {
   type HermesAdapterOptions,
 } from '../adapters/hermes/adapter.ts';
 import { startEngine, type EngineHandle } from '../relay/engine.ts';
+import { sweepRelayOrphans } from '../relay/process-sweep.ts';
 
 const FAKE = join(process.cwd(), 'tests', 'fake-hermes.ts');
 const TMP = mkdtempSync(join(tmpdir(), 'relay-hermes-test-'));
 const argvFile = join(TMP, 'argv.json');
 const envFile = join(TMP, 'env.json');
 const pidFile = join(TMP, 'pid.txt');
+const orphanPidFile = join(TMP, 'orphan-pid.txt');
 
 process.env.FAKE_HERMES_ARGV_FILE = argvFile;
 process.env.FAKE_HERMES_ENV_FILE = envFile;
 process.env.FAKE_HERMES_GRANDCHILD_PID_FILE = pidFile;
+process.env.FAKE_HERMES_ORPHAN_PID_FILE = orphanPidFile;
 
 function controlPath(name: string): string {
   return join(TMP, name);
@@ -64,9 +68,11 @@ function readEnv(): Record<string, string> {
 
 function pidIsAlive(pid: string): boolean {
   try {
+    // M6.4g fix: the old stdio ['pipe','ignore','ignore'] threw stdout away,
+    // so this always returned false (death checks passed vacuously).
     const out = execSync(`tasklist /FI "PID eq ${pid}"`, {
       encoding: 'utf8',
-      stdio: ['pipe', 'ignore', 'ignore'],
+      stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
     });
     const text = String(out);
@@ -1220,7 +1226,7 @@ test('R1: adapter starts without engine or token, connects when engine appears',
 
     const abortController = new AbortController();
     const runPromise = runForever(
-      { engineUrl: url, tokenPath, executable: FAKE },
+      { engineUrl: url, tokenPath, executable: FAKE, sweep: () => 0 }, // M6.4g: no marker sweep in tests
       abortController.signal
     );
 
@@ -1453,11 +1459,123 @@ test('M6.4a: kill ends a hanging run, kills the grandchild tree, and reports Sto
   assert.equal(gone, true, 'grandchild process is gone after kill (whole tree killed)');
 });
 
+test('M6.4g: the run tree kill alone misses the leaked orphan (the defect itself)', async () => {
+  // Pins the defect shape: with the sweep INERT (the class default), kill
+  // terminates the run but the orphan — parented to the dead spawner, marker
+  // on its command line — SURVIVES. This is what the publisher observed live;
+  // the sweep test above proves the fix.
+  clearControl();
+  const token = `orphmiss-${process.pid}-${Date.now()}`;
+  const markerArg = `C:/Users/tester/AppData/Roaming/RelayChat/hermes-cwd-${token}`;
+  setControl('orphan-hang', { orphanArg: markerArg });
+  try { unlinkSync(orphanPidFile); } catch { /* fresh */ }
+  let orphanPid = '';
+  try {
+    const { adapter, frames } = makeAdapter(); // sweep: inert (default)
+    const p1 = adapter.deliver('m-orphan2', 'hanging run');
+    for (let i = 0; i < 25; i++) {
+      if (existsSync(orphanPidFile)) { orphanPid = readFileSync(orphanPidFile, 'utf8').trim(); if (orphanPid !== '') break; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.ok(orphanPid !== '', 'leaked orphan started');
+    adapter.handleKill();
+    await p1;
+    assert.equal(String(lastFrameOfType(frames, 'failed')?.error), 'Stopped');
+    await new Promise((r) => setTimeout(r, 500)); // give taskkill /T every chance
+    assert.equal(pidIsAlive(orphanPid), true,
+      'the tree kill cannot reach a process parented to a dead spawner (why the sweep is needed)');
+  } finally {
+    if (orphanPid !== '') {
+      try { execSync(`taskkill /F /T /PID ${orphanPid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* gone */ }
+    }
+    clearControl();
+  }
+});
+
+test('M6.4g: kill sweeps a leaked shell outside the run tree; a look-alike survives', async () => {
+  clearControl();
+  const token = `orph-${process.pid}-${Date.now()}`;
+  const markerArg = `C:/Users/tester/AppData/Roaming/RelayChat/hermes-cwd-${token}`;
+  const lookalikeArg = `C:/Users/tester/AppData/Roaming/RelayChat/hermes-data-${token}`;
+  setControl('orphan-hang', { orphanArg: markerArg });
+  try { unlinkSync(orphanPidFile); } catch { /* fresh */ }
+  // Real marker sweep, scoped to this test's token so concurrent test files'
+  // marker children are never touched (and ours never swept by them).
+  const { adapter, frames } = makeAdapter({ sweep: () => sweepRelayOrphans({ contains: token }) });
+  let orphanPid = '';
+  let lookalikePid = '';
+  try {
+    const p1 = adapter.deliver('m-orphan', 'hanging run');
+    // The orphan's spawner exits immediately, so the leaked process is NOT a
+    // descendant of the run tree — taskkill /T on the tree cannot reach it
+    // (the exact shape of the M6.4g live defect).
+    for (let i = 0; i < 25; i++) {
+      if (existsSync(orphanPidFile)) { orphanPid = readFileSync(orphanPidFile, 'utf8').trim(); if (orphanPid !== '') break; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.ok(orphanPid !== '', 'leaked orphan started (pid file written)');
+    // A look-alike WITHOUT the marker on its command line.
+    const lookalike = spawn(process.execPath,
+      [join(process.cwd(), 'tests', 'fake-orphan.ts'), lookalikeArg],
+      { detached: true, stdio: 'ignore' });
+    lookalike.unref();
+    lookalikePid = String(lookalike.pid);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(pidIsAlive(orphanPid), true, 'the orphan is alive before the kill');
+    assert.equal(pidIsAlive(lookalikePid), true, 'the look-alike is alive before the kill');
+
+    adapter.handleKill();
+    await p1;
+    assert.equal(lastFrameOfType(frames, 'failed')?.messageId, 'm-orphan');
+    assert.equal(String(lastFrameOfType(frames, 'failed')?.error), 'Stopped');
+
+    let gone = false;
+    for (let i = 0; i < 25; i++) {
+      if (!pidIsAlive(orphanPid)) { gone = true; break; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.equal(gone, true, 'the marker sweep terminated the leaked orphan after kill');
+    assert.equal(pidIsAlive(lookalikePid), true, 'the look-alike (no marker) survives');
+  } finally {
+    // Tests clean up their own children.
+    for (const pid of [orphanPid, lookalikePid]) {
+      if (pid === '') continue;
+      try { execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* already gone */ }
+    }
+    delete process.env.FAKE_HERMES_CONTROL;
+  }
+});
+
+test('M6.4g: runForever sweeps marker processes older than its start (once, at start)', async () => {
+  // The production entry point calls the sweep exactly once before connecting,
+  // gated at its own start time. Fake sweep: no process table is touched here.
+  const calls: Array<{ olderThanMs?: number }> = [];
+  const before = Date.now();
+  const abortController = new AbortController();
+  const runPromise = runForever(
+    {
+      engineUrl: 'ws://127.0.0.1:1',
+      tokenPath: join(TMP, 'no-such-token-file'),
+      executable: FAKE,
+      sweep: (o) => { calls.push(o ?? {}); return 0; },
+    },
+    abortController.signal,
+  );
+  await new Promise((r) => setTimeout(r, 300));
+  abortController.abort();
+  await runPromise;
+  assert.equal(calls.length, 1, 'the start sweep ran once');
+  const opts = calls[0];
+  assert.ok(typeof opts.olderThanMs === 'number', 'the start sweep is age-gated at the adapter start');
+  assert.ok(opts.olderThanMs >= before && opts.olderThanMs <= Date.now(), 'the gate is the start moment');
+});
+
 // Cleanup the temp dir once all tests in this file are done.
 test('teardown: remove the temp directory', () => {
   clearControl();
   delete process.env.FAKE_HERMES_ARGV_FILE;
   delete process.env.FAKE_HERMES_ENV_FILE;
   delete process.env.FAKE_HERMES_GRANDCHILD_PID_FILE;
+  delete process.env.FAKE_HERMES_ORPHAN_PID_FILE;
   rmSync(TMP, { recursive: true, force: true, maxRetries: 5 });
 });

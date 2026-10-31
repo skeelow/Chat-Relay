@@ -12,6 +12,10 @@
 //   hang          never exit (tests the timeout + tree kill)
 //   grandchild-hang spawn a non-detached grandchild that loops forever, then
 //                   hang itself (tests that the whole tree dies)
+//   orphan-hang   M6.4g: leak a long-running child OUTSIDE the run tree
+//                   (spawner exits, the orphan keeps the relay cwd marker on
+//                   its command line; pid → FAKE_HERMES_ORPHAN_PID_FILE; the
+//                   marker path comes from control.orphanArg), then hang
 //   echo-argv     write process.argv to FAKE_HERMES_ARGV_FILE, then a normal
 //                   run
 //
@@ -22,7 +26,7 @@
 // event with exit_code 2 and exits 2; same values or neither works;
 // --yolo is not session policy.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -30,7 +34,7 @@ const controlPath = process.env.FAKE_HERMES_CONTROL;
 const argvFile = process.env.FAKE_HERMES_ARGV_FILE;
 const grandchildPidFile = process.env.FAKE_HERMES_GRANDCHILD_PID_FILE;
 
-let control: { mode?: string; sessionId?: string; exitCode?: number; text?: string; echoQuery?: boolean } = { mode: 'normal' };
+let control: { mode?: string; sessionId?: string; exitCode?: number; text?: string; echoQuery?: boolean; orphanArg?: string } = { mode: 'normal' };
 if (controlPath && existsSync(controlPath)) {
   try { control = JSON.parse(readFileSync(controlPath, 'utf8')); } catch { /* keep default */ }
 }
@@ -90,7 +94,7 @@ function resumeGate(): void {
     // A fresh run: any -t/--max-turns/--yolo works; the session is born with
     // these overrides. Modes that never report a session (fail, hang) do not
     // create one.
-    if (mode === 'fail' || mode === 'hang' || mode === 'grandchild-hang') return;
+    if (mode === 'fail' || mode === 'hang' || mode === 'grandchild-hang' || mode === 'orphan-hang') return;
     sessions[sessionId] = { toolsets: launchToolsets ?? null, maxTurns: launchMaxTurns ?? null };
     saveSessions(sessions);
     return;
@@ -144,6 +148,17 @@ function run(): void {
         try { writeFileSync(grandchildPidFile, String(grandchild.pid), 'utf8'); } catch { /* ignore */ }
       }
     }
+    // Keep this process alive until the adapter kills the whole tree.
+    setInterval(() => {}, 1000);
+    return;
+  }
+
+  if (mode === 'orphan-hang') {
+    // M6.4g live defect shape: the leaked shell is NOT a child of the run —
+    // the spawner below exits immediately, so the orphan's recorded parent is
+    // a dead pid and `taskkill /T` on the run tree can never reach it.
+    const spawner = join(dirname(process.argv[1] ?? '.'), 'fake-orphan-spawner.ts');
+    spawnSync(process.execPath, [spawner, control.orphanArg ?? ''], { stdio: 'ignore' });
     // Keep this process alive until the adapter kills the whole tree.
     setInterval(() => {}, 1000);
     return;

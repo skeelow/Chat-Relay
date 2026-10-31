@@ -106,7 +106,7 @@ let adapterPromise: Promise<void> | null = null;
 function startAdapter(engineUrl: string, tokenPath: string): void {
   adapterController = new AbortController();
   adapterPromise = runForever(
-    { engineUrl, tokenPath, executable: FAKE },
+    { engineUrl, tokenPath, executable: FAKE, sweep: () => 0 }, // M6.4g: keep smoke hermetic (no marker sweep)
     adapterController.signal,
   );
   // unhandled-rejection noise is expected while the loop retries; ignore it.
@@ -546,7 +546,7 @@ async function run() {
     try { unlinkSync(tokenPathB); } catch { /* token removed so adapter starts with none */ }
     writeControl(dirB, 'normal');
     const abortB = new AbortController();
-    const runB = runForever({ engineUrl: urlB, tokenPath: tokenPathB, executable: FAKE }, abortB.signal);
+    const runB = runForever({ engineUrl: urlB, tokenPath: tokenPathB, executable: FAKE, sweep: () => 0 }, abortB.signal);
     runB.catch(() => { /* */ });
 
     // adapter retries while nothing is there — must stay alive

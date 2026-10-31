@@ -26,6 +26,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from '
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { hashBody } from '../../relay/store.ts';
+import { sweepRelayOrphans, type SweepOptions } from '../../relay/process-sweep.ts';
 
 const ADAPTER_NAME = 'hermes';
 const ADAPTER_VERSION = '0.1.0';
@@ -64,6 +65,12 @@ const TIMEOUT_EXTRA_SEC = 30;
 
 // A profile name may only contain safe characters. Anything else fails closed.
 export const PROFILE_RE = /^[A-Za-z0-9_-]+$/;
+
+// M6.4g (D37): the marker sweep is INERT by default in the class — only the
+// production entry points (runForever below, the engine's main) wire the real
+// sweepRelayOrphans, so no test or embedded use can touch this machine's
+// process table unless it opts in explicitly.
+const NO_SWEEP = (): number => 0;
 
 const RELAY_HEADER = /^\[Relay ·/;
 
@@ -150,6 +157,11 @@ export interface HermesAdapterOptions {
   cwd?: string;
   sendFrame: (frame: unknown) => void;
   startMs?: number;
+  /** M6.4g (D37): kills leftover relay-cwd marker processes whose command
+   *  line carries the relay cwd but which are NOT in the run's process tree
+   *  (the live defect: the leaked shell's parent is the long-lived hermes
+   *  server). Inert by default; runForever wires the real sweep. */
+  sweep?: (options?: SweepOptions) => number;
 }
 
 interface Run {
@@ -169,6 +181,7 @@ export class HermesAdapter {
   private readonly workMaxRunSec: number;
   private readonly cwd: string;
   private readonly startMs: number;
+  private readonly sweep: (options?: SweepOptions) => number;
 
   private runNumber = 0;
   /** M6.4b2: one Hermes session per permission mode. Each slot is the id we
@@ -202,6 +215,7 @@ export class HermesAdapter {
     this.timeoutExtraSec = options.timeoutExtraSec ?? 30;
     this.cwd = options.cwd ?? defaultCwd();
     this.startMs = options.startMs ?? Date.now();
+    this.sweep = options.sweep ?? NO_SWEEP;
   }
 
   /** Rebind the frame sender to a live socket (used by connectToEngine). */
@@ -284,7 +298,7 @@ export class HermesAdapter {
    *  Also reset busy/current so a reconnected adapter can accept new deliveries. */
   close(): void {
     if (this.current !== null) {
-      killTree(this.current.child, 'adapter exit');
+      killTree(this.current.child, 'adapter exit', this.sweep);
       this.current = null;
       this.interrupted = true;
     }
@@ -336,12 +350,12 @@ export class HermesAdapter {
         return;
       }
 
-      this.current = { child, requestInterrupt: () => { interrupted = true; killTree(child, 'interrupt'); } };
+      this.current = { child, requestInterrupt: () => { interrupted = true; killTree(child, 'interrupt', this.sweep); } };
 
       const timeoutMs = limits.maxRunSec * 1000 + this.timeoutExtraSec * 1000;
       const timer = setTimeout(() => {
         timedOut = true;
-        killTree(child, 'timeout');
+        killTree(child, 'timeout', this.sweep);
       }, timeoutMs);
       timer.unref?.();
 
@@ -351,7 +365,7 @@ export class HermesAdapter {
         stdoutBuf += chunk.toString();
         if (stdoutBuf.length > MAX_STDOUT_BYTES) {
           stdoutOversized = true;
-          killTree(child, 'output too large');
+          killTree(child, 'output too large', this.sweep);
         }
       });
       child.stderr?.on('data', (chunk) => {
@@ -531,7 +545,12 @@ function spawnCommand(argv: string[], cwd: string = defaultCwd()): ChildProcess 
   });
 }
 
-function killTree(child: ChildProcess, reason: string): void {
+/** Kill the child's whole tree, then (M6.4g, D37) sweep leftover marker
+ *  processes: a run's shell can outlive the tree because its PARENT is not
+ *  the run's child but the long-lived hermes server — `taskkill /T` cannot
+ *  reach it. Only processes whose command line carries the relay cwd marker
+ *  are terminated, with their child trees; nothing else on the PC is touched. */
+function killTree(child: ChildProcess, reason: string, sweep: (options?: SweepOptions) => number): void {
   const pid = child.pid;
   if (pid === undefined) return;
   try {
@@ -542,6 +561,10 @@ function killTree(child: ChildProcess, reason: string): void {
     }
   } catch { /* best effort; the child may already be gone */ }
   try { child.kill(); } catch { /* ignore */ }
+  try {
+    const swept = sweep();
+    if (swept > 0) console.error(`[hermes-adapter] swept ${swept} leftover marker process(es) (${reason})`);
+  } catch { /* best effort; the sweep never throws (see process-sweep.ts) */ }
 }
 
 // --- script entry point (real engine connection) ---
@@ -625,12 +648,23 @@ export interface RunForeverOptions {
   timeoutExtraSec?: number;
   cwd?: string;
   startMs?: number;
+  /** M6.4g: the production entry wires the real marker sweep; tests pass a
+   *  no-op. The default here is the REAL sweep (unlike the class default). */
+  sweep?: (options?: SweepOptions) => number;
 }
 
 export async function runForever(
   options: RunForeverOptions,
   abortSignal?: AbortSignal,
 ): Promise<void> {
+  const sweep = options.sweep ?? sweepRelayOrphans;
+
+  // M6.4g (D37) start orphan sweep: marker processes created BEFORE this
+  // adapter started are leftovers of a previous crashed run — they die now.
+  // Processes created after the adapter start are left alone.
+  const orphans = sweep({ olderThanMs: Date.now() });
+  if (orphans > 0) console.error(`[hermes-adapter] start sweep: terminated ${orphans} orphan process(es)`);
+
   const adapter = new HermesAdapter({
     executable: options.executable,
     profile: options.profile,
@@ -638,6 +672,7 @@ export async function runForever(
     maxRunSec: options.maxRunSec,
     timeoutExtraSec: options.timeoutExtraSec,
     cwd: options.cwd,
+    sweep,
     // Bound by connectToEngine on each successful connection.
     sendFrame: () => { /* no socket yet */ },
     startMs: options.startMs,

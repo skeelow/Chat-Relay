@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn, execSync } from 'node:child_process';
 import { WebSocket as WsRawClient } from 'ws';
 import {
   startEngine,
@@ -17,6 +18,7 @@ import {
   hermesAckTimeoutMs,
 } from '../relay/engine.ts';
 import { hashBody } from '../relay/store.ts';
+import { sweepRelayOrphans } from '../relay/process-sweep.ts';
 // M6.4d: the GUI's frame builders are pushed through this real engine — the
 // exact JSON the picker/Kill/audit buttons send, not a hand-typed copy.
 import { forwardFrameWithPerm, sendFrameWithPerm } from '../app/src/perm.ts';
@@ -884,6 +886,81 @@ test('M6.4a kill: works when nothing is running (records audit + stopped state)'
   });
 });
 
+// --- M6.4g (D37): the kill-time marker sweep, real engine + real processes ---
+
+function pidAlive(pid: number): boolean {
+  if (process.platform === 'win32') {
+    try {
+      const out = execSync(`tasklist /FI "PID eq ${pid}"`, {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+      });
+      return String(out).includes(String(pid)) && !String(out).includes('No tasks');
+    } catch {
+      return false;
+    }
+  }
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function killForCleanup(pid: number): void {
+  try {
+    execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', windowsHide: true });
+  } catch { /* already gone */ }
+}
+
+test('M6.4g kill: sweeps the leftover marker shell and audits its count in detail', async () => {
+  // A REAL engine with the REAL sweep (scoped to this test's token) plus two
+  // REAL detached processes: one carries the relay cwd marker, the look-alike
+  // does not. The GUI kill frame must sweep the first and leave the second.
+  const dir = mkdtempSync(join(tmpdir(), 'relay-m64g-sweep-'));
+  const scope = `engkill-${process.pid}-${Date.now()}`;
+  const orphan = spawn(process.execPath,
+    [join(process.cwd(), 'tests', 'fake-orphan.ts'), `C:/Users/tester/AppData/Roaming/RelayChat/hermes-cwd-${scope}`],
+    { detached: true, stdio: 'ignore' });
+  orphan.unref();
+  const lookalike = spawn(process.execPath,
+    [join(process.cwd(), 'tests', 'fake-orphan.ts'), `C:/Users/tester/AppData/Roaming/RelayChat/hermes-data-${scope}`],
+    { detached: true, stdio: 'ignore' });
+  lookalike.unref();
+  try {
+    const engine = await startEngine({
+      port: 0,
+      dbPath: join(dir, 'relay.db'),
+      tokenPath: join(dir, 'token'),
+      sweepOnKill: () => sweepRelayOrphans({ contains: scope }),
+    });
+    const token = readFileSync(join(dir, 'token'), 'utf8').trim();
+    try {
+      // Both children must be up before the kill (poll, no guesswork).
+      let up = false;
+      for (let i = 0; i < 20; i++) {
+        if (pidAlive(orphan.pid!) && pidAlive(lookalike.pid!)) { up = true; break; }
+        await pause(200);
+      }
+      assert.ok(up, 'both real processes are alive before the kill');
+      const gui = await openGui(`ws://127.0.0.1:${engine.port}`, token);
+      gui.send({ type: 'kill' });
+      await pause(300);
+      const row = engine.store.recentAudit(50).find((e) => e.event === 'kill');
+      assert.ok(row !== undefined, 'the kill row exists');
+      assert.equal(row!.detail, 'swept 1', 'the kill row detail carries the swept count');
+      let gone = false;
+      for (let i = 0; i < 20; i++) {
+        if (!pidAlive(orphan.pid!)) { gone = true; break; }
+        await pause(200);
+      }
+      assert.equal(gone, true, 'the leftover marker process was terminated');
+      assert.equal(pidAlive(lookalike.pid!), true, 'the look-alike without the marker survives');
+    } finally {
+      engine.stop();
+    }
+  } finally {
+    killForCleanup(orphan.pid!);
+    killForCleanup(lookalike.pid!);
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); } catch { /* keep going */ }
+  }
+});
+
 // --- M6.4d: the GUI's builder frames, pushed through this real engine ---
 
 test('M6.4d GUI builders through the real engine: work send, kill round-trip, audit_result', async () => {
@@ -1056,7 +1133,8 @@ test('M6.4f D34 real engine: a whole-line RELAY-KILL in a captured astra reply p
     assert.ok(audit !== undefined, 'the relay kill is audited as relay_kill_astra');
     assert.equal(audit.actor, 'astra');
     assert.equal(audit.messageId, cap.id);
-    assert.ok(audit.detail === null || audit.detail === '', 'the audit row carries no message body');
+    assert.ok(audit.detail === null || /^swept \d+$/.test(String(audit.detail)),
+      'the audit row carries no message body (M6.4g: detail now holds the swept count)');
   });
 });
 

@@ -77,6 +77,7 @@ import {
   type AuditInput, type Participant, type PendingDelivery, type Perm, type RelayMessage, type RelayStore,
 } from './store.ts';
 import { exportMarkdown, EXPORT_CAP, type ExportDelivery } from './export.ts';
+import { sweepRelayOrphans, type SweepOptions } from './process-sweep.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -95,6 +96,11 @@ export interface EngineOptions {
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
+  /** M6.4g (D37): the relay-cwd marker sweep, run by performKill BEFORE the
+   *  kill audit row is written so the row's `detail` carries the swept
+   *  process count. Inert by default (tests never touch the process table);
+   *  the engine's main() wires the real sweepRelayOrphans. */
+  sweepOnKill?: (options?: SweepOptions) => number;
 }
 
 export interface EngineHandle {
@@ -190,6 +196,8 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
   const tokenPath = options.tokenPath ?? join(process.env.APPDATA ?? '.', 'RelayChat', 'token');
   const token = loadOrCreateToken(tokenPath);
   const store = openStore(options.dbPath ?? 'relay.db');
+  // M6.4g: inert marker sweep unless the caller (production main) opts in.
+  const sweepOnKill = options.sweepOnKill ?? ((): number => 0);
   const ackTimeoutMs = options.deliverAckTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
   // M6.2: the ack timeout is per target. When a test sets deliverAckTimeoutMs
   // it wins for all targets; otherwise Hermes gets 6 minutes (M6.4b: 3690 s
@@ -470,7 +478,13 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
    *  auto-Send click). Like the GUI Kill, an action while already stopped is
    *  not skipped: it re-sends the frames to catch any orphan. */
   const performKill = (audit: AuditInput, pauseNotice?: string): number => {
-    store.appendAudit(audit);
+    // M6.4g (D37): the relay-cwd marker sweep runs first, so a leftover
+    // shell whose parent is NOT the run's tree (the live defect) dies with
+    // the kill, and its count rides on the kill row's `detail`. Only
+    // processes whose command line carries %APPDATA%\RelayChat\hermes-cwd
+    // are ever touched — the adapter's own tree kill follows as usual.
+    const swept = sweepOnKill();
+    store.appendAudit({ ...audit, detail: `swept ${swept}` });
     const returned = enterStoppedState('Kill', pauseNotice);
     const hermesSock = adapterSocketFor('hermes');
     if (hermesSock !== null) hermesSock.send(JSON.stringify({ type: 'kill' }));
@@ -1325,7 +1339,7 @@ export async function startEngine(options: EngineOptions = {}): Promise<EngineHa
 
 async function main(): Promise<void> {
   try {
-    const engine = await startEngine();
+    const engine = await startEngine({ sweepOnKill: sweepRelayOrphans }); // M6.4g: real marker sweep in production
     console.log(`[engine] listening on ws://127.0.0.1:${engine.port} (read-only room)`);
     const shutdown = (): void => { engine.stop(); process.exit(0); };
     process.on('SIGINT', shutdown);
